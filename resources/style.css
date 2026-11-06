@@ -1,0 +1,65 @@
+.user-bubble {
+  background: @accent_bg_color;
+  color: @accent_fg_color;
+  border-radius: 16px;
+  padding: 8px 14px;
+}
+
+.user-bubble label {
+  color: @accent_fg_color;
+}
+
+.assistant-bubble {
+  background: @card_bg_color;
+  border-radius: 16px;
+  padding: 8px 14px;
+}
+
+.message-text,
+.message-text > text {
+  background: transparent;
+  font-size: 1.02em;
+}
+
+.composer {
+  background: @card_bg_color;
+  border-radius: 16px;
+  padding: 6px;
+}
+
+.composer textview,
+.composer textview > text {
+  background: transparent;
+}
+
+.status-online {
+  color: @success_color;
+}
+
+.status-offline {
+  color: @error_color;
+}
+
+.dim-label {
+  opacity: 0.65;
+}
+
+.context-warning {
+  color: @warning_color;
+}
+
+.context-high {
+  color: @error_color;
+}
+
+.code-container {
+  background: @view_bg_color;
+  border-radius: 10px;
+  border: 1px solid alpha(currentColor, 0.12);
+}
+
+textview.code-block,
+textview.code-block > text {
+  background: transparent;
+  font-size: 0.92em;
+}

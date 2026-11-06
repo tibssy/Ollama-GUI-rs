@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.ltux.OllamaGui</id>
+  <name>Ollama GUI</name>
+  <summary>Chat with your local Ollama models</summary>
+
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+
+  <description>
+    <p>
+      A native GTK4 and libadwaita desktop client for Ollama. Talk to models
+      running on your own machine, keep conversations on disk, and read replies
+      with native markdown and code rendering.
+    </p>
+    <ul>
+      <li>Streaming chat with stop and token-per-second stats</li>
+      <li>Local conversation history stored in SQLite</li>
+      <li>Model picker and per-chat model selection</li>
+      <li>Temperature, context size, and system prompt settings</li>
+      <li>Markdown, tables, lists, and syntax-highlighted code blocks</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">io.github.ltux.OllamaGui.desktop</launchable>
+
+  <releases>
+    <release version="0.1.0" date="2026-11-06">
+      <description>
+        <p>Initial release: streaming chat, persistence, settings, and markdown rendering.</p>
+      </description>
+    </release>
+  </releases>
+
+  <content_rating type="oars-1.1"/>
+</component>

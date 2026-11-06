@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Ollama GUI
+Comment=Chat with your local Ollama models
+Exec=ollama-gui
+Icon=io.github.ltux.OllamaGui
+Terminal=false
+Type=Application
+Categories=Utility;Development;
+Keywords=ollama;ai;llm;chat;local;
+StartupNotify=true
