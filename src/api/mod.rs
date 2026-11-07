@@ -92,6 +92,8 @@ pub struct ChatRequest {
     pub options: Option<ChatOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keep_alive: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub think: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -222,6 +224,83 @@ impl OllamaClient {
         }
         Ok(response)
     }
+
+    /// Generate speech with an Ollama speech-capable model via the
+    /// OpenAI-compatible `/v1/audio/speech` endpoint. Returns WAV bytes.
+    pub async fn speech(&self, model: &str, input: &str, voice: &str) -> Result<Vec<u8>> {
+        let response = self
+            .request(reqwest::Method::POST, "/v1/audio/speech")
+            .json(&serde_json::json!({
+                "model": model,
+                "input": input,
+                "voice": voice,
+                "response_format": "wav",
+            }))
+            .send()
+            .await
+            .context("could not reach the Ollama speech endpoint")?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            let detail = body.trim();
+            if detail.is_empty() {
+                bail!("Ollama speech endpoint returned HTTP {status}");
+            }
+            bail!("Ollama speech endpoint returned HTTP {status}: {detail}");
+        }
+        Ok(response
+            .bytes()
+            .await
+            .context("reading speech audio")?
+            .to_vec())
+    }
+
+    /// Transcribe a 16-bit PCM WAV with an Ollama model that has the `audio`
+    /// capability, using the OpenAI-compatible `/v1/audio/transcriptions`
+    /// endpoint.
+    pub async fn transcribe(
+        &self,
+        model: &str,
+        wav: Vec<u8>,
+        language: Option<&str>,
+    ) -> Result<String> {
+        let part = reqwest::multipart::Part::bytes(wav)
+            .file_name("audio.wav")
+            .mime_str("audio/wav")?;
+        let mut form = reqwest::multipart::Form::new()
+            .part("file", part)
+            .text("model", model.to_string())
+            .text("response_format", "json");
+        if let Some(language) = language {
+            if !language.is_empty() && language != "auto" {
+                form = form.text("language", language.to_string());
+            }
+        }
+
+        let response = self
+            .request(reqwest::Method::POST, "/v1/audio/transcriptions")
+            .multipart(form)
+            .send()
+            .await
+            .context("could not reach the Ollama transcription endpoint")?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            let detail = body.trim();
+            if detail.is_empty() {
+                bail!("Ollama transcription endpoint returned HTTP {status}");
+            }
+            bail!("Ollama transcription endpoint returned HTTP {status}: {detail}");
+        }
+
+        let body: serde_json::Value = response.json().await?;
+        Ok(body
+            .get("text")
+            .and_then(|text| text.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string())
+    }
 }
 
 /// Drives a streaming chat request on the tokio runtime and forwards parsed
@@ -346,6 +425,7 @@ mod tests {
                 ..Default::default()
             }),
             keep_alive: None,
+            think: None,
         };
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["options"]["temperature"], 0.5);
@@ -371,6 +451,28 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a local Ollama speech model"]
+    fn live_speech_returns_wav() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let client = OllamaClient::new("http://localhost:11434", "");
+            let models = client.list_models().await.expect("list models");
+            let model = models
+                .iter()
+                .find(|model| model.capabilities.iter().any(|item| item == "speech"))
+                .map(|model| model.name.clone())
+                .expect("no speech-capable models installed");
+
+            let audio = client
+                .speech(&model, "Hello from Ollama GUI.", "default")
+                .await
+                .expect("speech request");
+            assert!(audio.starts_with(b"RIFF"), "response is not a WAV file");
+            assert!(audio.len() > 1_000, "speech audio is suspiciously short");
+        });
+    }
+
+    #[test]
     #[ignore = "requires a local Ollama daemon"]
     fn live_chat_streams() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -381,9 +483,12 @@ mod tests {
 
             let model = models
                 .iter()
-                .find(|model| model.name == "lfm3:latest")
+                .find(|model| {
+                    model.is_chat_model() && !model.capabilities.iter().any(|item| item == "speech")
+                })
+                .or_else(|| models.iter().find(|model| model.is_chat_model()))
                 .map(|model| model.name.clone())
-                .unwrap_or_else(|| models[0].name.clone());
+                .expect("no chat-capable models installed");
 
             let request = ChatRequest {
                 model,
@@ -395,6 +500,7 @@ mod tests {
                     ..Default::default()
                 }),
                 keep_alive: Some("30s".into()),
+                think: Some(false),
             };
 
             let (tx, rx) = async_channel::unbounded();

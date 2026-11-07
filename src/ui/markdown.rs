@@ -142,6 +142,7 @@ pub fn render(view: &gtk::TextView, markdown: &str) {
     }
 
     trim_trailing_newlines(&buffer);
+    view.queue_resize();
 }
 
 fn insert(buffer: &gtk::TextBuffer, text: &str, tags: &[&str]) {

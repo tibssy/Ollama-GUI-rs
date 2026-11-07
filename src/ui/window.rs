@@ -1,5 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use gtk::prelude::*;
 use gtk::{gdk, gio, glib};
@@ -11,7 +13,8 @@ use crate::api::{
     StreamStats,
 };
 use crate::config::Settings;
-use crate::store::Store;
+use crate::store::{Store, StoredMessage};
+use crate::stt::{self, PreparedBackend, SttEvent};
 
 pub struct AppState {
     pub settings: RefCell<Settings>,
@@ -19,6 +22,8 @@ pub struct AppState {
     pub runtime: tokio::runtime::Runtime,
     pub client: RefCell<OllamaClient>,
     pub models: RefCell<Vec<ModelSummary>>,
+    pub paradee: Arc<std::sync::Mutex<Option<crate::paradee::Paradee>>>,
+    pub whistle: Arc<std::sync::Mutex<Option<crate::whistle::Whistle>>>,
 }
 
 impl AppState {
@@ -31,6 +36,8 @@ impl AppState {
             runtime: tokio::runtime::Runtime::new()?,
             client: RefCell::new(client),
             models: RefCell::new(Vec::new()),
+            paradee: Arc::new(std::sync::Mutex::new(None)),
+            whistle: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -50,6 +57,452 @@ struct ActiveStream {
     stats: Rc<RefCell<Option<StreamStats>>>,
 }
 
+struct PlaybackChunk {
+    generation: u64,
+    samples: Vec<f32>,
+    sample_rate: u32,
+    channels: u16,
+}
+
+enum SpeechEvent {
+    Playing,
+    AudioUnavailable,
+    Error(String),
+    Finished,
+}
+
+#[derive(Clone, Copy)]
+struct TtsLanguage {
+    code: &'static str,
+    label: &'static str,
+    builtin_suffix: &'static str,
+}
+
+const TTS_LANGUAGES: &[TtsLanguage] = &[
+    TtsLanguage {
+        code: "en-us",
+        label: "English (US)",
+        builtin_suffix: "american-english",
+    },
+    TtsLanguage {
+        code: "en-gb",
+        label: "English (UK)",
+        builtin_suffix: "british-english",
+    },
+    TtsLanguage {
+        code: "ar",
+        label: "Arabic",
+        builtin_suffix: "arabic",
+    },
+    TtsLanguage {
+        code: "zh",
+        label: "Chinese",
+        builtin_suffix: "chinese",
+    },
+    TtsLanguage {
+        code: "da",
+        label: "Danish",
+        builtin_suffix: "danish",
+    },
+    TtsLanguage {
+        code: "nl",
+        label: "Dutch",
+        builtin_suffix: "dutch",
+    },
+    TtsLanguage {
+        code: "fi",
+        label: "Finnish",
+        builtin_suffix: "finnish",
+    },
+    TtsLanguage {
+        code: "fr",
+        label: "French",
+        builtin_suffix: "french",
+    },
+    TtsLanguage {
+        code: "de",
+        label: "German",
+        builtin_suffix: "german",
+    },
+    TtsLanguage {
+        code: "el",
+        label: "Greek",
+        builtin_suffix: "greek",
+    },
+    TtsLanguage {
+        code: "he",
+        label: "Hebrew",
+        builtin_suffix: "hebrew",
+    },
+    TtsLanguage {
+        code: "it",
+        label: "Italian",
+        builtin_suffix: "italian",
+    },
+    TtsLanguage {
+        code: "ja",
+        label: "Japanese",
+        builtin_suffix: "japanese",
+    },
+    TtsLanguage {
+        code: "ko",
+        label: "Korean",
+        builtin_suffix: "korean",
+    },
+    TtsLanguage {
+        code: "pl",
+        label: "Polish",
+        builtin_suffix: "polish",
+    },
+    TtsLanguage {
+        code: "pt",
+        label: "Portuguese",
+        builtin_suffix: "portuguese",
+    },
+    TtsLanguage {
+        code: "es",
+        label: "Spanish",
+        builtin_suffix: "spanish",
+    },
+    TtsLanguage {
+        code: "sv",
+        label: "Swedish",
+        builtin_suffix: "swedish",
+    },
+    TtsLanguage {
+        code: "tr",
+        label: "Turkish",
+        builtin_suffix: "turkish",
+    },
+];
+
+struct ParadeeVoice {
+    id: &'static str,
+    label: &'static str,
+    language: &'static str,
+}
+
+const PARADEE_VOICES: &[ParadeeVoice] = &[
+    ParadeeVoice {
+        id: "af_heart",
+        label: "Female (American)",
+        language: "en-us",
+    },
+    ParadeeVoice {
+        id: "am_puck",
+        label: "Male (American)",
+        language: "en-us",
+    },
+    ParadeeVoice {
+        id: "bf_isabella",
+        label: "Female (British)",
+        language: "en-gb",
+    },
+    ParadeeVoice {
+        id: "bm_fable",
+        label: "Male (British)",
+        language: "en-gb",
+    },
+];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VoiceOption {
+    id: String,
+    label: String,
+}
+
+fn tts_language(code: &str) -> TtsLanguage {
+    TTS_LANGUAGES
+        .iter()
+        .copied()
+        .find(|language| language.code == code)
+        .unwrap_or(TTS_LANGUAGES[0])
+}
+
+fn has_paradee_voice(code: &str) -> bool {
+    PARADEE_VOICES.iter().any(|voice| voice.language == code)
+}
+
+fn paradee_voice_options(language: TtsLanguage) -> Vec<VoiceOption> {
+    PARADEE_VOICES
+        .iter()
+        .filter(|voice| voice.language == language.code)
+        .map(|voice| VoiceOption {
+            id: voice.id.to_string(),
+            label: voice.label.to_string(),
+        })
+        .collect()
+}
+
+fn builtin_voice_options(language: TtsLanguage) -> Vec<VoiceOption> {
+    vec![
+        VoiceOption {
+            id: format!("female-{}", language.builtin_suffix),
+            label: "Female".to_string(),
+        },
+        VoiceOption {
+            id: format!("male-{}", language.builtin_suffix),
+            label: "Male".to_string(),
+        },
+    ]
+}
+
+fn voice_options_for_choice(choice: TtsChoice, language: TtsLanguage) -> Vec<VoiceOption> {
+    match choice {
+        TtsChoice::Paradee => paradee_voice_options(language),
+        TtsChoice::Builtin => builtin_voice_options(language),
+    }
+}
+
+fn voice_options_for_backend(backend: &str, language: TtsLanguage) -> Vec<VoiceOption> {
+    match backend {
+        "paradee" => paradee_voice_options(language),
+        "builtin" => builtin_voice_options(language),
+        _ => {
+            if has_paradee_voice(language.code) {
+                paradee_voice_options(language)
+            } else {
+                builtin_voice_options(language)
+            }
+        }
+    }
+}
+
+fn languages_for_backend(backend: &str) -> Vec<TtsLanguage> {
+    if backend == "paradee" {
+        TTS_LANGUAGES
+            .iter()
+            .copied()
+            .filter(|language| has_paradee_voice(language.code))
+            .collect()
+    } else {
+        TTS_LANGUAGES.to_vec()
+    }
+}
+
+fn tts_backend_from_index(index: u32) -> &'static str {
+    match index {
+        1 => "paradee",
+        2 => "builtin",
+        _ => "auto",
+    }
+}
+
+fn tts_backend_index(backend: &str) -> u32 {
+    match backend {
+        "paradee" => 1,
+        "builtin" => 2,
+        _ => 0,
+    }
+}
+
+fn fill_language_row(
+    row: &adw::ComboRow,
+    backend: &str,
+    current_code: &str,
+    choices: &RefCell<Vec<TtsLanguage>>,
+    suppress: &Cell<bool>,
+) -> String {
+    let items = languages_for_backend(backend);
+    let labels: Vec<&str> = items.iter().map(|language| language.label).collect();
+    let model = gtk::StringList::new(&labels);
+    let selected = items
+        .iter()
+        .position(|language| language.code == current_code)
+        .unwrap_or(0);
+    let code = items
+        .get(selected)
+        .map(|language| language.code.to_string())
+        .unwrap_or_else(|| "en-us".to_string());
+
+    suppress.set(true);
+    row.set_model(Some(&model));
+    row.set_selected(selected as u32);
+    suppress.set(false);
+
+    *choices.borrow_mut() = items;
+    code
+}
+
+#[derive(Clone, Copy)]
+struct SttLanguage {
+    code: &'static str,
+    label: &'static str,
+}
+
+const STT_LANGUAGES: &[SttLanguage] = &[
+    SttLanguage {
+        code: "auto",
+        label: "Auto detect",
+    },
+    SttLanguage {
+        code: "en",
+        label: "English",
+    },
+    SttLanguage {
+        code: "de",
+        label: "German",
+    },
+    SttLanguage {
+        code: "fr",
+        label: "French",
+    },
+    SttLanguage {
+        code: "es",
+        label: "Spanish",
+    },
+    SttLanguage {
+        code: "it",
+        label: "Italian",
+    },
+    SttLanguage {
+        code: "nl",
+        label: "Dutch",
+    },
+    SttLanguage {
+        code: "pl",
+        label: "Polish",
+    },
+    SttLanguage {
+        code: "ar",
+        label: "Arabic",
+    },
+    SttLanguage {
+        code: "zh",
+        label: "Chinese",
+    },
+    SttLanguage {
+        code: "da",
+        label: "Danish",
+    },
+    SttLanguage {
+        code: "fi",
+        label: "Finnish",
+    },
+    SttLanguage {
+        code: "el",
+        label: "Greek",
+    },
+    SttLanguage {
+        code: "he",
+        label: "Hebrew",
+    },
+    SttLanguage {
+        code: "ja",
+        label: "Japanese",
+    },
+    SttLanguage {
+        code: "ko",
+        label: "Korean",
+    },
+    SttLanguage {
+        code: "pt",
+        label: "Portuguese",
+    },
+    SttLanguage {
+        code: "sv",
+        label: "Swedish",
+    },
+    SttLanguage {
+        code: "tr",
+        label: "Turkish",
+    },
+];
+
+fn stt_languages_for_provider(provider: &str) -> Vec<SttLanguage> {
+    if provider == "whistle" {
+        STT_LANGUAGES
+            .iter()
+            .copied()
+            .filter(|language| {
+                language.code == "auto"
+                    || crate::whistle::WHISTLE_LANGUAGES.contains(&language.code)
+            })
+            .collect()
+    } else {
+        STT_LANGUAGES.to_vec()
+    }
+}
+
+fn fill_stt_language_row(
+    row: &adw::ComboRow,
+    provider: &str,
+    current_code: &str,
+    choices: &RefCell<Vec<SttLanguage>>,
+    suppress: &Cell<bool>,
+) -> String {
+    let items = stt_languages_for_provider(provider);
+    let labels: Vec<&str> = items.iter().map(|language| language.label).collect();
+    let model = gtk::StringList::new(&labels);
+    let selected = items
+        .iter()
+        .position(|language| language.code == current_code)
+        .unwrap_or(0);
+    let code = items
+        .get(selected)
+        .map(|language| language.code.to_string())
+        .unwrap_or_else(|| "auto".to_string());
+
+    suppress.set(true);
+    row.set_model(Some(&model));
+    row.set_selected(selected as u32);
+    suppress.set(false);
+
+    *choices.borrow_mut() = items;
+    code
+}
+
+fn stt_provider_from_index(index: u32) -> &'static str {
+    match index {
+        1 => "whistle",
+        2 => "builtin",
+        _ => "auto",
+    }
+}
+
+fn stt_provider_index(provider: &str) -> u32 {
+    match provider {
+        "whistle" => 1,
+        "builtin" => 2,
+        _ => 0,
+    }
+}
+
+fn fill_voice_row(
+    row: &adw::ComboRow,
+    backend: &str,
+    language: TtsLanguage,
+    current_voice: &str,
+    choices: &RefCell<Vec<VoiceOption>>,
+    suppress: &Cell<bool>,
+) -> String {
+    let items = voice_options_for_backend(backend, language);
+    let labels: Vec<&str> = items.iter().map(|voice| voice.label.as_str()).collect();
+    let model = gtk::StringList::new(&labels);
+    let selected = items
+        .iter()
+        .position(|voice| voice.id == current_voice)
+        .unwrap_or(0);
+    let id = items
+        .get(selected)
+        .map(|voice| voice.id.clone())
+        .unwrap_or_default();
+
+    suppress.set(true);
+    row.set_model(Some(&model));
+    row.set_selected(selected as u32);
+    suppress.set(false);
+
+    *choices.borrow_mut() = items;
+    id
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TtsChoice {
+    Paradee,
+    Builtin,
+}
+
 struct ChatWindow {
     window: adw::ApplicationWindow,
     state: Rc<AppState>,
@@ -58,6 +511,7 @@ struct ChatWindow {
     new_chat_button: gtk::Button,
     refresh_button: gtk::Button,
     model_dropdown: gtk::DropDown,
+    capability_box: adw::WrapBox,
     status_label: gtk::Label,
 
     title_widget: adw::WindowTitle,
@@ -67,6 +521,8 @@ struct ChatWindow {
     input: gtk::TextView,
     send_button: gtk::Button,
     stop_button: gtk::Button,
+    mic_button: gtk::Button,
+    live_button: gtk::Button,
     context_label: gtk::Label,
     context_bar: gtk::LevelBar,
     toast_overlay: adw::ToastOverlay,
@@ -74,6 +530,17 @@ struct ChatWindow {
 
     current_id: RefCell<Option<i64>>,
     active: RefCell<Option<ActiveStream>>,
+    speech_buttons: RefCell<Vec<gtk::Button>>,
+    speech_player: RefCell<Option<async_channel::Sender<PlaybackChunk>>>,
+    speech_generation: Arc<AtomicU64>,
+    stt_session: RefCell<Option<crate::stt::SttSession>>,
+    stt_prefix: RefCell<String>,
+    stt_listening: Cell<bool>,
+    stt_preparing: Cell<bool>,
+    stt_generation: Cell<u64>,
+    live_mode: Cell<bool>,
+    live_pending: Cell<bool>,
+    suppress_autoread: Cell<bool>,
     suppress_model_change: Cell<bool>,
 }
 
@@ -111,6 +578,11 @@ impl ChatWindow {
         model_dropdown.set_enable_search(true);
         model_dropdown.set_tooltip_text(Some("Model"));
 
+        let capability_box = adw::WrapBox::new();
+        capability_box.set_child_spacing(4);
+        capability_box.set_line_spacing(4);
+        capability_box.set_align(0.0);
+
         let status_label = gtk::Label::new(Some("Connecting…"));
         status_label.add_css_class("dim-label");
         status_label.set_xalign(0.0);
@@ -124,6 +596,7 @@ impl ChatWindow {
         footer.set_margin_end(12);
         footer.append(&status_label);
         footer.append(&model_dropdown);
+        footer.append(&capability_box);
 
         let sidebar_content = gtk::Box::new(gtk::Orientation::Vertical, 0);
         sidebar_content.append(&sidebar_scroll);
@@ -205,8 +678,20 @@ impl ChatWindow {
         stop_button.set_tooltip_text(Some("Stop generating"));
         stop_button.set_visible(false);
 
+        let mic_button = gtk::Button::from_icon_name("audio-input-microphone-symbolic");
+        mic_button.add_css_class("flat");
+        mic_button.set_tooltip_text(Some("Dictate"));
+        mic_button.set_visible(false);
+
+        let live_button = gtk::Button::from_icon_name("media-playback-start-symbolic");
+        live_button.add_css_class("flat");
+        live_button.set_tooltip_text(Some("Start live voice conversation"));
+        live_button.set_visible(false);
+
         let composer_buttons = gtk::Box::new(gtk::Orientation::Vertical, 6);
         composer_buttons.set_valign(gtk::Align::End);
+        composer_buttons.append(&live_button);
+        composer_buttons.append(&mic_button);
         composer_buttons.append(&stop_button);
         composer_buttons.append(&send_button);
 
@@ -286,6 +771,7 @@ impl ChatWindow {
             new_chat_button,
             refresh_button,
             model_dropdown,
+            capability_box,
             status_label,
             title_widget,
             main_stack,
@@ -294,12 +780,25 @@ impl ChatWindow {
             input,
             send_button,
             stop_button,
+            mic_button,
+            live_button,
             context_label,
             context_bar,
             toast_overlay,
             menu_button,
             current_id: RefCell::new(None),
             active: RefCell::new(None),
+            speech_buttons: RefCell::new(Vec::new()),
+            speech_player: RefCell::new(None),
+            speech_generation: Arc::new(AtomicU64::new(0)),
+            stt_session: RefCell::new(None),
+            stt_prefix: RefCell::new(String::new()),
+            stt_listening: Cell::new(false),
+            stt_preparing: Cell::new(false),
+            stt_generation: Cell::new(0),
+            live_mode: Cell::new(false),
+            live_pending: Cell::new(false),
+            suppress_autoread: Cell::new(false),
             suppress_model_change: Cell::new(false),
         })
     }
@@ -314,6 +813,14 @@ impl ChatWindow {
             let win = self.clone();
             self.stop_button
                 .connect_clicked(move |_| win.stop_streaming());
+        }
+        {
+            let win = self.clone();
+            self.mic_button.connect_clicked(move |_| win.toggle_stt());
+        }
+        {
+            let win = self.clone();
+            self.live_button.connect_clicked(move |_| win.toggle_live());
         }
         {
             let win = self.clone();
@@ -416,6 +923,7 @@ impl ChatWindow {
 
         self.refresh_models();
         self.input.grab_focus();
+        self.update_stt_ui();
     }
 
     // ----- Models ----------------------------------------------------------
@@ -453,6 +961,37 @@ impl ChatWindow {
             self.model_dropdown.set_selected(index);
             self.suppress_model_change.set(false);
         }
+        self.update_capabilities();
+    }
+
+    fn update_capabilities(&self) {
+        while let Some(child) = self.capability_box.first_child() {
+            child.unparent();
+        }
+
+        let selected = self.selected_model();
+        if selected.is_empty() {
+            self.update_speech_buttons();
+            return;
+        }
+
+        let models = self.state.models.borrow();
+        let Some(model) = models.iter().find(|model| model.name == selected) else {
+            drop(models);
+            self.update_speech_buttons();
+            return;
+        };
+
+        for capability in &model.capabilities {
+            let label = gtk::Label::new(Some(capability));
+            label.add_css_class("capability-pill");
+            if let Some(class) = capability_css_class(capability) {
+                label.add_css_class(class);
+            }
+            label.set_tooltip_text(capability_description(capability));
+            self.capability_box.append(&label);
+        }
+        self.update_speech_buttons();
     }
 
     fn refresh_models(self: &Rc<Self>) {
@@ -530,6 +1069,7 @@ impl ChatWindow {
         if !model.is_empty() {
             self.title_widget.set_subtitle(&model);
         }
+        self.update_capabilities();
     }
 
     fn on_model_changed(self: &Rc<Self>) {
@@ -543,6 +1083,10 @@ impl ChatWindow {
         self.title_widget.set_subtitle(&model);
         self.state.settings.borrow_mut().default_model = model.clone();
         self.save_settings();
+        self.update_capabilities();
+        if self.resolve_tts().is_none() {
+            self.stop_speech();
+        }
         if let Some(id) = *self.current_id.borrow() {
             let _ = self.state.store.borrow().set_conversation_model(id, &model);
             self.reload_sidebar();
@@ -678,6 +1222,8 @@ impl ChatWindow {
 
     fn load_conversation(self: &Rc<Self>, id: i64) {
         self.stop_streaming();
+        self.stop_speech();
+        self.stop_stt();
         *self.current_id.borrow_mut() = Some(id);
 
         let (title, model, messages) = {
@@ -699,7 +1245,7 @@ impl ChatWindow {
 
         self.clear_messages();
         for message in &messages {
-            self.add_message_widget(&message.role, &message.content);
+            self.add_message_widget(id, message);
         }
 
         self.title_widget.set_title(&title);
@@ -734,6 +1280,8 @@ impl ChatWindow {
 
     fn new_chat(self: &Rc<Self>) {
         self.stop_streaming();
+        self.stop_speech();
+        self.stop_stt();
         *self.current_id.borrow_mut() = None;
         self.chat_list.unselect_all();
         self.show_empty();
@@ -746,18 +1294,54 @@ impl ChatWindow {
         while let Some(child) = self.messages_box.first_child() {
             self.messages_box.remove(&child);
         }
+        self.speech_buttons.borrow_mut().clear();
     }
 
-    fn add_message_widget(&self, role: &str, text: &str) {
-        if role == "user" {
-            self.add_user_message(text);
+    fn add_message_widget(self: &Rc<Self>, conversation_id: i64, message: &StoredMessage) {
+        if message.role == "user" {
+            self.add_user_message(conversation_id, Some(message.id), &message.content);
         } else {
-            let (_row, _bubble, view) = self.add_assistant_bubble();
-            super::markdown::render(&view, text);
+            let (_row, bubble, view) = self.add_assistant_bubble();
+            // A GtkTextView populated before its first allocation caches a zero
+            // height. Render once it has a width, then request one more resize
+            // after that allocation so wrapped markdown gets its real height.
+            let rendered = Rc::new(Cell::new(false));
+            let resized = Rc::new(Cell::new(false));
+            let content = message.content.clone();
+            {
+                let rendered = Rc::clone(&rendered);
+                let resized = Rc::clone(&resized);
+                view.add_tick_callback(move |view, _clock| {
+                    if view.width() == 0 {
+                        return glib::ControlFlow::Continue;
+                    }
+                    if !rendered.replace(true) {
+                        super::markdown::render(view, &content);
+                        view.queue_resize();
+                        return glib::ControlFlow::Continue;
+                    }
+                    if !resized.replace(true) {
+                        view.queue_resize();
+                    }
+                    glib::ControlFlow::Break
+                });
+            }
+            self.attach_message_actions(
+                conversation_id,
+                &bubble,
+                "assistant",
+                &message.content,
+                Some(message.id),
+            );
         }
     }
 
-    fn add_user_message(&self, text: &str) {
+    fn add_user_message(
+        self: &Rc<Self>,
+        conversation_id: i64,
+        message_id: Option<i64>,
+        text: &str,
+    ) {
         let label = gtk::Label::new(Some(text));
         label.set_wrap(true);
         label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
@@ -774,6 +1358,8 @@ impl ChatWindow {
         row.set_halign(gtk::Align::Fill);
         row.append(&bubble);
         self.messages_box.append(&row);
+
+        self.attach_message_actions(conversation_id, &bubble, "user", text, message_id);
     }
 
     fn add_assistant_bubble(&self) -> (gtk::Box, gtk::Box, gtk::TextView) {
@@ -797,6 +1383,862 @@ impl ChatWindow {
         self.messages_box.append(&row);
 
         (row, bubble, view)
+    }
+
+    fn attach_message_actions(
+        self: &Rc<Self>,
+        conversation_id: i64,
+        bubble: &gtk::Box,
+        role: &str,
+        content: &str,
+        message_id: Option<i64>,
+    ) {
+        let Some(message_id) = message_id else {
+            return;
+        };
+
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        actions.set_halign(if role == "user" {
+            gtk::Align::End
+        } else {
+            gtk::Align::Start
+        });
+        actions.set_margin_top(2);
+
+        if role == "assistant" {
+            let regenerate = message_action_button("view-refresh-symbolic", "Regenerate reply");
+            {
+                let win = self.clone();
+                regenerate.connect_clicked(move |_| {
+                    win.regenerate(conversation_id, message_id);
+                });
+            }
+            actions.append(&regenerate);
+        }
+
+        let copy = message_action_button("edit-copy-symbolic", "Copy message");
+        {
+            let text = content.to_string();
+            copy.connect_clicked(move |button| {
+                if let Some(display) = gdk::Display::default() {
+                    display.clipboard().set_text(&text);
+                }
+                button.set_icon_name("object-select-symbolic");
+                let button = button.clone();
+                glib::timeout_add_seconds_local_once(1, move || {
+                    button.set_icon_name("edit-copy-symbolic");
+                });
+            });
+        }
+        actions.append(&copy);
+
+        if role == "assistant" {
+            let speech = message_action_button("audio-volume-high-symbolic", "Read aloud");
+            speech.set_visible(self.resolve_tts().is_some());
+            {
+                let win = self.clone();
+                let text = content.to_string();
+                speech.connect_clicked(move |button| win.speak(&text, Some(button)));
+            }
+            actions.append(&speech);
+            self.speech_buttons.borrow_mut().push(speech);
+        }
+
+        let remove = message_action_button("user-trash-symbolic", "Remove turn");
+        {
+            let win = self.clone();
+            remove.connect_clicked(move |_| {
+                win.remove_turn(conversation_id, message_id);
+            });
+        }
+        actions.append(&remove);
+
+        bubble.append(&actions);
+        self.update_speech_buttons();
+    }
+
+    fn selected_model_supports(&self, capability: &str) -> bool {
+        let selected = self.selected_model();
+        self.state
+            .models
+            .borrow()
+            .iter()
+            .find(|model| model.name == selected)
+            .map(|model| model.capabilities.iter().any(|item| item == capability))
+            .unwrap_or(false)
+    }
+
+    fn update_speech_buttons(&self) {
+        let available = self.resolve_tts().is_some();
+        for button in self.speech_buttons.borrow().iter() {
+            button.set_visible(available);
+        }
+    }
+
+    fn remove_turn(self: &Rc<Self>, conversation_id: i64, message_id: i64) {
+        if self.active.borrow().is_some() {
+            self.toast("Wait for the current reply to finish.");
+            return;
+        }
+
+        let removed = match self
+            .state
+            .store
+            .borrow()
+            .delete_turn(conversation_id, message_id)
+        {
+            Ok(ids) => ids,
+            Err(err) => {
+                self.toast(&format!("Could not remove turn: {err:#}"));
+                return;
+            }
+        };
+        if removed.is_empty() {
+            return;
+        }
+
+        if *self.current_id.borrow() == Some(conversation_id) {
+            self.load_conversation(conversation_id);
+        }
+        self.reload_sidebar();
+        self.toast("Turn removed");
+    }
+
+    fn regenerate(self: &Rc<Self>, conversation_id: i64, assistant_id: i64) {
+        if self.active.borrow().is_some() {
+            self.toast("Wait for the current reply to finish.");
+            return;
+        }
+
+        let removed = match self
+            .state
+            .store
+            .borrow()
+            .delete_from_message(conversation_id, assistant_id)
+        {
+            Ok(count) => count,
+            Err(err) => {
+                self.toast(&format!("Could not regenerate: {err:#}"));
+                return;
+            }
+        };
+        if removed == 0 {
+            return;
+        }
+
+        if *self.current_id.borrow() == Some(conversation_id) {
+            self.load_conversation(conversation_id);
+        }
+        self.reload_sidebar();
+        self.start_generation(conversation_id);
+
+        if removed > 1 {
+            self.toast("Regenerating; later turns were removed.");
+        }
+    }
+
+    fn speak(self: &Rc<Self>, text: &str, button: Option<&gtk::Button>) {
+        let Some(choice) = self.resolve_tts() else {
+            self.toast("Speech is not available for this TTS setting and language.");
+            return;
+        };
+
+        let (sentences, truncated) = sentences_for_speech(text, 4096);
+        if sentences.is_empty() {
+            return;
+        }
+        if truncated {
+            self.toast("Speech is limited to the first 4,096 characters.");
+        }
+
+        let language = tts_language(&self.state.settings.borrow().tts_language);
+        let voice = self.resolved_voice(choice, language);
+        tracing::info!(
+            "speech: queueing {} sentence(s) via {} with voice '{}'",
+            sentences.len(),
+            match choice {
+                TtsChoice::Paradee => "Paradee",
+                TtsChoice::Builtin => "Ollama",
+            },
+            voice
+        );
+
+        let Some(sender) = self.speech_sender() else {
+            return;
+        };
+        let generation = self.speech_generation.fetch_add(1, Ordering::SeqCst) + 1;
+
+        if let Some(button) = button {
+            button.set_sensitive(false);
+        }
+        let generation_counter = Arc::clone(&self.speech_generation);
+        let (ui_tx, ui_rx) = async_channel::bounded(8);
+
+        match choice {
+            TtsChoice::Builtin => {
+                let client = self.state.client.borrow().clone();
+                let model = self.selected_model();
+
+                self.state.runtime.spawn(async move {
+                    let mut first_chunk = true;
+                    for sentence in sentences {
+                        if generation_counter.load(Ordering::SeqCst) != generation {
+                            break;
+                        }
+                        match client.speech(&model, &sentence, &voice).await {
+                            Ok(bytes) => match decode_wav(&bytes) {
+                                Ok((samples, sample_rate, channels)) => {
+                                    if generation_counter.load(Ordering::SeqCst) != generation {
+                                        break;
+                                    }
+                                    let chunk = PlaybackChunk {
+                                        generation,
+                                        samples,
+                                        sample_rate,
+                                        channels,
+                                    };
+                                    if sender.send(chunk).await.is_err() {
+                                        let _ = ui_tx.send(SpeechEvent::AudioUnavailable).await;
+                                        break;
+                                    }
+                                    if first_chunk {
+                                        first_chunk = false;
+                                        let _ = ui_tx.send(SpeechEvent::Playing).await;
+                                    }
+                                }
+                                Err(err) => {
+                                    let _ =
+                                        ui_tx.send(SpeechEvent::Error(format!("{err:#}"))).await;
+                                    break;
+                                }
+                            },
+                            Err(err) => {
+                                let _ = ui_tx.send(SpeechEvent::Error(format!("{err:#}"))).await;
+                                break;
+                            }
+                        }
+                    }
+                    let _ = ui_tx.send(SpeechEvent::Finished).await;
+                });
+            }
+            TtsChoice::Paradee => {
+                if !crate::paradee::is_downloaded() {
+                    self.toast("Downloading Paradee voice model (8.5 MB)…");
+                }
+
+                let engine = Arc::clone(&self.state.paradee);
+
+                self.state.runtime.spawn(async move {
+                    if let Err(err) = crate::paradee::ensure_downloaded().await {
+                        let _ = ui_tx.send(SpeechEvent::Error(format!("{err:#}"))).await;
+                        let _ = ui_tx.send(SpeechEvent::Finished).await;
+                        return;
+                    }
+
+                    let mut first_chunk = true;
+                    for sentence in sentences {
+                        if generation_counter.load(Ordering::SeqCst) != generation {
+                            break;
+                        }
+
+                        let engine = Arc::clone(&engine);
+                        let voice = voice.clone();
+                        let result = tokio::task::spawn_blocking(move || {
+                            let mut guard = engine
+                                .lock()
+                                .map_err(|_| anyhow::anyhow!("Paradee engine lock failed"))?;
+                            if guard.is_none() {
+                                *guard = Some(crate::paradee::Paradee::load()?);
+                            }
+                            guard
+                                .as_mut()
+                                .expect("Paradee engine")
+                                .synthesize(&sentence, &voice)
+                        })
+                        .await;
+
+                        match result {
+                            Ok(Ok((samples, sample_rate))) => {
+                                if generation_counter.load(Ordering::SeqCst) != generation {
+                                    break;
+                                }
+                                let chunk = PlaybackChunk {
+                                    generation,
+                                    samples,
+                                    sample_rate,
+                                    channels: 1,
+                                };
+                                if sender.send(chunk).await.is_err() {
+                                    let _ = ui_tx.send(SpeechEvent::AudioUnavailable).await;
+                                    break;
+                                }
+                                if first_chunk {
+                                    first_chunk = false;
+                                    let _ = ui_tx.send(SpeechEvent::Playing).await;
+                                }
+                            }
+                            Ok(Err(err)) => {
+                                let _ = ui_tx.send(SpeechEvent::Error(format!("{err:#}"))).await;
+                                break;
+                            }
+                            Err(err) => {
+                                let _ = ui_tx
+                                    .send(SpeechEvent::Error(format!("speech task failed: {err}")))
+                                    .await;
+                                break;
+                            }
+                        }
+                    }
+                    let _ = ui_tx.send(SpeechEvent::Finished).await;
+                });
+            }
+        }
+
+        self.show_speech_events(ui_rx, button.cloned());
+        if button.is_some() {
+            self.toast("Generating speech…");
+        }
+    }
+
+    fn show_speech_events(
+        self: &Rc<Self>,
+        rx: async_channel::Receiver<SpeechEvent>,
+        button: Option<gtk::Button>,
+    ) {
+        let announce = button.is_some();
+        let win = self.clone();
+        glib::spawn_future_local(async move {
+            while let Ok(event) = rx.recv().await {
+                match event {
+                    SpeechEvent::Playing => {
+                        if announce {
+                            win.toast("Speaking…");
+                        }
+                    }
+                    SpeechEvent::AudioUnavailable => {
+                        win.toast("Audio output is unavailable");
+                        *win.speech_player.borrow_mut() = None;
+                    }
+                    SpeechEvent::Error(message) => {
+                        win.toast(&format!("Speech failed: {message}"));
+                    }
+                    SpeechEvent::Finished => {
+                        if let Some(button) = button.as_ref() {
+                            button.set_sensitive(true);
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    fn resolve_tts(&self) -> Option<TtsChoice> {
+        let (enabled, backend, language_code) = {
+            let settings = self.state.settings.borrow();
+            (
+                settings.tts_enabled,
+                settings.tts_backend.clone(),
+                settings.tts_language.clone(),
+            )
+        };
+        if !enabled {
+            return None;
+        }
+        let language = tts_language(&language_code);
+
+        match backend.as_str() {
+            "paradee" => has_paradee_voice(language.code).then_some(TtsChoice::Paradee),
+            "builtin" => self
+                .selected_model_supports("speech")
+                .then_some(TtsChoice::Builtin),
+            _ => {
+                if has_paradee_voice(language.code) {
+                    Some(TtsChoice::Paradee)
+                } else if self.selected_model_supports("speech") {
+                    Some(TtsChoice::Builtin)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    fn resolved_voice(&self, choice: TtsChoice, language: TtsLanguage) -> String {
+        let stored = self.state.settings.borrow().tts_voice.clone();
+        let options = voice_options_for_choice(choice, language);
+        options
+            .iter()
+            .find(|voice| voice.id == stored)
+            .map(|voice| voice.id.clone())
+            .unwrap_or_else(|| {
+                options
+                    .first()
+                    .map(|voice| voice.id.clone())
+                    .unwrap_or_default()
+            })
+    }
+
+    fn speech_sender(self: &Rc<Self>) -> Option<async_channel::Sender<PlaybackChunk>> {
+        let existing = self.speech_player.borrow().as_ref().cloned();
+        if let Some(sender) = existing {
+            return Some(sender);
+        }
+
+        match spawn_playback_thread(Arc::clone(&self.speech_generation)) {
+            Ok(sender) => {
+                *self.speech_player.borrow_mut() = Some(sender.clone());
+                Some(sender)
+            }
+            Err(err) => {
+                self.toast(&format!("Audio output unavailable: {err:#}"));
+                None
+            }
+        }
+    }
+
+    fn stop_speech(&self) {
+        self.speech_generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn unload_tts_engine(&self) {
+        let engine = Arc::clone(&self.state.paradee);
+        drop(self.state.runtime.spawn_blocking(move || {
+            if let Ok(mut guard) = engine.lock() {
+                *guard = None;
+            }
+            trim_heap();
+        }));
+    }
+
+    fn unload_stt_engine(&self) {
+        let engine = Arc::clone(&self.state.whistle);
+        drop(self.state.runtime.spawn_blocking(move || {
+            if let Ok(mut guard) = engine.lock() {
+                *guard = None;
+            }
+            trim_heap();
+        }));
+    }
+
+    // ----- Speech to text --------------------------------------------------
+
+    fn update_stt_ui(&self) {
+        let (stt_enabled, tts_enabled) = {
+            let settings = self.state.settings.borrow();
+            (settings.stt_enabled, settings.tts_enabled)
+        };
+        let live_active = self.live_mode.get() || self.live_pending.get();
+
+        self.mic_button.set_visible(stt_enabled);
+        self.live_button.set_visible(stt_enabled && tts_enabled);
+
+        if !stt_enabled {
+            self.mic_button.set_sensitive(true);
+            self.mic_button
+                .set_icon_name("audio-input-microphone-symbolic");
+            self.mic_button.remove_css_class("destructive-action");
+            self.mic_button.set_tooltip_text(Some("Dictate"));
+        } else if live_active {
+            self.mic_button.set_sensitive(false);
+            self.mic_button
+                .set_icon_name("audio-input-microphone-symbolic");
+            self.mic_button.remove_css_class("destructive-action");
+            self.mic_button
+                .set_tooltip_text(Some("Unavailable during live conversation"));
+        } else if self.stt_preparing.get() {
+            self.mic_button.set_sensitive(true);
+            self.mic_button
+                .set_icon_name("media-playback-stop-symbolic");
+            self.mic_button.add_css_class("destructive-action");
+            self.mic_button
+                .set_tooltip_text(Some("Cancel speech recognition preparation"));
+        } else if self.stt_listening.get() {
+            self.mic_button.set_sensitive(true);
+            self.mic_button
+                .set_icon_name("media-playback-stop-symbolic");
+            self.mic_button.add_css_class("destructive-action");
+            self.mic_button.set_tooltip_text(Some("Stop dictation"));
+        } else {
+            self.mic_button.set_sensitive(true);
+            self.mic_button
+                .set_icon_name("audio-input-microphone-symbolic");
+            self.mic_button.remove_css_class("destructive-action");
+            self.mic_button.set_tooltip_text(Some("Dictate"));
+        }
+
+        if !self.live_button.is_visible() {
+            return;
+        }
+        if live_active {
+            self.live_button.set_sensitive(true);
+            self.live_button
+                .set_icon_name("media-playback-stop-symbolic");
+            self.live_button.add_css_class("destructive-action");
+            self.live_button
+                .set_tooltip_text(Some(if self.stt_preparing.get() {
+                    "Cancel live conversation preparation"
+                } else {
+                    "Stop live voice conversation"
+                }));
+        } else {
+            self.live_button
+                .set_sensitive(!self.stt_listening.get() && !self.stt_preparing.get());
+            self.live_button
+                .set_icon_name("media-playback-start-symbolic");
+            self.live_button.remove_css_class("destructive-action");
+            self.live_button
+                .set_tooltip_text(Some("Start live voice conversation"));
+        }
+    }
+
+    fn toggle_stt(self: &Rc<Self>) {
+        if self.stt_listening.get() || self.stt_preparing.get() {
+            self.stop_stt();
+        } else {
+            self.start_stt(false);
+        }
+    }
+
+    fn toggle_live(self: &Rc<Self>) {
+        if self.live_mode.get() || self.live_pending.get() {
+            self.stop_stt();
+            self.stop_speech();
+            self.update_stt_ui();
+        } else {
+            self.start_stt(true);
+        }
+    }
+
+    fn start_stt(self: &Rc<Self>, live: bool) {
+        if self.stt_listening.get() || self.stt_preparing.get() {
+            return;
+        }
+        if live && self.resolve_tts().is_none() {
+            self.toast("Live conversation needs an available text-to-speech voice.");
+            return;
+        }
+
+        let (enabled, provider, language, start_secs, end_ms) = {
+            let settings = self.state.settings.borrow();
+            (
+                settings.stt_enabled,
+                settings.stt_provider.clone(),
+                settings.stt_language.clone(),
+                settings.stt_start_timeout_secs,
+                settings.stt_end_silence_ms,
+            )
+        };
+        if !enabled {
+            return;
+        }
+
+        let audio_model = self.selected_model_supports("audio");
+        let language = if language == "auto" {
+            None
+        } else {
+            Some(language)
+        };
+        let whistle_language = language
+            .as_deref()
+            .is_none_or(|code| crate::whistle::WHISTLE_LANGUAGES.contains(&code));
+
+        let use_whistle = match provider.as_str() {
+            "whistle" => true,
+            "builtin" => {
+                if !audio_model {
+                    self.toast("The selected model does not support speech input.");
+                    return;
+                }
+                false
+            }
+            _ => {
+                if crate::whistle::is_downloaded() && whistle_language {
+                    true
+                } else if audio_model {
+                    false
+                } else if whistle_language {
+                    true
+                } else {
+                    self.toast("No speech-to-text provider supports that language.");
+                    return;
+                }
+            }
+        };
+
+        let start_timeout = std::time::Duration::from_secs(start_secs.max(1) as u64);
+        let end_silence = std::time::Duration::from_millis(end_ms.max(200) as u64);
+        tracing::info!(
+            "STT: using {} for language {:?}{}",
+            if use_whistle { "Whistle" } else { "Ollama" },
+            language,
+            if live { " (live conversation)" } else { "" }
+        );
+
+        if use_whistle {
+            if let Some(code) = language.as_deref() {
+                if !crate::whistle::WHISTLE_LANGUAGES.contains(&code) {
+                    self.toast("Whistle does not support that language.");
+                    return;
+                }
+            }
+
+            let engine = Arc::clone(&self.state.whistle);
+            let loaded = engine.lock().map(|guard| guard.is_some()).unwrap_or(false);
+            if loaded && crate::whistle::is_downloaded() {
+                self.begin_listening(
+                    PreparedBackend::Whistle(engine),
+                    language,
+                    start_timeout,
+                    end_silence,
+                    live,
+                );
+                return;
+            }
+
+            self.stt_preparing.set(true);
+            if live {
+                self.live_pending.set(true);
+            }
+            let prep_id = self.stt_generation.get().saturating_add(1);
+            self.stt_generation.set(prep_id);
+            self.update_stt_ui();
+            if crate::whistle::is_downloaded() {
+                self.toast("Preparing Whistle speech recognition…");
+            } else {
+                self.toast("Downloading Whistle model (~160 MB)…");
+            }
+
+            let (tx, rx) = async_channel::bounded(1);
+            let prepare_engine = Arc::clone(&engine);
+            self.state.runtime.spawn(async move {
+                let result = stt::prepare_whistle(prepare_engine).await;
+                let _ = tx.send(result).await;
+            });
+
+            let win = self.clone();
+            glib::spawn_future_local(async move {
+                match rx.recv().await {
+                    Ok(Ok(())) => {
+                        if win.stt_generation.get() != prep_id || !win.stt_preparing.get() {
+                            return;
+                        }
+                        win.stt_preparing.set(false);
+                        if !win.state.settings.borrow().stt_enabled {
+                            win.live_pending.set(false);
+                            win.update_stt_ui();
+                            return;
+                        }
+                        win.begin_listening(
+                            PreparedBackend::Whistle(engine),
+                            language,
+                            start_timeout,
+                            end_silence,
+                            live,
+                        );
+                    }
+                    Ok(Err(error)) => {
+                        if win.stt_generation.get() != prep_id {
+                            return;
+                        }
+                        win.stt_preparing.set(false);
+                        win.live_pending.set(false);
+                        win.update_stt_ui();
+                        win.toast(&format!("Could not prepare Whistle: {error:#}"));
+                    }
+                    Err(_) => {
+                        if win.stt_generation.get() == prep_id {
+                            win.stt_preparing.set(false);
+                            win.live_pending.set(false);
+                            win.update_stt_ui();
+                        }
+                    }
+                }
+            });
+            return;
+        }
+
+        let model = self.selected_model();
+        if model.is_empty() {
+            self.toast("No model selected for speech recognition.");
+            return;
+        }
+        let backend = PreparedBackend::Builtin {
+            client: self.state.client.borrow().clone(),
+            model,
+        };
+        self.begin_listening(backend, language, start_timeout, end_silence, live);
+    }
+
+    fn begin_listening(
+        self: &Rc<Self>,
+        backend: PreparedBackend,
+        language: Option<String>,
+        start_timeout: std::time::Duration,
+        end_silence: std::time::Duration,
+        live: bool,
+    ) {
+        if !self.state.settings.borrow().stt_enabled {
+            return;
+        }
+
+        self.stop_stt();
+        if live {
+            self.input.buffer().set_text("");
+            self.stt_prefix.borrow_mut().clear();
+        } else {
+            let buffer = self.input.buffer();
+            *self.stt_prefix.borrow_mut() = buffer
+                .text(&buffer.start_iter(), &buffer.end_iter(), true)
+                .to_string();
+        }
+
+        match stt::start_listening(
+            &self.state.runtime,
+            backend,
+            language,
+            start_timeout,
+            end_silence,
+            live,
+        ) {
+            Ok((session, events)) => {
+                *self.stt_session.borrow_mut() = Some(session);
+                self.live_mode.set(live);
+                self.live_pending.set(false);
+                self.stt_listening.set(true);
+                self.stt_preparing.set(false);
+                self.update_stt_ui();
+                if live {
+                    self.toast("Live voice conversation started");
+                }
+
+                let id = self.stt_generation.get();
+                let win = self.clone();
+                glib::spawn_future_local(async move {
+                    let mut finished = false;
+                    while let Ok(event) = events.recv().await {
+                        if win.stt_generation.get() != id {
+                            return;
+                        }
+                        tracing::debug!("STT event: {event:?}");
+
+                        if live {
+                            match event {
+                                SttEvent::SpeechStarted => {
+                                    if win.active.borrow().is_some() {
+                                        win.stop_streaming();
+                                    }
+                                    win.stop_speech();
+                                }
+                                SttEvent::Partial(text) => win.apply_stt_text(&text),
+                                SttEvent::Final(text) => {
+                                    if text.trim().is_empty() {
+                                        continue;
+                                    }
+                                    win.apply_stt_text(&text);
+                                    if win.active.borrow().is_some() {
+                                        win.stop_streaming();
+                                    }
+                                    win.send_message();
+                                }
+                                SttEvent::Timeout => {}
+                                SttEvent::Error(error) => {
+                                    win.toast(&format!("Speech recognition failed: {error}"));
+                                    win.stop_stt();
+                                    finished = true;
+                                    break;
+                                }
+                                SttEvent::Stopped => {
+                                    win.stop_stt();
+                                    finished = true;
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
+
+                        match event {
+                            SttEvent::SpeechStarted => {
+                                win.mic_button
+                                    .set_tooltip_text(Some("Listening… click to stop"));
+                            }
+                            SttEvent::Partial(text) => win.apply_stt_text(&text),
+                            SttEvent::Final(text) => {
+                                win.apply_stt_text(&text);
+                                let autosend = win.state.settings.borrow().stt_autosend;
+                                let send = autosend && !text.trim().is_empty();
+                                win.stop_stt();
+                                if send {
+                                    win.send_message();
+                                }
+                                finished = true;
+                                break;
+                            }
+                            SttEvent::Timeout => {
+                                win.toast("No speech detected");
+                                win.stop_stt();
+                                finished = true;
+                                break;
+                            }
+                            SttEvent::Error(error) => {
+                                win.toast(&format!("Speech recognition failed: {error}"));
+                                win.stop_stt();
+                                finished = true;
+                                break;
+                            }
+                            SttEvent::Stopped => {
+                                win.stop_stt();
+                                finished = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !finished && win.stt_generation.get() == id {
+                        win.stop_stt();
+                    }
+                });
+            }
+            Err(error) => {
+                self.stt_listening.set(false);
+                self.live_mode.set(false);
+                self.live_pending.set(false);
+                self.update_stt_ui();
+                self.toast(&format!("Could not start the microphone: {error:#}"));
+            }
+        }
+    }
+
+    fn apply_stt_text(&self, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let prefix = self.stt_prefix.borrow().clone();
+        let combined = if prefix.trim().is_empty() {
+            text.to_string()
+        } else if prefix.ends_with(char::is_whitespace) {
+            format!("{prefix}{text}")
+        } else {
+            format!("{prefix} {text}")
+        };
+
+        let buffer = self.input.buffer();
+        buffer.set_text(&combined);
+        let end = buffer.end_iter();
+        buffer.place_cursor(&end);
+    }
+
+    fn stop_stt(&self) {
+        self.stt_generation
+            .set(self.stt_generation.get().saturating_add(1));
+        if let Some(session) = self.stt_session.borrow_mut().take() {
+            session.stop();
+        }
+        self.stt_listening.set(false);
+        self.stt_preparing.set(false);
+        self.live_mode.set(false);
+        self.live_pending.set(false);
+        self.update_stt_ui();
     }
 
     fn near_bottom(&self) -> bool {
@@ -823,6 +2265,10 @@ impl ChatWindow {
             .to_string();
         if text.is_empty() {
             return;
+        }
+
+        if self.stt_listening.get() && !self.live_mode.get() {
+            self.stop_stt();
         }
 
         let model = self.selected_model();
@@ -857,21 +2303,43 @@ impl ChatWindow {
             }
         };
 
-        if let Err(err) =
-            self.state
+        let user_id =
+            match self
+                .state
                 .store
                 .borrow()
                 .add_message(conversation_id, "user", &text, None)
-        {
-            self.toast(&format!("Could not save message: {err:#}"));
-            return;
-        }
+            {
+                Ok(id) => id,
+                Err(err) => {
+                    self.toast(&format!("Could not save message: {err:#}"));
+                    return;
+                }
+            };
 
-        self.add_user_message(&text);
+        self.add_user_message(conversation_id, Some(user_id), &text);
         self.main_stack.set_visible_child_name("chat");
 
         buffer.set_text("");
         self.reload_sidebar();
+        self.start_generation(conversation_id);
+    }
+
+    fn start_generation(self: &Rc<Self>, conversation_id: i64) {
+        if self.active.borrow().is_some() {
+            return;
+        }
+
+        let model = self.selected_model();
+        if model.is_empty() {
+            self.toast("No chat model selected. Pull one with `ollama pull`, then refresh.");
+            return;
+        }
+        let _ = self
+            .state
+            .store
+            .borrow()
+            .set_conversation_model(conversation_id, &model);
 
         let history = match self.state.store.borrow().messages(conversation_id) {
             Ok(messages) => messages,
@@ -913,6 +2381,7 @@ impl ChatWindow {
                 ..Default::default()
             }),
             keep_alive: Some("5m".to_string()),
+            think: None,
         };
 
         let (row, bubble, assistant_view) = self.add_assistant_bubble();
@@ -975,6 +2444,7 @@ impl ChatWindow {
 
         let content = active.content.borrow().clone();
         let stats = active.stats.borrow().clone();
+        let mut assistant_id = None;
 
         if !content.trim().is_empty() {
             let conversation_exists = self
@@ -986,13 +2456,16 @@ impl ChatWindow {
                 .flatten()
                 .is_some();
             if conversation_exists {
-                if let Err(err) = self.state.store.borrow().add_message(
+                match self.state.store.borrow().add_message(
                     active.conv_id,
                     "assistant",
                     &content,
                     stats.as_ref(),
                 ) {
-                    self.toast(&format!("Could not save reply: {err:#}"));
+                    Ok(id) => assistant_id = Some(id),
+                    Err(err) => {
+                        self.toast(&format!("Could not save reply: {err:#}"));
+                    }
                 }
             }
             if active.row.parent().is_some() {
@@ -1024,14 +2497,41 @@ impl ChatWindow {
             }
         }
 
+        if active.row.parent().is_some() {
+            if let Some(assistant_id) = assistant_id {
+                self.attach_message_actions(
+                    active.conv_id,
+                    &active.bubble,
+                    "assistant",
+                    &content,
+                    Some(assistant_id),
+                );
+            }
+        }
+
         self.set_streaming_ui(false);
         self.reload_sidebar();
         self.refresh_context_indicator();
         self.scroll_to_bottom();
+
+        let suppressed = self.suppress_autoread.replace(false);
+        let auto_read = {
+            let settings = self.state.settings.borrow();
+            settings.tts_enabled && (settings.tts_autoread || self.live_mode.get())
+        };
+        if auto_read
+            && !suppressed
+            && !content.trim().is_empty()
+            && *self.current_id.borrow() == Some(active.conv_id)
+            && self.resolve_tts().is_some()
+        {
+            self.speak(&content, None);
+        }
     }
 
     fn stop_streaming(&self) {
         if let Some(active) = self.active.borrow().as_ref() {
+            self.suppress_autoread.set(true);
             active.abort.abort();
         }
         self.set_streaming_ui(false);
@@ -1120,6 +2620,209 @@ impl ChatWindow {
 
         page.add(&generation);
 
+        let speech = adw::PreferencesGroup::new();
+        speech.set_title("Speech");
+
+        let tts_enable_row = adw::SwitchRow::new();
+        tts_enable_row.set_title("Enable text-to-speech");
+        tts_enable_row.set_subtitle("Show read-aloud buttons on assistant replies");
+        tts_enable_row.set_active(self.state.settings.borrow().tts_enabled);
+        speech.add(&tts_enable_row);
+
+        let backend_row = adw::ComboRow::new();
+        backend_row.set_title("Preferred TTS");
+        backend_row.set_subtitle(
+            "Automatic uses Paradee for English and the Ollama model for other languages",
+        );
+        let backends = gtk::StringList::new(&[
+            "Automatic",
+            "Paradee (local ONNX)",
+            "Ollama model (built-in)",
+        ]);
+        backend_row.set_model(Some(&backends));
+        backend_row.set_selected(tts_backend_index(&self.state.settings.borrow().tts_backend));
+        speech.add(&backend_row);
+
+        let language_row = adw::ComboRow::new();
+        language_row.set_title("Language");
+        language_row
+            .set_subtitle("Paradee: English only. Built-in languages depend on the selected model");
+        let language_choices: Rc<RefCell<Vec<TtsLanguage>>> = Rc::new(RefCell::new(Vec::new()));
+        let suppress_language = Rc::new(Cell::new(false));
+        {
+            let settings = self.state.settings.borrow();
+            let selected = fill_language_row(
+                &language_row,
+                &settings.tts_backend,
+                &settings.tts_language,
+                &language_choices,
+                &suppress_language,
+            );
+            drop(settings);
+            if self.state.settings.borrow().tts_language != selected {
+                self.state.settings.borrow_mut().tts_language = selected;
+                self.save_settings();
+            }
+        }
+        speech.add(&language_row);
+
+        let voice_row = adw::ComboRow::new();
+        voice_row.set_title("Voice");
+        voice_row.set_subtitle("Female or male, depending on the selected TTS and language");
+        let voice_choices: Rc<RefCell<Vec<VoiceOption>>> = Rc::new(RefCell::new(Vec::new()));
+        let suppress_voice = Rc::new(Cell::new(false));
+        {
+            let settings = self.state.settings.borrow();
+            let language = tts_language(&settings.tts_language);
+            let selected = fill_voice_row(
+                &voice_row,
+                &settings.tts_backend,
+                language,
+                &settings.tts_voice,
+                &voice_choices,
+                &suppress_voice,
+            );
+            drop(settings);
+            if self.state.settings.borrow().tts_voice != selected {
+                self.state.settings.borrow_mut().tts_voice = selected;
+                self.save_settings();
+            }
+        }
+        speech.add(&voice_row);
+
+        let tts_autoread_row = adw::SwitchRow::new();
+        tts_autoread_row.set_title("Read replies automatically");
+        tts_autoread_row.set_subtitle("Speak each assistant reply when it finishes");
+        tts_autoread_row.set_active(self.state.settings.borrow().tts_autoread);
+        tts_autoread_row.set_sensitive(self.state.settings.borrow().tts_enabled);
+        speech.add(&tts_autoread_row);
+
+        let paradee_row = adw::ActionRow::new();
+        paradee_row.set_title("Paradee model");
+        let downloaded = crate::paradee::is_downloaded();
+        paradee_row.set_subtitle(if downloaded {
+            "Downloaded · 8.5 MB · Apache-2.0"
+        } else {
+            "Not downloaded · 8.5 MB · Apache-2.0"
+        });
+        let download_button =
+            gtk::Button::with_label(if downloaded { "Downloaded" } else { "Download" });
+        download_button.add_css_class("flat");
+        download_button.set_valign(gtk::Align::Center);
+        download_button.set_sensitive(!downloaded);
+        paradee_row.add_suffix(&download_button);
+        speech.add(&paradee_row);
+
+        page.add(&speech);
+
+        let stt = adw::PreferencesGroup::new();
+        stt.set_title("Speech to Text");
+
+        let stt_enable_row = adw::SwitchRow::new();
+        stt_enable_row.set_title("Enable dictation");
+        stt_enable_row.set_subtitle("Show a microphone button in the composer");
+        stt_enable_row.set_active(self.state.settings.borrow().stt_enabled);
+        stt.add(&stt_enable_row);
+
+        let stt_provider_row = adw::ComboRow::new();
+        stt_provider_row.set_title("Preferred STT");
+        stt_provider_row.set_subtitle(
+            "Automatic prefers Whistle when downloaded, then an audio-capable Ollama model",
+        );
+        let stt_providers = gtk::StringList::new(&[
+            "Automatic",
+            "Whistle (local ONNX)",
+            "Ollama model (built-in)",
+        ]);
+        stt_provider_row.set_model(Some(&stt_providers));
+        stt_provider_row.set_selected(stt_provider_index(
+            &self.state.settings.borrow().stt_provider,
+        ));
+        stt.add(&stt_provider_row);
+
+        let stt_language_row = adw::ComboRow::new();
+        stt_language_row.set_title("Language");
+        stt_language_row.set_subtitle(
+            "Whistle supports seven languages; built-in support depends on the model",
+        );
+        let stt_choices: Rc<RefCell<Vec<SttLanguage>>> = Rc::new(RefCell::new(Vec::new()));
+        let suppress_stt_language = Rc::new(Cell::new(false));
+        {
+            let settings = self.state.settings.borrow();
+            let selected = fill_stt_language_row(
+                &stt_language_row,
+                &settings.stt_provider,
+                &settings.stt_language,
+                &stt_choices,
+                &suppress_stt_language,
+            );
+            drop(settings);
+            if self.state.settings.borrow().stt_language != selected {
+                self.state.settings.borrow_mut().stt_language = selected;
+                self.save_settings();
+            }
+        }
+        stt.add(&stt_language_row);
+
+        let stt_start_row = adw::SpinRow::new(
+            Some(&gtk::Adjustment::new(
+                self.state.settings.borrow().stt_start_timeout_secs as f64,
+                1.0,
+                60.0,
+                1.0,
+                5.0,
+                0.0,
+            )),
+            1.0,
+            0,
+        );
+        stt_start_row.set_title("Wait for speech");
+        stt_start_row.set_subtitle("Seconds before listening gives up when no voice is detected");
+        stt.add(&stt_start_row);
+
+        let stt_end_row = adw::SpinRow::new(
+            Some(&gtk::Adjustment::new(
+                self.state.settings.borrow().stt_end_silence_ms as f64 / 1000.0,
+                0.3,
+                5.0,
+                0.1,
+                0.5,
+                0.0,
+            )),
+            0.1,
+            1,
+        );
+        stt_end_row.set_title("End of speech silence");
+        stt_end_row.set_subtitle("Seconds of silence before the transcript is finished");
+        stt.add(&stt_end_row);
+
+        let stt_autosend_row = adw::SwitchRow::new();
+        stt_autosend_row.set_title("Send automatically");
+        stt_autosend_row.set_subtitle("Send the transcript when speech ends");
+        stt_autosend_row.set_active(self.state.settings.borrow().stt_autosend);
+        stt.add(&stt_autosend_row);
+
+        let whistle_row = adw::ActionRow::new();
+        whistle_row.set_title("Whistle model");
+        let whistle_downloaded = crate::whistle::is_downloaded();
+        whistle_row.set_subtitle(if whistle_downloaded {
+            "Downloaded · ~160 MB · Apache-2.0"
+        } else {
+            "Not downloaded · ~160 MB · Apache-2.0"
+        });
+        let whistle_button = gtk::Button::with_label(if whistle_downloaded {
+            "Downloaded"
+        } else {
+            "Download"
+        });
+        whistle_button.add_css_class("flat");
+        whistle_button.set_valign(gtk::Align::Center);
+        whistle_button.set_sensitive(!whistle_downloaded);
+        whistle_row.add_suffix(&whistle_button);
+        stt.add(&whistle_row);
+
+        page.add(&stt);
+
         let appearance = adw::PreferencesGroup::new();
         appearance.set_title("Appearance");
 
@@ -1188,6 +2891,254 @@ impl ChatWindow {
                 win.apply_theme();
             });
         }
+        {
+            let win = self.clone();
+            let autoread_row = tts_autoread_row.clone();
+            tts_enable_row.connect_active_notify(move |row| {
+                win.state.settings.borrow_mut().tts_enabled = row.is_active();
+                win.save_settings();
+                autoread_row.set_sensitive(row.is_active());
+                win.update_speech_buttons();
+                if !row.is_active() {
+                    if win.live_mode.get() || win.live_pending.get() {
+                        win.stop_stt();
+                    }
+                    win.stop_speech();
+                    win.unload_tts_engine();
+                }
+                win.update_stt_ui();
+            });
+        }
+        {
+            let win = self.clone();
+            tts_autoread_row.connect_active_notify(move |row| {
+                win.state.settings.borrow_mut().tts_autoread = row.is_active();
+                win.save_settings();
+            });
+        }
+        {
+            let win = self.clone();
+            let language_row = language_row.clone();
+            let choices = Rc::clone(&language_choices);
+            let suppress = Rc::clone(&suppress_language);
+            let voice_row = voice_row.clone();
+            let voice_choices = Rc::clone(&voice_choices);
+            let suppress_voice = Rc::clone(&suppress_voice);
+            backend_row.connect_selected_notify(move |row| {
+                let backend = tts_backend_from_index(row.selected());
+                win.state.settings.borrow_mut().tts_backend = backend.to_string();
+                let current = win.state.settings.borrow().tts_language.clone();
+                let selected =
+                    fill_language_row(&language_row, backend, &current, &choices, &suppress);
+                let language = tts_language(&selected);
+                win.state.settings.borrow_mut().tts_language = selected;
+
+                let current_voice = win.state.settings.borrow().tts_voice.clone();
+                let selected_voice = fill_voice_row(
+                    &voice_row,
+                    backend,
+                    language,
+                    &current_voice,
+                    &voice_choices,
+                    &suppress_voice,
+                );
+                win.state.settings.borrow_mut().tts_voice = selected_voice;
+
+                win.save_settings();
+                win.stop_speech();
+                win.update_speech_buttons();
+            });
+        }
+        {
+            let win = self.clone();
+            let choices = Rc::clone(&language_choices);
+            let suppress = Rc::clone(&suppress_language);
+            let voice_row = voice_row.clone();
+            let voice_choices = Rc::clone(&voice_choices);
+            let suppress_voice = Rc::clone(&suppress_voice);
+            language_row.connect_selected_notify(move |row| {
+                if suppress.get() {
+                    return;
+                }
+                let index = row.selected() as usize;
+                if let Some(language) = choices.borrow().get(index).copied() {
+                    win.state.settings.borrow_mut().tts_language = language.code.to_string();
+                    let backend = win.state.settings.borrow().tts_backend.clone();
+                    let current_voice = win.state.settings.borrow().tts_voice.clone();
+                    let selected_voice = fill_voice_row(
+                        &voice_row,
+                        &backend,
+                        language,
+                        &current_voice,
+                        &voice_choices,
+                        &suppress_voice,
+                    );
+                    win.state.settings.borrow_mut().tts_voice = selected_voice;
+                    win.save_settings();
+                    win.stop_speech();
+                    win.update_speech_buttons();
+                }
+            });
+        }
+        {
+            let win = self.clone();
+            let choices = Rc::clone(&voice_choices);
+            let suppress = Rc::clone(&suppress_voice);
+            voice_row.connect_selected_notify(move |row| {
+                if suppress.get() {
+                    return;
+                }
+                let index = row.selected() as usize;
+                if let Some(voice) = choices.borrow().get(index) {
+                    win.state.settings.borrow_mut().tts_voice = voice.id.clone();
+                    win.save_settings();
+                    win.stop_speech();
+                }
+            });
+        }
+        {
+            let win = self.clone();
+            let row = paradee_row.clone();
+            let button = download_button.clone();
+            download_button.connect_clicked(move |_| {
+                if crate::paradee::is_downloaded() {
+                    return;
+                }
+                button.set_sensitive(false);
+                row.set_subtitle("Downloading…");
+                let (tx, rx) = async_channel::bounded(1);
+                win.state.runtime.spawn(async move {
+                    let result = crate::paradee::ensure_downloaded().await;
+                    let _ = tx.send(result).await;
+                });
+
+                let win = win.clone();
+                let row = row.clone();
+                let button = button.clone();
+                glib::spawn_future_local(async move {
+                    match rx.recv().await {
+                        Ok(Ok(())) => {
+                            row.set_subtitle("Downloaded · 8.5 MB · Apache-2.0");
+                            button.set_label("Downloaded");
+                            button.set_sensitive(false);
+                            win.toast("Paradee voice model downloaded");
+                        }
+                        Ok(Err(err)) => {
+                            row.set_subtitle("Not downloaded · 8.5 MB · Apache-2.0");
+                            button.set_sensitive(true);
+                            win.toast(&format!("Could not download Paradee model: {err:#}"));
+                        }
+                        Err(_) => {}
+                    }
+                });
+            });
+        }
+
+        {
+            let win = self.clone();
+            stt_enable_row.connect_active_notify(move |row| {
+                win.state.settings.borrow_mut().stt_enabled = row.is_active();
+                win.save_settings();
+                if row.is_active() {
+                    win.update_stt_ui();
+                } else {
+                    win.stop_stt();
+                    win.unload_stt_engine();
+                }
+            });
+        }
+        {
+            let win = self.clone();
+            let language_row = stt_language_row.clone();
+            let choices = Rc::clone(&stt_choices);
+            let suppress = Rc::clone(&suppress_stt_language);
+            stt_provider_row.connect_selected_notify(move |row| {
+                let provider = stt_provider_from_index(row.selected());
+                win.state.settings.borrow_mut().stt_provider = provider.to_string();
+                let current = win.state.settings.borrow().stt_language.clone();
+                let selected =
+                    fill_stt_language_row(&language_row, provider, &current, &choices, &suppress);
+                win.state.settings.borrow_mut().stt_language = selected;
+                win.save_settings();
+                win.stop_stt();
+            });
+        }
+        {
+            let win = self.clone();
+            let choices = Rc::clone(&stt_choices);
+            let suppress = Rc::clone(&suppress_stt_language);
+            stt_language_row.connect_selected_notify(move |row| {
+                if suppress.get() {
+                    return;
+                }
+                let index = row.selected() as usize;
+                if let Some(language) = choices.borrow().get(index).copied() {
+                    win.state.settings.borrow_mut().stt_language = language.code.to_string();
+                    win.save_settings();
+                    win.stop_stt();
+                }
+            });
+        }
+        {
+            let win = self.clone();
+            stt_start_row.connect_value_notify(move |row| {
+                win.state.settings.borrow_mut().stt_start_timeout_secs =
+                    row.value().max(1.0) as u32;
+                win.save_settings();
+            });
+        }
+        {
+            let win = self.clone();
+            stt_end_row.connect_value_notify(move |row| {
+                win.state.settings.borrow_mut().stt_end_silence_ms =
+                    (row.value() * 1000.0).max(200.0) as u32;
+                win.save_settings();
+            });
+        }
+        {
+            let win = self.clone();
+            stt_autosend_row.connect_active_notify(move |row| {
+                win.state.settings.borrow_mut().stt_autosend = row.is_active();
+                win.save_settings();
+            });
+        }
+        {
+            let win = self.clone();
+            let row = whistle_row.clone();
+            let button = whistle_button.clone();
+            whistle_button.connect_clicked(move |_| {
+                if crate::whistle::is_downloaded() {
+                    return;
+                }
+                button.set_sensitive(false);
+                row.set_subtitle("Downloading…");
+                let (tx, rx) = async_channel::bounded(1);
+                win.state.runtime.spawn(async move {
+                    let result = crate::whistle::ensure_downloaded().await;
+                    let _ = tx.send(result).await;
+                });
+
+                let win = win.clone();
+                let row = row.clone();
+                let button = button.clone();
+                glib::spawn_future_local(async move {
+                    match rx.recv().await {
+                        Ok(Ok(())) => {
+                            row.set_subtitle("Downloaded · ~160 MB · Apache-2.0");
+                            button.set_label("Downloaded");
+                            button.set_sensitive(false);
+                            win.toast("Whistle speech model downloaded");
+                        }
+                        Ok(Err(err)) => {
+                            row.set_subtitle("Not downloaded · ~160 MB · Apache-2.0");
+                            button.set_sensitive(true);
+                            win.toast(&format!("Could not download Whistle model: {err:#}"));
+                        }
+                        Err(_) => {}
+                    }
+                });
+            });
+        }
 
         let dialog = adw::PreferencesDialog::builder()
             .title("Preferences")
@@ -1209,6 +3160,13 @@ impl ChatWindow {
 
     fn toast(&self, message: &str) {
         self.toast_overlay.add_toast(adw::Toast::new(message));
+    }
+}
+
+fn trim_heap() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::malloc_trim(0);
     }
 }
 
@@ -1258,9 +3216,264 @@ fn apply_usage_class(label: &gtk::Label, percent: f64) {
     }
 }
 
+fn message_action_button(icon: &str, tooltip: &str) -> gtk::Button {
+    let button = gtk::Button::from_icon_name(icon);
+    button.add_css_class("flat");
+    button.add_css_class("message-action");
+    button.set_tooltip_text(Some(tooltip));
+    button
+}
+
+const SENTENCE_ABBREVIATIONS: &[&str] = &[
+    "mr", "mrs", "ms", "dr", "prof", "st", "jr", "sr", "vs", "etc", "e.g", "i.e", "u.s", "u.k",
+    "ph.d", "a.m", "p.m",
+];
+
+fn split_sentences(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut sentences = Vec::new();
+    let mut start = 0usize;
+    let mut index = 0usize;
+
+    while index < chars.len() {
+        let character = chars[index];
+        let boundary = match character {
+            '!' | '?' | '\n' => true,
+            '.' => {
+                let previous = index.checked_sub(1).map(|position| chars[position]);
+                let next = chars.get(index + 1).copied();
+                let ellipsis = previous == Some('.') || next == Some('.');
+                let decimal = previous.is_some_and(|c| c.is_ascii_digit())
+                    && next.is_some_and(|c| c.is_ascii_digit());
+                let initial = previous.is_some_and(|c| c.is_ascii_uppercase())
+                    && (index < 2
+                        || chars[index - 2].is_whitespace()
+                        || matches!(chars[index - 2], '"' | '\'' | '(' | '['));
+                let after = chars[index + 1..]
+                    .iter()
+                    .find(|c| !c.is_whitespace())
+                    .copied();
+                let continues = after.is_some_and(|c| c.is_lowercase() || c.is_ascii_digit());
+                let token = chars[start..index]
+                    .iter()
+                    .collect::<String>()
+                    .split_whitespace()
+                    .last()
+                    .unwrap_or("")
+                    .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.')
+                    .to_ascii_lowercase();
+                let abbreviation = SENTENCE_ABBREVIATIONS.contains(&token.as_str());
+                !ellipsis && !decimal && !initial && !continues && !abbreviation
+            }
+            _ => false,
+        };
+
+        if boundary {
+            let mut end = index;
+            while let Some(next) = chars.get(end + 1) {
+                if matches!(next, '"' | '\'' | ')' | ']' | '}' | '»' | '”') {
+                    end += 1;
+                } else {
+                    break;
+                }
+            }
+            let sentence: String = chars[start..=end].iter().collect();
+            let sentence = sentence.trim();
+            if !sentence.is_empty() {
+                sentences.push(sentence.to_string());
+            }
+            start = end + 1;
+            index = end + 1;
+            continue;
+        }
+
+        index += 1;
+    }
+
+    if start < chars.len() {
+        let tail: String = chars[start..].iter().collect();
+        let tail = tail.trim();
+        if !tail.is_empty() {
+            sentences.push(tail.to_string());
+        }
+    }
+
+    if sentences.is_empty() {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            sentences.push(trimmed.to_string());
+        }
+    }
+
+    sentences
+}
+
+/// Split text into sentences, limiting the total to Ollama's 4,096-character
+/// speech input budget. Returns the chunks and whether text was dropped.
+fn sentences_for_speech(text: &str, max_chars: usize) -> (Vec<String>, bool) {
+    let sentences = split_sentences(text);
+    let mut result = Vec::new();
+    let mut used = 0usize;
+
+    for sentence in sentences {
+        let length = sentence.chars().count();
+        if used + length <= max_chars {
+            used += length;
+            result.push(sentence);
+            continue;
+        }
+
+        if result.is_empty() {
+            let cut: String = sentence.chars().take(max_chars).collect();
+            let cut = cut.trim_end();
+            if !cut.is_empty() {
+                result.push(cut.to_string());
+            }
+        }
+        return (result, true);
+    }
+
+    (result, false)
+}
+
+fn spawn_playback_thread(
+    generation: Arc<AtomicU64>,
+) -> anyhow::Result<async_channel::Sender<PlaybackChunk>> {
+    let (tx, rx) = async_channel::bounded::<PlaybackChunk>(4);
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+
+    std::thread::Builder::new()
+        .name("ollama-gui-tts".to_string())
+        .spawn(move || {
+            let stream = match rodio::OutputStreamBuilder::open_default_stream() {
+                Ok(stream) => {
+                    let _ = ready_tx.send(Ok(()));
+                    stream
+                }
+                Err(err) => {
+                    let _ = ready_tx.send(Err(err.to_string()));
+                    return;
+                }
+            };
+
+            while let Ok(chunk) = rx.recv_blocking() {
+                if chunk.generation != generation.load(Ordering::SeqCst) {
+                    continue;
+                }
+
+                let sink = rodio::Sink::connect_new(stream.mixer());
+                tracing::debug!(
+                    "speech playback: {} samples at {} Hz, {} channel(s)",
+                    chunk.samples.len(),
+                    chunk.sample_rate,
+                    chunk.channels
+                );
+                sink.append(rodio::buffer::SamplesBuffer::new(
+                    chunk.channels,
+                    chunk.sample_rate,
+                    chunk.samples,
+                ));
+
+                while !sink.empty() {
+                    if generation.load(Ordering::SeqCst) != chunk.generation {
+                        sink.stop();
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+        })?;
+
+    match ready_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+        Ok(Ok(())) => Ok(tx),
+        Ok(Err(err)) => anyhow::bail!("{err}"),
+        Err(_) => anyhow::bail!("audio output did not initialize"),
+    }
+}
+
+/// Decode the 16-bit PCM WAV returned by `/v1/audio/speech` into rodio samples.
+fn decode_wav(bytes: &[u8]) -> anyhow::Result<(Vec<f32>, u32, u16)> {
+    anyhow::ensure!(
+        bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE",
+        "speech endpoint did not return WAV audio"
+    );
+
+    let mut position = 12usize;
+    let mut channels = 1u16;
+    let mut sample_rate = 24_000u32;
+    let mut bits = 16u16;
+    let mut data: Option<&[u8]> = None;
+
+    while position + 8 <= bytes.len() {
+        let id = &bytes[position..position + 4];
+        let size = u32::from_le_bytes(
+            bytes[position + 4..position + 8]
+                .try_into()
+                .expect("chunk size"),
+        ) as usize;
+        let body_start = position + 8;
+        let body_end = body_start.saturating_add(size).min(bytes.len());
+        let body = &bytes[body_start..body_end];
+
+        match id {
+            b"fmt " if body.len() >= 16 => {
+                channels = u16::from_le_bytes([body[0], body[1]]);
+                sample_rate = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+                bits = u16::from_le_bytes([body[14], body[15]]);
+            }
+            b"data" => data = Some(body),
+            _ => {}
+        }
+
+        position = body_start.saturating_add(size).saturating_add(size & 1);
+    }
+
+    let data = data.ok_or_else(|| anyhow::anyhow!("WAV file has no data chunk"))?;
+    anyhow::ensure!(bits == 16, "unsupported WAV sample size: {bits} bits");
+    anyhow::ensure!(channels > 0, "unsupported WAV channel count");
+
+    let samples: Vec<f32> = data
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| i16::from_le_bytes(*pair) as f32 / 32_768.0)
+        .collect();
+    anyhow::ensure!(!samples.is_empty(), "WAV data chunk is empty");
+
+    Ok((samples, sample_rate, channels))
+}
+
+fn capability_css_class(capability: &str) -> Option<&'static str> {
+    match capability {
+        "vision" => Some("cap-vision"),
+        "tools" => Some("cap-tools"),
+        "thinking" => Some("cap-thinking"),
+        "audio" | "speech" => Some("cap-audio"),
+        _ => None,
+    }
+}
+
+fn capability_description(capability: &str) -> Option<&'static str> {
+    match capability {
+        "completion" => Some("Generates text completions"),
+        "chat" => Some("Chat-capable model"),
+        "vision" => Some("Can process images"),
+        "tools" => Some("Supports tool calling"),
+        "thinking" => Some("Emits reasoning/thinking output"),
+        "audio" => Some("Can process audio input"),
+        "speech" => Some("Can generate speech"),
+        "embedding" => Some("Produces embeddings"),
+        "decision" => Some("Decision/classification model"),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{format_percent, group_digits};
+    use super::{
+        decode_wav, format_percent, group_digits, sentences_for_speech, split_sentences,
+        tts_language, voice_options_for_backend,
+    };
 
     #[test]
     fn groups_thousands() {
@@ -1276,5 +3489,132 @@ mod tests {
         assert_eq!(format_percent(0.28), "0.3%");
         assert_eq!(format_percent(9.9), "9.9%");
         assert_eq!(format_percent(15.4), "15%");
+    }
+
+    #[test]
+    fn paradee_offers_two_voices_per_english_accent() {
+        let us = voice_options_for_backend("paradee", tts_language("en-us"));
+        assert_eq!(us.len(), 2);
+        assert_eq!(us[0].id, "af_heart");
+        assert_eq!(us[1].id, "am_puck");
+
+        let gb = voice_options_for_backend("paradee", tts_language("en-gb"));
+        assert_eq!(gb.len(), 2);
+        assert_eq!(gb[0].id, "bf_isabella");
+        assert_eq!(gb[1].id, "bm_fable");
+    }
+
+    #[test]
+    fn builtin_offers_female_and_male_per_language() {
+        let spanish = voice_options_for_backend("builtin", tts_language("es"));
+        assert_eq!(spanish.len(), 2);
+        assert_eq!(spanish[0].id, "female-spanish");
+        assert_eq!(spanish[1].id, "male-spanish");
+
+        let auto_english = voice_options_for_backend("auto", tts_language("en-us"));
+        assert_eq!(auto_english[0].id, "af_heart");
+        let auto_spanish = voice_options_for_backend("auto", tts_language("es"));
+        assert_eq!(auto_spanish[0].id, "female-spanish");
+    }
+
+    #[test]
+    fn splits_sentences_on_punctuation() {
+        assert_eq!(
+            split_sentences("First sentence. Second one! Third?"),
+            vec!["First sentence.", "Second one!", "Third?"]
+        );
+        assert_eq!(
+            split_sentences("Dr. Smith went home. He slept."),
+            vec!["Dr. Smith went home.", "He slept."]
+        );
+        assert_eq!(
+            split_sentences("Pi is 3.14 today."),
+            vec!["Pi is 3.14 today."]
+        );
+        assert_eq!(split_sentences("Wait... what?"), vec!["Wait... what?"]);
+    }
+
+    #[test]
+    fn speech_budget_stops_before_oversized_sentence() {
+        let (chunks, truncated) = sentences_for_speech("One. Two. Three.", 9);
+        assert_eq!(chunks, vec!["One.", "Two."]);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn decodes_16_bit_wav() {
+        let wav = wav_bytes(&[0, 16384, -16384], 24_000);
+        let (samples, sample_rate, channels) = decode_wav(&wav).unwrap();
+        assert_eq!(sample_rate, 24_000);
+        assert_eq!(channels, 1);
+        assert_eq!(samples.len(), 3);
+        assert!(samples[0].abs() < 0.001);
+        assert!((samples[1] - 0.5).abs() < 0.001);
+        assert!((samples[2] + 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    #[ignore = "requires an audio output device"]
+    fn rodio_plays_silence() {
+        let stream = rodio::OutputStreamBuilder::open_default_stream().expect("audio output");
+        let sink = rodio::Sink::connect_new(stream.mixer());
+        sink.append(rodio::buffer::SamplesBuffer::new(
+            1,
+            24_000,
+            vec![0.0f32; 4_800],
+        ));
+        let started = std::time::Instant::now();
+        while !sink.empty() {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(3),
+                "rodio playback did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a local Ollama speech model"]
+    fn live_speech_decodes_to_samples() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let client = crate::api::OllamaClient::new("http://localhost:11434", "");
+            let models = client.list_models().await.expect("list models");
+            let model = models
+                .iter()
+                .find(|model| model.capabilities.iter().any(|item| item == "speech"))
+                .map(|model| model.name.clone())
+                .expect("no speech-capable models installed");
+
+            let audio = client
+                .speech(&model, "Hello from Ollama GUI.", "default")
+                .await
+                .expect("speech request");
+            let (samples, sample_rate, channels) = decode_wav(&audio).expect("decode wav");
+            assert_eq!(channels, 1);
+            assert_eq!(sample_rate, 24_000);
+            assert!(samples.len() > 1_000);
+        });
+    }
+
+    fn wav_bytes(samples: &[i16], sample_rate: u32) -> Vec<u8> {
+        let data_length = (samples.len() * 2) as u32;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_length).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // mono
+        bytes.extend_from_slice(&sample_rate.to_le_bytes());
+        bytes.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_length.to_le_bytes());
+        for sample in samples {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        bytes
     }
 }

@@ -10,7 +10,7 @@ gtk = { package = "gtk4", version = "0.11", features = ["v4_24"] }
 libadwaita = { version = "0.9", features = ["v1_10"] }
 sourceview5 = "0.11"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "time"] }
-reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "multipart"] }
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -18,5 +18,11 @@ async-channel = "2"
 rusqlite = { version = "0.41", features = ["bundled"] }
 anyhow = "1"
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 pulldown-cmark = "0.13"
+rodio = { version = "0.21", default-features = false, features = ["playback"] }
+ort = "=2.0.0-rc.13"
+silero = "0.7"
+cpal = "0.16"
+hound = "3.5"
+libc = "0.2"

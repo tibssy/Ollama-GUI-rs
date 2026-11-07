@@ -13,6 +13,28 @@ pub struct Settings {
     pub num_ctx: u32,
     /// "system", "light" or "dark"
     pub theme: String,
+    /// "auto", "paradee" or "builtin"
+    pub tts_backend: String,
+    /// Language code such as "en-us" or "es"
+    pub tts_language: String,
+    /// Voice id for the selected TTS backend
+    pub tts_voice: String,
+    /// Enable text-to-speech buttons and auto-reading
+    pub tts_enabled: bool,
+    /// Read assistant replies automatically
+    pub tts_autoread: bool,
+    /// Enable the microphone/dictation button
+    pub stt_enabled: bool,
+    /// "auto", "whistle" or "builtin"
+    pub stt_provider: String,
+    /// "auto" or a language code
+    pub stt_language: String,
+    /// Seconds to wait for speech before stopping
+    pub stt_start_timeout_secs: u32,
+    /// Silence in milliseconds that ends an utterance
+    pub stt_end_silence_ms: u32,
+    /// Send the transcript to the model automatically
+    pub stt_autosend: bool,
 }
 
 impl Default for Settings {
@@ -25,6 +47,17 @@ impl Default for Settings {
             temperature: 0.7,
             num_ctx: 8192,
             theme: "system".to_string(),
+            tts_backend: "auto".to_string(),
+            tts_language: "en-us".to_string(),
+            tts_voice: "af_heart".to_string(),
+            tts_enabled: true,
+            tts_autoread: false,
+            stt_enabled: false,
+            stt_provider: "auto".to_string(),
+            stt_language: "auto".to_string(),
+            stt_start_timeout_secs: 5,
+            stt_end_silence_ms: 1000,
+            stt_autosend: false,
         }
     }
 }

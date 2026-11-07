@@ -52,6 +52,44 @@
   color: @error_color;
 }
 
+.capability-pill {
+  background: alpha(@card_fg_color, 0.08);
+  border-radius: 999px;
+  padding: 1px 8px;
+  font-size: 0.78em;
+}
+
+.capability-pill.cap-vision {
+  background: alpha(#9141ac, 0.22);
+}
+
+.capability-pill.cap-tools {
+  background: alpha(#3584e4, 0.22);
+}
+
+.capability-pill.cap-thinking {
+  background: alpha(#2ec27e, 0.22);
+}
+
+.capability-pill.cap-audio {
+  background: alpha(#e66100, 0.22);
+}
+
+.message-action {
+  min-width: 24px;
+  min-height: 24px;
+  padding: 2px;
+  opacity: 0.65;
+}
+
+.message-action:hover {
+  opacity: 1;
+}
+
+.user-bubble .message-action {
+  color: @accent_fg_color;
+}
+
 .code-container {
   background: @view_bg_color;
   border-radius: 10px;

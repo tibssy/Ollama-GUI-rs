@@ -1,7 +1,10 @@
 mod api;
 mod config;
+mod paradee;
 mod store;
+mod stt;
 mod ui;
+mod whistle;
 
 use gtk::gio;
 use gtk::prelude::*;
@@ -9,8 +12,10 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 
 fn main() -> gtk::glib::ExitCode {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,ort=warn"));
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
+        .with_env_filter(filter)
         .with_target(false)
         .init();
 

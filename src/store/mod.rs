@@ -14,6 +14,7 @@ pub struct ConversationSummary {
 
 #[derive(Debug, Clone)]
 pub struct StoredMessage {
+    pub id: i64,
     pub role: String,
     pub content: String,
 }
@@ -268,13 +269,14 @@ impl Store {
 
     pub fn messages(&self, conversation_id: i64) -> Result<Vec<StoredMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT role, content FROM messages
+            "SELECT id, role, content FROM messages
              WHERE conversation_id = ?1 ORDER BY id ASC",
         )?;
         let rows = stmt.query_map(params![conversation_id], |row| {
             Ok(StoredMessage {
-                role: row.get(0)?,
-                content: row.get(1)?,
+                id: row.get(0)?,
+                role: row.get(1)?,
+                content: row.get(2)?,
             })
         })?;
         let mut messages = Vec::new();
@@ -282,6 +284,71 @@ impl Store {
             messages.push(row?);
         }
         Ok(messages)
+    }
+
+    /// Remove a message together with its counterpart in the same turn.
+    ///
+    /// Removing a user message also removes the assistant reply that follows
+    /// it; removing an assistant message also removes the user prompt that
+    /// precedes it. Returns the deleted message ids.
+    pub fn delete_turn(&self, conversation_id: i64, message_id: i64) -> Result<Vec<i64>> {
+        let messages = self.messages(conversation_id)?;
+        let Some(index) = messages.iter().position(|message| message.id == message_id) else {
+            return Ok(Vec::new());
+        };
+
+        let mut ids = vec![message_id];
+        match messages[index].role.as_str() {
+            "user" => {
+                if let Some(next) = messages.get(index + 1) {
+                    if next.role == "assistant" {
+                        ids.push(next.id);
+                    }
+                }
+            }
+            "assistant" => {
+                if let Some(previous) = index
+                    .checked_sub(1)
+                    .and_then(|previous_index| messages.get(previous_index))
+                {
+                    if previous.role == "user" {
+                        ids.push(previous.id);
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        for id in &ids {
+            self.conn.execute(
+                "DELETE FROM messages WHERE conversation_id = ?1 AND id = ?2",
+                params![conversation_id, id],
+            )?;
+        }
+        self.recalculate_context_used(conversation_id)?;
+        Ok(ids)
+    }
+
+    /// Delete a message and everything after it. Used when regenerating an
+    /// earlier reply, where all later turns no longer apply.
+    pub fn delete_from_message(&self, conversation_id: i64, message_id: i64) -> Result<usize> {
+        let deleted = self.conn.execute(
+            "DELETE FROM messages WHERE conversation_id = ?1 AND id >= ?2",
+            params![conversation_id, message_id],
+        )?;
+        self.recalculate_context_used(conversation_id)?;
+        Ok(deleted)
+    }
+
+    pub fn recalculate_context_used(&self, conversation_id: i64) -> Result<()> {
+        let used = self.latest_stats_used(conversation_id)?;
+        self.conn.execute(
+            "UPDATE conversations
+             SET context_used = ?1, updated_at = unixepoch()
+             WHERE id = ?2",
+            params![used, conversation_id],
+        )?;
+        Ok(())
     }
 }
 
@@ -337,5 +404,63 @@ mod tests {
         // Messages without stats must not reset the recorded usage.
         store.add_message(id, "user", "hello", None).unwrap();
         assert_eq!(store.conversation_context_used(id).unwrap(), Some(23));
+    }
+
+    fn stats(eval_count: u32, prompt_eval_count: u32) -> StreamStats {
+        StreamStats {
+            eval_count: Some(eval_count),
+            eval_duration: None,
+            prompt_eval_count: Some(prompt_eval_count),
+        }
+    }
+
+    #[test]
+    fn delete_turn_removes_prompt_and_reply() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_conversation("model", "title").unwrap();
+        let user1 = store.add_message(id, "user", "one", None).unwrap();
+        let assistant1 = store
+            .add_message(id, "assistant", "two", Some(&stats(2, 3)))
+            .unwrap();
+        let user2 = store.add_message(id, "user", "three", None).unwrap();
+        let assistant2 = store
+            .add_message(id, "assistant", "four", Some(&stats(4, 5)))
+            .unwrap();
+        assert_eq!(store.conversation_context_used(id).unwrap(), Some(9));
+
+        let removed = store.delete_turn(id, user2).unwrap();
+        assert_eq!(removed.len(), 2);
+        assert!(removed.contains(&user2));
+        assert!(removed.contains(&assistant2));
+        assert_eq!(store.messages(id).unwrap().len(), 2);
+        assert_eq!(store.conversation_context_used(id).unwrap(), Some(5));
+
+        let removed = store.delete_turn(id, assistant1).unwrap();
+        assert_eq!(removed.len(), 2);
+        assert!(removed.contains(&user1));
+        assert!(removed.contains(&assistant1));
+        assert!(store.messages(id).unwrap().is_empty());
+        assert_eq!(store.conversation_context_used(id).unwrap(), None);
+    }
+
+    #[test]
+    fn delete_from_message_truncates_later_turns() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_conversation("model", "title").unwrap();
+        let user1 = store.add_message(id, "user", "one", None).unwrap();
+        let assistant1 = store
+            .add_message(id, "assistant", "two", Some(&stats(2, 3)))
+            .unwrap();
+        store.add_message(id, "user", "three", None).unwrap();
+        store
+            .add_message(id, "assistant", "four", Some(&stats(4, 5)))
+            .unwrap();
+
+        let deleted = store.delete_from_message(id, assistant1).unwrap();
+        assert_eq!(deleted, 3);
+        let remaining = store.messages(id).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, user1);
+        assert_eq!(store.conversation_context_used(id).unwrap(), None);
     }
 }
