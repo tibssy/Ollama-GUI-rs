@@ -3392,6 +3392,206 @@ const SENTENCE_ABBREVIATIONS: &[&str] = &[
     "ph.d", "a.m", "p.m",
 ];
 
+/// Punctuation that adds a pause when spoken. Everything else that is not a
+/// letter, digit, or whitespace is dropped from speech input.
+const SPEECH_PUNCTUATION: &[char] = &[
+    '.', ',', '!', '?', ';', ':', '\'', '"', '-', '–', '—', '…', '‘', '’', '“', '”', '。', '，',
+    '！', '？', '；', '：', '、',
+];
+
+/// Convert markdown-rich assistant output into plain text for speech engines.
+///
+/// Fenced code blocks are skipped, HTML tags and link targets are removed, and
+/// symbols/emoji that TTS engines would read as noise are dropped. Letters and
+/// digits from every language are kept, as are common sentence punctuation and
+/// apostrophes.
+fn plain_text_for_speech(text: &str) -> String {
+    let stripped = strip_fenced_code_blocks(text);
+    let mut lines = Vec::new();
+
+    for line in stripped.lines() {
+        let line = strip_html_tags(line);
+        let line = replace_markdown_links(&line);
+        let line = strip_line_prefixes(&line);
+        let line = strip_bare_urls(&line);
+        let line = speech_safe_characters(&line);
+        let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if line.chars().any(|character| character.is_alphanumeric()) {
+            lines.push(line);
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn strip_fenced_code_blocks(text: &str) -> String {
+    let mut result = String::new();
+    let mut fence: Option<&str> = None;
+
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if let Some(marker) = fence {
+            if trimmed.starts_with(marker) {
+                fence = None;
+            }
+            continue;
+        }
+        if trimmed.starts_with("```") {
+            fence = Some("```");
+            continue;
+        }
+        if trimmed.starts_with("~~~") {
+            fence = Some("~~~");
+            continue;
+        }
+        result.push_str(line);
+        result.push('\n');
+    }
+
+    result
+}
+
+fn strip_html_tags(line: &str) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let mut result = String::new();
+    let mut index = 0;
+
+    while index < chars.len() {
+        if chars[index] == '<' {
+            if let Some(close) = chars[index + 1..].iter().position(|c| *c == '>') {
+                let tag: String = chars[index + 1..index + 1 + close].iter().collect();
+                let name = tag
+                    .trim_start_matches('/')
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("");
+                if name.eq_ignore_ascii_case("br") {
+                    result.push('\n');
+                }
+                index += close + 2;
+                continue;
+            }
+        }
+        result.push(chars[index]);
+        index += 1;
+    }
+
+    decode_html_entities(&result)
+}
+
+fn decode_html_entities(text: &str) -> String {
+    text.replace("&amp;", " and ")
+        .replace("&lt;", " ")
+        .replace("&gt;", " ")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&nbsp;", " ")
+}
+
+fn replace_markdown_links(line: &str) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let mut result = String::new();
+    let mut index = 0;
+
+    while index < chars.len() {
+        let image = chars[index] == '!' && chars.get(index + 1) == Some(&'[');
+        let open = if image {
+            index + 1
+        } else if chars[index] == '[' {
+            index
+        } else {
+            usize::MAX
+        };
+
+        if open != usize::MAX {
+            if let Some(close) = chars[open + 1..].iter().position(|c| *c == ']') {
+                let close = open + 1 + close;
+                let mut end = close + 1;
+                let mut has_target = false;
+                if chars.get(end) == Some(&'(') {
+                    if let Some(paren) = chars[end + 1..].iter().position(|c| *c == ')') {
+                        end = end + 1 + paren + 1;
+                        has_target = true;
+                    }
+                } else if chars.get(end) == Some(&'[') {
+                    if let Some(bracket) = chars[end + 1..].iter().position(|c| *c == ']') {
+                        end = end + 1 + bracket + 1;
+                        has_target = true;
+                    }
+                }
+                if has_target {
+                    result.extend(&chars[open + 1..close]);
+                    index = end;
+                    continue;
+                }
+            }
+        }
+
+        result.push(chars[index]);
+        index += 1;
+    }
+
+    result
+}
+
+fn strip_line_prefixes(line: &str) -> String {
+    let mut text = line.trim_start();
+    while let Some(rest) = text.strip_prefix('>') {
+        text = rest.trim_start();
+    }
+    text = text.trim_start_matches('#').trim_start();
+    for marker in ["- ", "* ", "+ "] {
+        if let Some(rest) = text.strip_prefix(marker) {
+            text = rest;
+            break;
+        }
+    }
+    for marker in ["[ ] ", "[x] ", "[X] "] {
+        if let Some(rest) = text.strip_prefix(marker) {
+            text = rest;
+            break;
+        }
+    }
+    text.to_string()
+}
+
+fn strip_bare_urls(line: &str) -> String {
+    line.split_whitespace()
+        .filter(|token| {
+            let trimmed =
+                token.trim_matches(|character: char| matches!(character, '(' | '[' | '<' | '"'));
+            let lower = trimmed.to_ascii_lowercase();
+            !(lower.starts_with("http://")
+                || lower.starts_with("https://")
+                || lower.starts_with("www."))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn speech_safe_characters(line: &str) -> String {
+    line.chars()
+        .filter(|character| {
+            character.is_alphanumeric()
+                || character.is_whitespace()
+                || SPEECH_PUNCTUATION.contains(character)
+                || is_combining_mark(*character)
+        })
+        .collect()
+}
+
+fn is_combining_mark(character: char) -> bool {
+    matches!(
+        character as u32,
+        0x0300..=0x036F
+            | 0x1AB0..=0x1AFF
+            | 0x1DC0..=0x1DFF
+            | 0x20D0..=0x20FF
+            | 0xFE20..=0xFE2F
+    )
+}
+
 fn split_sentences(text: &str) -> Vec<String> {
     let chars: Vec<char> = text.chars().collect();
     let mut sentences = Vec::new();
@@ -3474,7 +3674,8 @@ fn split_sentences(text: &str) -> Vec<String> {
 /// Split text into sentences, limiting the total to Ollama's 4,096-character
 /// speech input budget. Returns the chunks and whether text was dropped.
 fn sentences_for_speech(text: &str, max_chars: usize) -> (Vec<String>, bool) {
-    let sentences = split_sentences(text);
+    let text = plain_text_for_speech(text);
+    let sentences = split_sentences(&text);
     let mut result = Vec::new();
     let mut used = 0usize;
 
@@ -3634,8 +3835,8 @@ fn capability_description(capability: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_wav, format_percent, group_digits, sentences_for_speech, split_sentences,
-        tts_language, voice_options_for_backend,
+        decode_wav, format_percent, group_digits, plain_text_for_speech, sentences_for_speech,
+        split_sentences, tts_language, voice_options_for_backend,
     };
 
     #[test]
@@ -3702,6 +3903,20 @@ mod tests {
         let (chunks, truncated) = sentences_for_speech("One. Two. Three.", 9);
         assert_eq!(chunks, vec!["One.", "Two."]);
         assert!(truncated);
+    }
+
+    #[test]
+    fn strips_markdown_and_symbols_for_speech() {
+        let text = "## Heading\n**Bold** and *italic* with `code`.\n- [x] done ✅\n\n```rust\nfn main() {}\n```\nSee [the docs](https://example.com) & 50%.";
+        assert_eq!(
+            plain_text_for_speech(text),
+            "Heading\nBold and italic with code.\ndone\nSee the docs 50."
+        );
+        assert_eq!(plain_text_for_speech("Café — naïve → 🚀"), "Café — naïve");
+        assert_eq!(
+            sentences_for_speech("## Hi\n**There** — friend.", 4096).0,
+            vec!["Hi", "There — friend."]
+        );
     }
 
     #[test]

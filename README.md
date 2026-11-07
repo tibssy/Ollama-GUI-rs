@@ -127,7 +127,9 @@ and runs locally through ONNX Runtime. British voices use British eSpeak
 phonemes. The model is Apache-2.0; see its model card for details.
 
 Speech is synthesized one sentence at a time and queued for background playback,
-so the first sentence starts before the rest of the reply is generated.
+so the first sentence starts before the rest of the reply is generated. Before
+synthesis, markdown formatting, fenced code blocks, link targets, and
+symbols/emoji are stripped so only speakable text is sent to the engine.
 
 ## Speech to Text
 
