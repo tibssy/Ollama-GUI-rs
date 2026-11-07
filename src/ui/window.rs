@@ -73,6 +73,204 @@ enum SpeechEvent {
     Finished,
 }
 
+struct SpeechSynthesis {
+    choice: TtsChoice,
+    voice: String,
+    generation: u64,
+    generation_counter: Arc<AtomicU64>,
+    sender: async_channel::Sender<PlaybackChunk>,
+    ui_tx: async_channel::Sender<SpeechEvent>,
+    client: OllamaClient,
+    model: String,
+    paradee: Arc<std::sync::Mutex<Option<crate::paradee::Paradee>>>,
+}
+
+impl SpeechSynthesis {
+    fn alive(&self) -> bool {
+        self.generation_counter.load(Ordering::SeqCst) == self.generation
+    }
+
+    async fn run(self, sentences: async_channel::Receiver<String>) {
+        if self.choice == TtsChoice::Paradee {
+            if let Err(err) = crate::paradee::ensure_downloaded().await {
+                let _ = self
+                    .ui_tx
+                    .send(SpeechEvent::Error(format!("{err:#}")))
+                    .await;
+                let _ = self.ui_tx.send(SpeechEvent::Finished).await;
+                return;
+            }
+        }
+
+        let mut first_chunk = true;
+        while let Ok(sentence) = sentences.recv().await {
+            if !self.alive() {
+                break;
+            }
+
+            match self.synthesize(&sentence).await {
+                Ok((samples, sample_rate, channels)) => {
+                    if !self.alive() {
+                        break;
+                    }
+                    let chunk = PlaybackChunk {
+                        generation: self.generation,
+                        samples,
+                        sample_rate,
+                        channels,
+                    };
+                    if self.sender.send(chunk).await.is_err() {
+                        let _ = self.ui_tx.send(SpeechEvent::AudioUnavailable).await;
+                        break;
+                    }
+                    if first_chunk {
+                        first_chunk = false;
+                        let _ = self.ui_tx.send(SpeechEvent::Playing).await;
+                    }
+                }
+                Err(err) => {
+                    let _ = self
+                        .ui_tx
+                        .send(SpeechEvent::Error(format!("{err:#}")))
+                        .await;
+                    break;
+                }
+            }
+        }
+
+        let _ = self.ui_tx.send(SpeechEvent::Finished).await;
+    }
+
+    async fn synthesize(&self, sentence: &str) -> anyhow::Result<(Vec<f32>, u32, u16)> {
+        match self.choice {
+            TtsChoice::Builtin => {
+                let bytes = self
+                    .client
+                    .speech(&self.model, sentence, &self.voice)
+                    .await?;
+                let (samples, sample_rate, channels) = decode_wav(&bytes)?;
+                Ok((samples, sample_rate, channels))
+            }
+            TtsChoice::Paradee => {
+                let engine = Arc::clone(&self.paradee);
+                let voice = self.voice.clone();
+                let sentence = sentence.to_string();
+                match tokio::task::spawn_blocking(move || {
+                    let mut guard = engine
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("Paradee engine lock failed"))?;
+                    if guard.is_none() {
+                        *guard = Some(crate::paradee::Paradee::load()?);
+                    }
+                    guard
+                        .as_mut()
+                        .expect("Paradee engine")
+                        .synthesize(&sentence, &voice)
+                })
+                .await
+                {
+                    Ok(result) => {
+                        let (samples, sample_rate) = result?;
+                        Ok((samples, sample_rate, 1))
+                    }
+                    Err(err) => Err(anyhow::anyhow!("speech task failed: {err}")),
+                }
+            }
+        }
+    }
+}
+
+/// Accumulates streamed assistant text and emits sentences as soon as they are
+/// complete. Fenced code blocks are skipped, and a partial final line is held
+/// back until more text arrives or the stream finishes.
+#[derive(Default)]
+struct SpeechTextBuffer {
+    pending: String,
+    carry: String,
+    fence: Option<&'static str>,
+}
+
+impl SpeechTextBuffer {
+    fn clear(&mut self) {
+        self.pending.clear();
+        self.carry.clear();
+        self.fence = None;
+    }
+
+    fn push(&mut self, delta: &str) -> Vec<String> {
+        self.pending.push_str(delta);
+
+        loop {
+            if let Some(marker) = self.fence {
+                let Some(position) = self.pending.find('\n') else {
+                    break;
+                };
+                let line: String = self.pending.drain(..=position).collect();
+                if line.trim_start().starts_with(marker) {
+                    self.fence = None;
+                }
+                continue;
+            }
+
+            if let Some(position) = self.pending.find('\n') {
+                let line: String = self.pending.drain(..=position).collect();
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("```") {
+                    self.fence = Some("```");
+                    continue;
+                }
+                if trimmed.starts_with("~~~") {
+                    self.fence = Some("~~~");
+                    continue;
+                }
+                self.append(plain_text_for_speech(&line), true);
+                continue;
+            }
+
+            let trimmed = self.pending.trim_start();
+            if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+                break;
+            }
+
+            let (sentences, tail) = take_complete_sentences(&self.pending);
+            self.pending = tail;
+            for sentence in sentences {
+                self.append(plain_text_for_speech(&sentence), false);
+            }
+            break;
+        }
+
+        let (sentences, rest) = take_complete_sentences(&self.carry);
+        self.carry = rest;
+        sentences
+    }
+
+    fn finish(&mut self) -> Vec<String> {
+        if self.fence.is_none() {
+            let plain = plain_text_for_speech(&self.pending);
+            self.append(plain, false);
+        }
+        self.pending.clear();
+        self.fence = None;
+
+        let sentences = split_sentences(&self.carry);
+        self.carry.clear();
+        sentences
+    }
+
+    fn append(&mut self, plain: String, line_end: bool) {
+        if !plain.is_empty() {
+            if !self.carry.is_empty() && !self.carry.ends_with(char::is_whitespace) {
+                self.carry.push(' ');
+            }
+            self.carry.push_str(&plain);
+        }
+        if line_end {
+            self.carry.push('\n');
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct TtsLanguage {
     code: &'static str,
@@ -550,6 +748,8 @@ struct ChatWindow {
     speech_buttons: RefCell<Vec<gtk::Button>>,
     speech_player: RefCell<Option<async_channel::Sender<PlaybackChunk>>>,
     speech_generation: Arc<AtomicU64>,
+    speech_stream_tx: RefCell<Option<async_channel::Sender<String>>>,
+    speech_text: RefCell<SpeechTextBuffer>,
     stt_session: RefCell<Option<crate::stt::SttSession>>,
     stt_prefix: RefCell<String>,
     stt_listening: Cell<bool>,
@@ -808,6 +1008,8 @@ impl ChatWindow {
             speech_buttons: RefCell::new(Vec::new()),
             speech_player: RefCell::new(None),
             speech_generation: Arc::new(AtomicU64::new(0)),
+            speech_stream_tx: RefCell::new(None),
+            speech_text: RefCell::new(SpeechTextBuffer::default()),
             stt_session: RefCell::new(None),
             stt_prefix: RefCell::new(String::new()),
             stt_listening: Cell::new(false),
@@ -1588,128 +1790,30 @@ impl ChatWindow {
         if let Some(button) = button {
             button.set_sensitive(false);
         }
-        let generation_counter = Arc::clone(&self.speech_generation);
-        let (ui_tx, ui_rx) = async_channel::bounded(8);
-
-        match choice {
-            TtsChoice::Builtin => {
-                let client = self.state.client.borrow().clone();
-                let model = self.selected_model();
-
-                self.state.runtime.spawn(async move {
-                    let mut first_chunk = true;
-                    for sentence in sentences {
-                        if generation_counter.load(Ordering::SeqCst) != generation {
-                            break;
-                        }
-                        match client.speech(&model, &sentence, &voice).await {
-                            Ok(bytes) => match decode_wav(&bytes) {
-                                Ok((samples, sample_rate, channels)) => {
-                                    if generation_counter.load(Ordering::SeqCst) != generation {
-                                        break;
-                                    }
-                                    let chunk = PlaybackChunk {
-                                        generation,
-                                        samples,
-                                        sample_rate,
-                                        channels,
-                                    };
-                                    if sender.send(chunk).await.is_err() {
-                                        let _ = ui_tx.send(SpeechEvent::AudioUnavailable).await;
-                                        break;
-                                    }
-                                    if first_chunk {
-                                        first_chunk = false;
-                                        let _ = ui_tx.send(SpeechEvent::Playing).await;
-                                    }
-                                }
-                                Err(err) => {
-                                    let _ =
-                                        ui_tx.send(SpeechEvent::Error(format!("{err:#}"))).await;
-                                    break;
-                                }
-                            },
-                            Err(err) => {
-                                let _ = ui_tx.send(SpeechEvent::Error(format!("{err:#}"))).await;
-                                break;
-                            }
-                        }
-                    }
-                    let _ = ui_tx.send(SpeechEvent::Finished).await;
-                });
-            }
-            TtsChoice::Paradee => {
-                if !crate::paradee::is_downloaded() {
-                    self.toast("Downloading Paradee voice model (8.5 MB)…");
-                }
-
-                let engine = Arc::clone(&self.state.paradee);
-
-                self.state.runtime.spawn(async move {
-                    if let Err(err) = crate::paradee::ensure_downloaded().await {
-                        let _ = ui_tx.send(SpeechEvent::Error(format!("{err:#}"))).await;
-                        let _ = ui_tx.send(SpeechEvent::Finished).await;
-                        return;
-                    }
-
-                    let mut first_chunk = true;
-                    for sentence in sentences {
-                        if generation_counter.load(Ordering::SeqCst) != generation {
-                            break;
-                        }
-
-                        let engine = Arc::clone(&engine);
-                        let voice = voice.clone();
-                        let result = tokio::task::spawn_blocking(move || {
-                            let mut guard = engine
-                                .lock()
-                                .map_err(|_| anyhow::anyhow!("Paradee engine lock failed"))?;
-                            if guard.is_none() {
-                                *guard = Some(crate::paradee::Paradee::load()?);
-                            }
-                            guard
-                                .as_mut()
-                                .expect("Paradee engine")
-                                .synthesize(&sentence, &voice)
-                        })
-                        .await;
-
-                        match result {
-                            Ok(Ok((samples, sample_rate))) => {
-                                if generation_counter.load(Ordering::SeqCst) != generation {
-                                    break;
-                                }
-                                let chunk = PlaybackChunk {
-                                    generation,
-                                    samples,
-                                    sample_rate,
-                                    channels: 1,
-                                };
-                                if sender.send(chunk).await.is_err() {
-                                    let _ = ui_tx.send(SpeechEvent::AudioUnavailable).await;
-                                    break;
-                                }
-                                if first_chunk {
-                                    first_chunk = false;
-                                    let _ = ui_tx.send(SpeechEvent::Playing).await;
-                                }
-                            }
-                            Ok(Err(err)) => {
-                                let _ = ui_tx.send(SpeechEvent::Error(format!("{err:#}"))).await;
-                                break;
-                            }
-                            Err(err) => {
-                                let _ = ui_tx
-                                    .send(SpeechEvent::Error(format!("speech task failed: {err}")))
-                                    .await;
-                                break;
-                            }
-                        }
-                    }
-                    let _ = ui_tx.send(SpeechEvent::Finished).await;
-                });
-            }
+        if choice == TtsChoice::Paradee && !crate::paradee::is_downloaded() {
+            self.toast("Downloading Paradee voice model (8.5 MB)…");
         }
+        let (ui_tx, ui_rx) = async_channel::bounded(8);
+        let synthesis = SpeechSynthesis {
+            choice,
+            voice,
+            generation,
+            generation_counter: Arc::clone(&self.speech_generation),
+            sender,
+            ui_tx,
+            client: self.state.client.borrow().clone(),
+            model: self.selected_model(),
+            paradee: Arc::clone(&self.state.paradee),
+        };
+
+        self.state.runtime.spawn(async move {
+            let (sentence_tx, sentence_rx) = async_channel::unbounded();
+            for sentence in sentences {
+                let _ = sentence_tx.send(sentence).await;
+            }
+            drop(sentence_tx);
+            synthesis.run(sentence_rx).await;
+        });
 
         self.show_speech_events(ui_rx, button.cloned());
         if button.is_some() {
@@ -1814,7 +1918,87 @@ impl ChatWindow {
         }
     }
 
+    fn begin_streaming_speech(self: &Rc<Self>) -> bool {
+        self.end_streaming_speech();
+        self.speech_text.borrow_mut().clear();
+
+        let Some(choice) = self.resolve_tts() else {
+            return false;
+        };
+        if choice == TtsChoice::Paradee && !crate::paradee::is_downloaded() {
+            self.toast("Downloading Paradee voice model (8.5 MB)…");
+        }
+
+        let language = tts_language(&self.state.settings.borrow().tts_language);
+        let voice = self.resolved_voice(choice, language);
+        let Some(sender) = self.speech_sender() else {
+            return false;
+        };
+        let generation = self.speech_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let (ui_tx, ui_rx) = async_channel::bounded(8);
+        let (sentence_tx, sentence_rx) = async_channel::unbounded();
+        *self.speech_stream_tx.borrow_mut() = Some(sentence_tx);
+
+        let synthesis = SpeechSynthesis {
+            choice,
+            voice,
+            generation,
+            generation_counter: Arc::clone(&self.speech_generation),
+            sender,
+            ui_tx,
+            client: self.state.client.borrow().clone(),
+            model: self.selected_model(),
+            paradee: Arc::clone(&self.state.paradee),
+        };
+        self.state.runtime.spawn(synthesis.run(sentence_rx));
+        self.show_speech_events(ui_rx, None);
+        true
+    }
+
+    fn end_streaming_speech(&self) {
+        self.speech_stream_tx.borrow_mut().take();
+    }
+
+    fn queue_streaming_sentence(&self, sentence: &str) {
+        let sentence = sentence.trim();
+        if sentence.is_empty() {
+            return;
+        }
+        let sender = self.speech_stream_tx.borrow().as_ref().cloned();
+        let Some(sender) = sender else {
+            return;
+        };
+        if sender.try_send(sentence.to_string()).is_err() {
+            *self.speech_stream_tx.borrow_mut() = None;
+        }
+    }
+
+    /// Feed newly streamed assistant text into the speech pipeline. Complete
+    /// sentences are queued for synthesis as soon as they arrive instead of
+    /// waiting for the whole reply to finish.
+    fn feed_streaming_speech(&self, delta: &str) {
+        if self.speech_stream_tx.borrow().is_none() {
+            return;
+        }
+
+        let sentences = self.speech_text.borrow_mut().push(delta);
+        for sentence in sentences {
+            self.queue_streaming_sentence(&sentence);
+        }
+    }
+
+    /// Queue whatever text remains after the reply finished, including a final
+    /// sentence without punctuation, then close the streaming speech session.
+    fn flush_streaming_speech(&self) {
+        let sentences = self.speech_text.borrow_mut().finish();
+        for sentence in sentences {
+            self.queue_streaming_sentence(&sentence);
+        }
+    }
+
     fn stop_speech(&self) {
+        self.end_streaming_speech();
+        self.speech_text.borrow_mut().clear();
         self.speech_generation.fetch_add(1, Ordering::SeqCst);
     }
 
@@ -2512,6 +2696,14 @@ impl ChatWindow {
         self.set_streaming_ui(true);
         self.scroll_to_bottom();
 
+        let stream_speech = {
+            let settings = self.state.settings.borrow();
+            settings.tts_enabled && (settings.tts_autoread || self.live_mode.get())
+        } && self.resolve_tts().is_some();
+        if stream_speech {
+            self.begin_streaming_speech();
+        }
+
         let win = self.clone();
         glib::spawn_future_local(async move {
             let mut had_error = false;
@@ -2522,6 +2714,7 @@ impl ChatWindow {
                         let follow = win.near_bottom();
                         assistant_buffer.insert(&mut assistant_buffer.end_iter(), &delta);
                         content.borrow_mut().push_str(&delta);
+                        win.feed_streaming_speech(&delta);
                         if follow {
                             win.scroll_to_bottom();
                         }
@@ -2620,12 +2813,21 @@ impl ChatWindow {
         self.refresh_context_indicator();
         self.scroll_to_bottom();
 
+        let streaming_speech = self.speech_stream_tx.borrow().is_some();
+        if streaming_speech {
+            if !self.suppress_autoread.get() {
+                self.flush_streaming_speech();
+            }
+            self.end_streaming_speech();
+        }
+
         let suppressed = self.suppress_autoread.replace(false);
         let auto_read = {
             let settings = self.state.settings.borrow();
             settings.tts_enabled && (settings.tts_autoread || self.live_mode.get())
         };
-        if auto_read
+        if !streaming_speech
+            && auto_read
             && !suppressed
             && !content.trim().is_empty()
             && *self.current_id.borrow() == Some(active.conv_id)
@@ -2640,6 +2842,7 @@ impl ChatWindow {
             self.suppress_autoread.set(true);
             active.abort.abort();
         }
+        self.stop_speech();
         self.set_streaming_ui(false);
     }
 
@@ -2798,7 +3001,7 @@ impl ChatWindow {
 
         let tts_autoread_row = adw::SwitchRow::new();
         tts_autoread_row.set_title("Read replies automatically");
-        tts_autoread_row.set_subtitle("Speak each assistant reply when it finishes");
+        tts_autoread_row.set_subtitle("Speak each assistant reply as it streams in");
         tts_autoread_row.set_active(self.state.settings.borrow().tts_autoread);
         tts_autoread_row.set_sensitive(self.state.settings.borrow().tts_enabled);
         speech.add(&tts_autoread_row);
@@ -3592,6 +3795,56 @@ fn is_combining_mark(character: char) -> bool {
     )
 }
 
+fn take_complete_sentences(text: &str) -> (Vec<String>, String) {
+    let mut sentences = split_sentences(text);
+    if sentences.is_empty() {
+        return (sentences, String::new());
+    }
+
+    if text.ends_with('\n')
+        || sentences
+            .last()
+            .is_some_and(|sentence| ends_sentence(sentence))
+    {
+        (sentences, String::new())
+    } else {
+        let tail = sentences.pop().unwrap_or_default();
+        (sentences, tail)
+    }
+}
+
+fn ends_sentence(text: &str) -> bool {
+    let trimmed = text.trim_end_matches(&['"', '\'', ')', ']', '}', '»', '”'][..]);
+    let Some(last) = trimmed.chars().last() else {
+        return false;
+    };
+    if !matches!(last, '.' | '!' | '?' | '…' | '。' | '！' | '？') {
+        return false;
+    }
+    if last != '.' {
+        return true;
+    }
+
+    let token = trimmed
+        .split_whitespace()
+        .last()
+        .unwrap_or("")
+        .trim_matches(|character: char| !character.is_ascii_alphanumeric() && character != '.')
+        .to_ascii_lowercase();
+    let token = token.trim_end_matches('.');
+    if SENTENCE_ABBREVIATIONS.contains(&token) {
+        return false;
+    }
+    if token.chars().count() == 1
+        && token
+            .chars()
+            .all(|character| character.is_ascii_alphabetic())
+    {
+        return false;
+    }
+    true
+}
+
 fn split_sentences(text: &str) -> Vec<String> {
     let chars: Vec<char> = text.chars().collect();
     let mut sentences = Vec::new();
@@ -3601,7 +3854,7 @@ fn split_sentences(text: &str) -> Vec<String> {
     while index < chars.len() {
         let character = chars[index];
         let boundary = match character {
-            '!' | '?' | '\n' => true,
+            '!' | '?' | '\n' | '。' | '！' | '？' => true,
             '.' => {
                 let previous = index.checked_sub(1).map(|position| chars[position]);
                 let next = chars.get(index + 1).copied();
@@ -3836,7 +4089,8 @@ fn capability_description(capability: &str) -> Option<&'static str> {
 mod tests {
     use super::{
         decode_wav, format_percent, group_digits, plain_text_for_speech, sentences_for_speech,
-        split_sentences, tts_language, voice_options_for_backend,
+        split_sentences, take_complete_sentences, tts_language, voice_options_for_backend,
+        SpeechTextBuffer,
     };
 
     #[test]
@@ -3896,6 +4150,66 @@ mod tests {
             vec!["Pi is 3.14 today."]
         );
         assert_eq!(split_sentences("Wait... what?"), vec!["Wait... what?"]);
+    }
+
+    #[test]
+    fn streaming_speech_keeps_incomplete_tail() {
+        let (sentences, tail) = take_complete_sentences("First. Second");
+        assert_eq!(sentences, vec!["First."]);
+        assert_eq!(tail, "Second");
+
+        let (sentences, tail) = take_complete_sentences("First. Second.");
+        assert_eq!(sentences, vec!["First.", "Second."]);
+        assert_eq!(tail, "");
+
+        let (sentences, tail) = take_complete_sentences("Dr. Smith");
+        assert!(sentences.is_empty());
+        assert_eq!(tail, "Dr. Smith");
+
+        let (sentences, tail) = take_complete_sentences("A complete paragraph.\n");
+        assert_eq!(sentences, vec!["A complete paragraph."]);
+        assert_eq!(tail, "");
+
+        let (sentences, tail) = take_complete_sentences("Dr.");
+        assert!(sentences.is_empty());
+        assert_eq!(tail, "Dr.");
+    }
+
+    #[test]
+    fn streamed_text_emits_sentences_as_chunks_arrive() {
+        let mut buffer = SpeechTextBuffer::default();
+        assert!(buffer.push("Hello").is_empty());
+        assert_eq!(buffer.push(" world."), vec!["Hello world."]);
+        assert!(buffer.push(" Next").is_empty());
+        assert_eq!(buffer.push(" one!"), vec!["Next one!"]);
+        assert!(buffer.finish().is_empty());
+
+        let mut buffer = SpeechTextBuffer::default();
+        assert!(buffer.push("Dr. Smith").is_empty());
+        assert_eq!(buffer.push(" arrived."), vec!["Dr. Smith arrived."]);
+    }
+
+    #[test]
+    fn streamed_text_preserves_words_split_across_chunks() {
+        let mut buffer = SpeechTextBuffer::default();
+        assert!(buffer.push("Hel").is_empty());
+        assert_eq!(buffer.push("lo."), vec!["Hello."]);
+
+        let mut buffer = SpeechTextBuffer::default();
+        assert!(buffer.push("**Bold").is_empty());
+        assert_eq!(buffer.push(" text**."), vec!["Bold text."]);
+    }
+
+    #[test]
+    fn streamed_text_skips_fences_and_flushes_tail() {
+        let mut buffer = SpeechTextBuffer::default();
+        assert_eq!(buffer.push("Intro.\n```rust\nfn main"), vec!["Intro."]);
+        assert_eq!(buffer.push("() {}\n```\nAfter.\n"), vec!["After."]);
+        assert!(buffer.finish().is_empty());
+
+        let mut buffer = SpeechTextBuffer::default();
+        assert!(buffer.push("A final thought").is_empty());
+        assert_eq!(buffer.finish(), vec!["A final thought"]);
     }
 
     #[test]

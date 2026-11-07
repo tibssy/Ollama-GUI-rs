@@ -116,8 +116,9 @@ Preferences → Speech has the following choices:
   Paradee exposes four voices (`af_heart`, `am_puck`, `bf_isabella`,
   `bm_fable`), while the built-in backend exposes a female and male voice for
   each language (e.g. `female-spanish` / `male-spanish`).
-- **Read replies automatically** — speak each assistant reply as soon as it
-  finishes; suppressed when text-to-speech is disabled.
+- **Read replies automatically** — speak each assistant reply as it streams in,
+  starting with the first complete sentence; suppressed when text-to-speech is
+  disabled.
 
 Paradee 8M v1.2 is a small English-only model distilled from Kokoro-82M with
 four voices. The int8 ONNX file is downloaded on first use (or from the
@@ -164,6 +165,9 @@ the composer. It is available when both **Enable dictation** and
 
 - Starts a continuous STT session that keeps listening across turns.
 - Each finished utterance is sent to the model automatically.
+- Assistant replies are spoken automatically as they stream: each complete
+  sentence is synthesized and queued while the model is still generating, so
+  playback starts after the first sentence arrives.
 - Assistant replies are spoken automatically, even when **Read replies
   automatically** is off.
 - **Voice interruption:** speaking while the assistant is generating or talking
