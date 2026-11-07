@@ -1,4 +1,5 @@
 use crate::api::OllamaClient;
+use crate::parakeet::{self, Parakeet};
 use crate::whistle::{self, Whistle};
 use anyhow::{bail, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -27,6 +28,7 @@ pub enum SttEvent {
 }
 
 pub enum PreparedBackend {
+    Parakeet(Arc<Mutex<Option<Parakeet>>>),
     Whistle(Arc<Mutex<Option<Whistle>>>),
     Builtin { client: OllamaClient, model: String },
 }
@@ -61,6 +63,24 @@ pub async fn prepare_whistle(engine: Arc<Mutex<Option<Whistle>>>) -> Result<()> 
             .map_err(|_| anyhow::anyhow!("Whistle engine lock failed"))?;
         if guard.is_none() {
             *guard = Some(Whistle::load(&whistle::model_dir())?);
+        }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await??;
+    Ok(())
+}
+
+pub async fn prepare_parakeet(engine: Arc<Mutex<Option<Parakeet>>>) -> Result<()> {
+    std::fs::create_dir_all(parakeet::model_dir())
+        .with_context(|| format!("creating {}", parakeet::model_dir().display()))?;
+    parakeet::ensure_downloaded().await?;
+
+    tokio::task::spawn_blocking(move || {
+        let mut guard = engine
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Parakeet engine lock failed"))?;
+        if guard.is_none() {
+            *guard = Some(Parakeet::load(&parakeet::model_dir())?);
         }
         Ok::<(), anyhow::Error>(())
     })
@@ -391,6 +411,20 @@ async fn transcribe_pcm(
     language: Option<&str>,
 ) -> Result<String> {
     match backend {
+        PreparedBackend::Parakeet(engine) => {
+            let engine = Arc::clone(engine);
+            let pcm = pcm.to_vec();
+            tokio::task::spawn_blocking(move || {
+                let mut guard = engine
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Parakeet engine lock failed"))?;
+                let engine = guard
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("Parakeet engine is not loaded"))?;
+                engine.transcribe(&pcm)
+            })
+            .await?
+        }
         PreparedBackend::Whistle(engine) => {
             let engine = Arc::clone(engine);
             let pcm = pcm.to_vec();
@@ -623,6 +657,55 @@ mod tests {
             let _ = worker.await;
             assert_eq!(transcripts.len(), 2);
             assert!(transcripts.iter().all(|text| !text.trim().is_empty()));
+        });
+    }
+
+    #[test]
+    #[ignore = "requires the Parakeet Redux ONNX files and a test WAV"]
+    fn worker_transcribes_with_parakeet() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let samples = read_wav("/tmp/opencode/stt-mem/s1.wav");
+            let engine = Arc::new(std::sync::Mutex::new(Some(
+                crate::parakeet::Parakeet::load(&crate::parakeet::model_dir())
+                    .expect("load Parakeet"),
+            )));
+            let (audio_tx, audio_rx) = async_channel::unbounded();
+            for chunk in samples.chunks(1024) {
+                audio_tx.send(chunk.to_vec()).await.unwrap();
+            }
+            drop(audio_tx);
+
+            let (events_tx, events_rx) = async_channel::unbounded();
+            let worker = tokio::spawn(run_worker(
+                audio_rx,
+                super::PreparedBackend::Parakeet(engine),
+                super::WorkerConfig {
+                    source_rate: 16_000,
+                    language: None,
+                    start_timeout: Duration::from_secs(5),
+                    end_silence: Duration::from_millis(700),
+                    continuous: false,
+                },
+                events_tx,
+                Arc::new(AtomicBool::new(false)),
+            ));
+
+            let mut final_text = None;
+            while let Ok(event) = events_rx.recv().await {
+                match event {
+                    super::SttEvent::Final(text) => {
+                        final_text = Some(text);
+                        break;
+                    }
+                    super::SttEvent::Error(error) => panic!("{error}"),
+                    _ => {}
+                }
+            }
+            worker.await.unwrap().unwrap();
+            let text = final_text.expect("final transcript");
+            println!("parakeet worker transcript={text:?}");
+            assert!(text.to_lowercase().contains("quick") || text.to_lowercase().contains("fox"));
         });
     }
 

@@ -17,6 +17,8 @@ The MVP is working:
 - Local Whistle ONNX speech-to-text with Silero VAD, a microphone button,
   language selection, configurable start/end-silence timeouts, and optional
   automatic sending of the transcript
+- Parakeet Redux ONNX speech-to-text as the preferred local provider: 25
+  languages with automatic language detection
 - Continuous live voice conversation with voice interruption (talk over the
   assistant) and automatic multi-turn sending/reading
 - Context usage indicator (tokens used / window size, percentage) with a
@@ -90,8 +92,9 @@ Settings are stored at `$XDG_CONFIG_HOME/ollama-gui/settings.json`
 (`~/.config/ollama-gui/settings.json` by default). Conversations live in
 `$XDG_DATA_HOME/ollama-gui/chats.db` (`~/.local/share/ollama-gui/chats.db`).
 The Paradee model is cached in `$XDG_DATA_HOME/ollama-gui/models/paradee/`.
-The Whistle speech-to-text model is cached in
-`$XDG_DATA_HOME/ollama-gui/models/whistle/` (about 160 MB on first use).
+The speech-to-text models are cached in
+`$XDG_DATA_HOME/ollama-gui/models/whistle/` (about 160 MB on first use) and
+`$XDG_DATA_HOME/ollama-gui/models/parakeet-redux/` (about 420 MB on first use).
 
 The server URL defaults to `http://localhost:11434`. For a remote or Ollama
 Cloud endpoint, set the URL and, if needed, an API key under Preferences.
@@ -130,13 +133,15 @@ so the first sentence starts before the rest of the reply is generated.
 
 Preferences → Speech to Text enables the microphone button in the composer.
 
-- **Preferred STT** — *Automatic* prefers Whistle when its model is downloaded
-  and the language is supported, then the selected Ollama model when it supports
-  audio input, and otherwise Whistle. Whistle and the built-in model can also be
+- **Preferred STT** — *Automatic* prefers Parakeet Redux when its model is
+  downloaded, then Whistle when its model is downloaded and the language is
+  supported, then the selected Ollama model when it supports audio input, and
+  otherwise Whistle. Parakeet Redux, Whistle, and the built-in model can also be
   forced explicitly.
-- **Language** — Whistle supports English, German, French, Spanish, Italian,
-  Dutch and Polish. Built-in languages depend on the selected model
-  (`lfm3-audio` supports 19 languages). "Auto detect" is available.
+- **Language** — Parakeet Redux detects the language automatically. Whistle
+  supports English, German, French, Spanish, Italian, Dutch and Polish.
+  Built-in languages depend on the selected model (`lfm3-audio` supports 19
+  languages). "Auto detect" is available.
 - **Wait for speech** — if no voice is detected within this many seconds,
   listening stops and the microphone becomes clickable again.
 - **End of speech silence** — seconds of silence after which the utterance is
@@ -169,6 +174,16 @@ the composer. It is available when both **Enable dictation** and
 During live conversation, the speech-to-text VAD start timeout is ignored;
 listening continues until the live button is turned off.
 
+Parakeet Redux is an ONNX export of the 1.58-bit
+[moondream/parakeet-redux](https://huggingface.co/moondream/parakeet-redux)
+model (based on NVIDIA's `parakeet-tdt-0.6b-v3`) from
+[eschmidbauer/parakeet-redux-onnx](https://huggingface.co/eschmidbauer/parakeet-redux-onnx).
+It handles 25 European languages and detects the language on its own, so its
+language setting is always "Auto detect". The first use downloads about 420 MB
+of model files (CC-BY-4.0). It runs on the CPU through ONNX Runtime with greedy
+token-and-duration decoding and shares the same Silero VAD and microphone
+pipeline as Whistle.
+
 Whistle is a 16.9 MB Apache-2.0 model from Cactus Compute, using the ONNX export
 from [mrfakename/whistle-ONNX](https://huggingface.co/mrfakename/whistle-ONNX)
 (Apache-2.0). The first use downloads the encoder/decoder and pack (~160 MB).
@@ -183,14 +198,17 @@ working ALSA/PipeWire input are required.
 | Paradee int8 ONNX + config | 8.5 MB |
 | Silero VAD (bundled) | 2.3 MB |
 | Whistle ONNX export (encoder + decoder + pack) | ~156 MB |
+| Parakeet Redux ONNX (preprocessor + encoder + decoder + vocab) | ~420 MB |
 | Built-in TTS/STT | the selected Ollama model, e.g. 1.7 GB for `lfm3-audio` |
 
 Models are loaded lazily. Repeated speech requests do not grow the process
 without bound: ONNX Runtime arenas reach a high-water mark, and the Whistle
 engram cache is capped at 16,384 rows (about 8 MB). Disabling text-to-speech or
 dictation unloads the corresponding local engine and trims the heap. Measured
-warm RSS is about 230 MB for Paradee, 315 MB for Whistle, or about 385 MB with
-both loaded.
+warm RSS is about 230 MB for Paradee, 315 MB for Whistle, 580 MB for Parakeet
+Redux loaded (about 600 MB after a transcription), or about 385 MB for Paradee
+and Whistle together. Unloading Parakeet Redux and trimming the heap returns
+the process to about 50 MB.
 
 ## Architecture
 
@@ -204,6 +222,8 @@ src/
   paradee.rs         Paradee download, eSpeak G2P conversion, ONNX inference
   whistle.rs         Whistle pack parser, mel frontend, engram cache,
                      ONNX encoder/decoder inference
+  parakeet.rs        Parakeet Redux download, log-mel preprocessor, ONNX
+                     encoder/decoder and greedy TDT decoding
   stt.rs             microphone capture, resampling, Silero VAD and the
                      streaming transcription worker
   ui/window.rs       split-view shell, chat controller, settings dialog,

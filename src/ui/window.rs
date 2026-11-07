@@ -24,6 +24,7 @@ pub struct AppState {
     pub models: RefCell<Vec<ModelSummary>>,
     pub paradee: Arc<std::sync::Mutex<Option<crate::paradee::Paradee>>>,
     pub whistle: Arc<std::sync::Mutex<Option<crate::whistle::Whistle>>>,
+    pub parakeet: Arc<std::sync::Mutex<Option<crate::parakeet::Parakeet>>>,
 }
 
 impl AppState {
@@ -38,6 +39,7 @@ impl AppState {
             models: RefCell::new(Vec::new()),
             paradee: Arc::new(std::sync::Mutex::new(None)),
             whistle: Arc::new(std::sync::Mutex::new(None)),
+            parakeet: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -410,7 +412,13 @@ const STT_LANGUAGES: &[SttLanguage] = &[
 ];
 
 fn stt_languages_for_provider(provider: &str) -> Vec<SttLanguage> {
-    if provider == "whistle" {
+    if provider == "parakeet" {
+        STT_LANGUAGES
+            .iter()
+            .copied()
+            .filter(|language| language.code == "auto")
+            .collect()
+    } else if provider == "whistle" {
         STT_LANGUAGES
             .iter()
             .copied()
@@ -454,16 +462,18 @@ fn fill_stt_language_row(
 
 fn stt_provider_from_index(index: u32) -> &'static str {
     match index {
-        1 => "whistle",
-        2 => "builtin",
+        1 => "parakeet",
+        2 => "whistle",
+        3 => "builtin",
         _ => "auto",
     }
 }
 
 fn stt_provider_index(provider: &str) -> u32 {
     match provider {
-        "whistle" => 1,
-        "builtin" => 2,
+        "parakeet" => 1,
+        "whistle" => 2,
+        "builtin" => 3,
         _ => 0,
     }
 }
@@ -500,6 +510,13 @@ fn fill_voice_row(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TtsChoice {
     Paradee,
+    Builtin,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SttChoice {
+    Parakeet,
+    Whistle,
     Builtin,
 }
 
@@ -1812,9 +1829,13 @@ impl ChatWindow {
     }
 
     fn unload_stt_engine(&self) {
-        let engine = Arc::clone(&self.state.whistle);
+        let whistle = Arc::clone(&self.state.whistle);
+        let parakeet = Arc::clone(&self.state.parakeet);
         drop(self.state.runtime.spawn_blocking(move || {
-            if let Ok(mut guard) = engine.lock() {
+            if let Ok(mut guard) = whistle.lock() {
+                *guard = None;
+            }
+            if let Ok(mut guard) = parakeet.lock() {
                 *guard = None;
             }
             trim_heap();
@@ -1943,37 +1964,122 @@ impl ChatWindow {
             .as_deref()
             .is_none_or(|code| crate::whistle::WHISTLE_LANGUAGES.contains(&code));
 
-        let use_whistle = match provider.as_str() {
-            "whistle" => true,
+        let parakeet_downloaded = crate::parakeet::is_downloaded();
+        let choice = match provider.as_str() {
+            "parakeet" => SttChoice::Parakeet,
+            "whistle" => SttChoice::Whistle,
             "builtin" => {
                 if !audio_model {
                     self.toast("The selected model does not support speech input.");
                     return;
                 }
-                false
+                SttChoice::Builtin
             }
             _ => {
-                if crate::whistle::is_downloaded() && whistle_language {
-                    true
+                if parakeet_downloaded {
+                    SttChoice::Parakeet
+                } else if crate::whistle::is_downloaded() && whistle_language {
+                    SttChoice::Whistle
                 } else if audio_model {
-                    false
+                    SttChoice::Builtin
                 } else if whistle_language {
-                    true
+                    SttChoice::Whistle
                 } else {
                     self.toast("No speech-to-text provider supports that language.");
                     return;
                 }
             }
         };
+        let use_whistle = choice == SttChoice::Whistle;
 
         let start_timeout = std::time::Duration::from_secs(start_secs.max(1) as u64);
         let end_silence = std::time::Duration::from_millis(end_ms.max(200) as u64);
         tracing::info!(
             "STT: using {} for language {:?}{}",
-            if use_whistle { "Whistle" } else { "Ollama" },
+            match choice {
+                SttChoice::Parakeet => "Parakeet Redux",
+                SttChoice::Whistle => "Whistle",
+                SttChoice::Builtin => "Ollama",
+            },
             language,
             if live { " (live conversation)" } else { "" }
         );
+
+        if choice == SttChoice::Parakeet {
+            let engine = Arc::clone(&self.state.parakeet);
+            let loaded = engine.lock().map(|guard| guard.is_some()).unwrap_or(false);
+            if loaded && parakeet_downloaded {
+                self.begin_listening(
+                    PreparedBackend::Parakeet(engine),
+                    None,
+                    start_timeout,
+                    end_silence,
+                    live,
+                );
+                return;
+            }
+
+            self.stt_preparing.set(true);
+            if live {
+                self.live_pending.set(true);
+            }
+            let prep_id = self.stt_generation.get().saturating_add(1);
+            self.stt_generation.set(prep_id);
+            self.update_stt_ui();
+            if parakeet_downloaded {
+                self.toast("Preparing Parakeet Redux speech recognition…");
+            } else {
+                self.toast("Downloading Parakeet Redux model (~420 MB)…");
+            }
+
+            let (tx, rx) = async_channel::bounded(1);
+            let prepare_engine = Arc::clone(&engine);
+            self.state.runtime.spawn(async move {
+                let result = stt::prepare_parakeet(prepare_engine).await;
+                let _ = tx.send(result).await;
+            });
+
+            let win = self.clone();
+            glib::spawn_future_local(async move {
+                match rx.recv().await {
+                    Ok(Ok(())) => {
+                        if win.stt_generation.get() != prep_id || !win.stt_preparing.get() {
+                            return;
+                        }
+                        win.stt_preparing.set(false);
+                        if !win.state.settings.borrow().stt_enabled {
+                            win.live_pending.set(false);
+                            win.update_stt_ui();
+                            return;
+                        }
+                        win.begin_listening(
+                            PreparedBackend::Parakeet(engine),
+                            None,
+                            start_timeout,
+                            end_silence,
+                            live,
+                        );
+                    }
+                    Ok(Err(error)) => {
+                        if win.stt_generation.get() != prep_id {
+                            return;
+                        }
+                        win.stt_preparing.set(false);
+                        win.live_pending.set(false);
+                        win.update_stt_ui();
+                        win.toast(&format!("Could not prepare Parakeet: {error:#}"));
+                    }
+                    Err(_) => {
+                        if win.stt_generation.get() == prep_id {
+                            win.stt_preparing.set(false);
+                            win.live_pending.set(false);
+                            win.update_stt_ui();
+                        }
+                    }
+                }
+            });
+            return;
+        }
 
         if use_whistle {
             if let Some(code) = language.as_deref() {
@@ -2727,10 +2833,11 @@ impl ChatWindow {
         let stt_provider_row = adw::ComboRow::new();
         stt_provider_row.set_title("Preferred STT");
         stt_provider_row.set_subtitle(
-            "Automatic prefers Whistle when downloaded, then an audio-capable Ollama model",
+            "Automatic prefers Parakeet Redux, then Whistle, then an audio-capable Ollama model",
         );
         let stt_providers = gtk::StringList::new(&[
             "Automatic",
+            "Parakeet Redux (local ONNX)",
             "Whistle (local ONNX)",
             "Ollama model (built-in)",
         ]);
@@ -2743,7 +2850,7 @@ impl ChatWindow {
         let stt_language_row = adw::ComboRow::new();
         stt_language_row.set_title("Language");
         stt_language_row.set_subtitle(
-            "Whistle supports seven languages; built-in support depends on the model",
+            "Parakeet auto-detects; Whistle supports seven languages; built-in depends on the model",
         );
         let stt_choices: Rc<RefCell<Vec<SttLanguage>>> = Rc::new(RefCell::new(Vec::new()));
         let suppress_stt_language = Rc::new(Cell::new(false));
@@ -2801,6 +2908,25 @@ impl ChatWindow {
         stt_autosend_row.set_subtitle("Send the transcript when speech ends");
         stt_autosend_row.set_active(self.state.settings.borrow().stt_autosend);
         stt.add(&stt_autosend_row);
+
+        let parakeet_row = adw::ActionRow::new();
+        parakeet_row.set_title("Parakeet Redux model");
+        let parakeet_downloaded = crate::parakeet::is_downloaded();
+        parakeet_row.set_subtitle(if parakeet_downloaded {
+            "Downloaded · ~420 MB · CC-BY-4.0"
+        } else {
+            "Not downloaded · ~420 MB · CC-BY-4.0"
+        });
+        let parakeet_button = gtk::Button::with_label(if parakeet_downloaded {
+            "Downloaded"
+        } else {
+            "Download"
+        });
+        parakeet_button.add_css_class("flat");
+        parakeet_button.set_valign(gtk::Align::Center);
+        parakeet_button.set_sensitive(!parakeet_downloaded);
+        parakeet_row.add_suffix(&parakeet_button);
+        stt.add(&parakeet_row);
 
         let whistle_row = adw::ActionRow::new();
         whistle_row.set_title("Whistle model");
@@ -3100,6 +3226,43 @@ impl ChatWindow {
             stt_autosend_row.connect_active_notify(move |row| {
                 win.state.settings.borrow_mut().stt_autosend = row.is_active();
                 win.save_settings();
+            });
+        }
+        {
+            let win = self.clone();
+            let row = parakeet_row.clone();
+            let button = parakeet_button.clone();
+            parakeet_button.connect_clicked(move |_| {
+                if crate::parakeet::is_downloaded() {
+                    return;
+                }
+                button.set_sensitive(false);
+                row.set_subtitle("Downloading…");
+                let (tx, rx) = async_channel::bounded(1);
+                win.state.runtime.spawn(async move {
+                    let result = crate::parakeet::ensure_downloaded().await;
+                    let _ = tx.send(result).await;
+                });
+
+                let win = win.clone();
+                let row = row.clone();
+                let button = button.clone();
+                glib::spawn_future_local(async move {
+                    match rx.recv().await {
+                        Ok(Ok(())) => {
+                            row.set_subtitle("Downloaded · ~420 MB · CC-BY-4.0");
+                            button.set_label("Downloaded");
+                            button.set_sensitive(false);
+                            win.toast("Parakeet Redux model downloaded");
+                        }
+                        Ok(Err(err)) => {
+                            row.set_subtitle("Not downloaded · ~420 MB · CC-BY-4.0");
+                            button.set_sensitive(true);
+                            win.toast(&format!("Could not download Parakeet model: {err:#}"));
+                        }
+                        Err(_) => {}
+                    }
+                });
             });
         }
         {

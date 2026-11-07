@@ -1,6 +1,7 @@
 mod api;
 mod config;
 mod paradee;
+mod parakeet;
 mod store;
 mod stt;
 mod ui;
