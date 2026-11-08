@@ -16,6 +16,9 @@ use crate::config::Settings;
 use crate::store::{Store, StoredMessage};
 use crate::stt::{self, PreparedBackend, SttEvent};
 
+/// Seconds without speech activity before local TTS/STT models are released.
+const SPEECH_IDLE_UNLOAD_SECS: u32 = 60;
+
 pub struct AppState {
     pub settings: RefCell<Settings>,
     pub store: RefCell<Store>,
@@ -750,11 +753,13 @@ struct ChatWindow {
     speech_generation: Arc<AtomicU64>,
     speech_stream_tx: RefCell<Option<async_channel::Sender<String>>>,
     speech_text: RefCell<SpeechTextBuffer>,
+    tts_idle_token: Arc<AtomicU64>,
     stt_session: RefCell<Option<crate::stt::SttSession>>,
     stt_prefix: RefCell<String>,
     stt_listening: Cell<bool>,
     stt_preparing: Cell<bool>,
     stt_generation: Cell<u64>,
+    stt_idle_token: Arc<AtomicU64>,
     live_mode: Cell<bool>,
     live_pending: Cell<bool>,
     suppress_autoread: Cell<bool>,
@@ -1010,11 +1015,13 @@ impl ChatWindow {
             speech_generation: Arc::new(AtomicU64::new(0)),
             speech_stream_tx: RefCell::new(None),
             speech_text: RefCell::new(SpeechTextBuffer::default()),
+            tts_idle_token: Arc::new(AtomicU64::new(0)),
             stt_session: RefCell::new(None),
             stt_prefix: RefCell::new(String::new()),
             stt_listening: Cell::new(false),
             stt_preparing: Cell::new(false),
             stt_generation: Cell::new(0),
+            stt_idle_token: Arc::new(AtomicU64::new(0)),
             live_mode: Cell::new(false),
             live_pending: Cell::new(false),
             suppress_autoread: Cell::new(false),
@@ -1757,6 +1764,7 @@ impl ChatWindow {
     }
 
     fn speak(self: &Rc<Self>, text: &str, button: Option<&gtk::Button>) {
+        self.cancel_tts_idle_unload();
         let Some(choice) = self.resolve_tts() else {
             self.toast("Speech is not available for this TTS setting and language.");
             return;
@@ -1847,6 +1855,7 @@ impl ChatWindow {
                         if let Some(button) = button.as_ref() {
                             button.set_sensitive(true);
                         }
+                        win.schedule_tts_idle_unload();
                         break;
                     }
                 }
@@ -1919,6 +1928,7 @@ impl ChatWindow {
     }
 
     fn begin_streaming_speech(self: &Rc<Self>) -> bool {
+        self.cancel_tts_idle_unload();
         self.end_streaming_speech();
         self.speech_text.borrow_mut().clear();
 
@@ -1996,31 +2006,103 @@ impl ChatWindow {
         }
     }
 
+    fn cancel_tts_idle_unload(&self) {
+        self.tts_idle_token.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Release the local text-to-speech model after a minute without speech.
+    fn schedule_tts_idle_unload(self: &Rc<Self>) {
+        if !self.state.settings.borrow().tts_enabled {
+            return;
+        }
+
+        let token = self.tts_idle_token.fetch_add(1, Ordering::SeqCst) + 1;
+        let win = self.clone();
+        glib::timeout_add_seconds_local_once(SPEECH_IDLE_UNLOAD_SECS, move || {
+            // A newer request or an active streaming session keeps the model loaded.
+            if win.tts_idle_token.load(Ordering::SeqCst) != token
+                || win.speech_stream_tx.borrow().is_some()
+            {
+                return;
+            }
+            win.unload_tts_engine(Some(token));
+        });
+    }
+
     fn stop_speech(&self) {
         self.end_streaming_speech();
         self.speech_text.borrow_mut().clear();
         self.speech_generation.fetch_add(1, Ordering::SeqCst);
     }
 
-    fn unload_tts_engine(&self) {
+    /// Drop the local TTS engine. When a timer token is supplied, the unload is
+    /// skipped if speech started again while the blocking task was queued.
+    fn unload_tts_engine(&self, token: Option<u64>) {
         let engine = Arc::clone(&self.state.paradee);
+        let idle_token = Arc::clone(&self.tts_idle_token);
         drop(self.state.runtime.spawn_blocking(move || {
+            let mut released = false;
             if let Ok(mut guard) = engine.lock() {
-                *guard = None;
+                let idle = token.is_none_or(|token| idle_token.load(Ordering::SeqCst) == token);
+                if idle {
+                    released = guard.take().is_some();
+                }
+            }
+            if released {
+                tracing::info!("TTS: released local engine");
             }
             trim_heap();
         }));
     }
 
-    fn unload_stt_engine(&self) {
+    fn cancel_stt_idle_unload(&self) {
+        self.stt_idle_token.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Release Whistle/Parakeet after a minute without dictation or live turns.
+    fn schedule_stt_idle_unload(self: &Rc<Self>) {
+        if !self.state.settings.borrow().stt_enabled {
+            return;
+        }
+
+        let token = self.stt_idle_token.fetch_add(1, Ordering::SeqCst) + 1;
+        let win = self.clone();
+        glib::timeout_add_seconds_local_once(SPEECH_IDLE_UNLOAD_SECS, move || {
+            if win.stt_idle_token.load(Ordering::SeqCst) != token
+                || win.stt_listening.get()
+                || win.stt_preparing.get()
+                || win.live_mode.get()
+                || win.live_pending.get()
+            {
+                return;
+            }
+            win.unload_stt_engine(Some(token));
+        });
+    }
+
+    /// Drop the local STT engines. When a timer token is supplied, the unload
+    /// is skipped if listening started again while the task was queued.
+    fn unload_stt_engine(&self, token: Option<u64>) {
         let whistle = Arc::clone(&self.state.whistle);
         let parakeet = Arc::clone(&self.state.parakeet);
+        let idle_token = Arc::clone(&self.stt_idle_token);
         drop(self.state.runtime.spawn_blocking(move || {
+            let idle = |expected: Option<u64>| {
+                expected.is_none_or(|expected| idle_token.load(Ordering::SeqCst) == expected)
+            };
+            let mut released = false;
             if let Ok(mut guard) = whistle.lock() {
-                *guard = None;
+                if idle(token) {
+                    released |= guard.take().is_some();
+                }
             }
             if let Ok(mut guard) = parakeet.lock() {
-                *guard = None;
+                if idle(token) {
+                    released |= guard.take().is_some();
+                }
+            }
+            if released {
+                tracing::info!("STT: released local engine");
             }
             trim_heap();
         }));
@@ -2119,6 +2201,7 @@ impl ChatWindow {
         if self.stt_listening.get() || self.stt_preparing.get() {
             return;
         }
+        self.cancel_stt_idle_unload();
         if live && self.resolve_tts().is_none() {
             self.toast("Live conversation needs an available text-to-speech voice.");
             return;
@@ -2251,6 +2334,7 @@ impl ChatWindow {
                         win.stt_preparing.set(false);
                         win.live_pending.set(false);
                         win.update_stt_ui();
+                        win.schedule_stt_idle_unload();
                         win.toast(&format!("Could not prepare Parakeet: {error:#}"));
                     }
                     Err(_) => {
@@ -2258,6 +2342,7 @@ impl ChatWindow {
                             win.stt_preparing.set(false);
                             win.live_pending.set(false);
                             win.update_stt_ui();
+                            win.schedule_stt_idle_unload();
                         }
                     }
                 }
@@ -2334,6 +2419,7 @@ impl ChatWindow {
                         win.stt_preparing.set(false);
                         win.live_pending.set(false);
                         win.update_stt_ui();
+                        win.schedule_stt_idle_unload();
                         win.toast(&format!("Could not prepare Whistle: {error:#}"));
                     }
                     Err(_) => {
@@ -2341,6 +2427,7 @@ impl ChatWindow {
                             win.stt_preparing.set(false);
                             win.live_pending.set(false);
                             win.update_stt_ui();
+                            win.schedule_stt_idle_unload();
                         }
                     }
                 }
@@ -2373,6 +2460,7 @@ impl ChatWindow {
         }
 
         self.stop_stt();
+        self.cancel_stt_idle_unload();
         if live {
             self.input.buffer().set_text("");
             self.stt_prefix.borrow_mut().clear();
@@ -2518,7 +2606,7 @@ impl ChatWindow {
         buffer.place_cursor(&end);
     }
 
-    fn stop_stt(&self) {
+    fn stop_stt(self: &Rc<Self>) {
         self.stt_generation
             .set(self.stt_generation.get().saturating_add(1));
         if let Some(session) = self.stt_session.borrow_mut().take() {
@@ -2529,6 +2617,7 @@ impl ChatWindow {
         self.live_mode.set(false);
         self.live_pending.set(false);
         self.update_stt_ui();
+        self.schedule_stt_idle_unload();
     }
 
     fn near_bottom(&self) -> bool {
@@ -3233,7 +3322,8 @@ impl ChatWindow {
                         win.stop_stt();
                     }
                     win.stop_speech();
-                    win.unload_tts_engine();
+                    win.cancel_tts_idle_unload();
+                    win.unload_tts_engine(None);
                 }
                 win.update_stt_ui();
             });
@@ -3372,7 +3462,7 @@ impl ChatWindow {
                     win.update_stt_ui();
                 } else {
                     win.stop_stt();
-                    win.unload_stt_engine();
+                    win.unload_stt_engine(None);
                 }
             });
         }

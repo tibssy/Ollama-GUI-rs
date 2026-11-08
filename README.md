@@ -218,12 +218,13 @@ working ALSA/PipeWire input are required.
 
 Models are loaded lazily. Repeated speech requests do not grow the process
 without bound: ONNX Runtime arenas reach a high-water mark, and the Whistle
-engram cache is capped at 16,384 rows (about 8 MB). Disabling text-to-speech or
-dictation unloads the corresponding local engine and trims the heap. Measured
-warm RSS is about 230 MB for Paradee, 315 MB for Whistle, 580 MB for Parakeet
-Redux loaded (about 600 MB after a transcription), or about 385 MB for Paradee
-and Whistle together. Unloading Parakeet Redux and trimming the heap returns
-the process to about 50 MB.
+engram cache is capped at 16,384 rows (about 8 MB). Local engines are released
+after 60 seconds without speech or dictation activity, and immediately when
+text-to-speech or dictation is disabled; both paths trim the heap, and the next
+use reloads the engine lazily. Measured warm RSS is about 230 MB for Paradee,
+315 MB for Whistle, 580 MB for Parakeet Redux loaded (about 600 MB after a
+transcription), or about 385 MB for Paradee and Whistle together. Unloading
+Parakeet Redux and trimming the heap returns the process to about 50 MB.
 
 ## Architecture
 
