@@ -177,6 +177,15 @@ the composer. It is available when both **Enable dictation** and
 - Stopping live conversation ends listening and stops any current speech; an
   in-flight text reply is allowed to finish.
 
+> **Recommended for live mode:** use a headset. With speakers, enable echo
+> cancellation on the microphone input first; otherwise the assistant's own
+> voice can be picked up and trigger barge-in or repeated turns. A working
+> EasyEffects input chain is:
+>
+> - **Echo Canceller** (WebRTC) enabled, with **Enforce high-pass** on
+> - **Noise Suppression** at **Very high**
+> - **High-Pass Filter** enabled on **Full band**
+
 During live conversation, the speech-to-text VAD start timeout is ignored;
 listening continues until the live button is turned off.
 
