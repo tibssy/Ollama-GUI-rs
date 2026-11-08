@@ -19,6 +19,14 @@ pub struct StoredMessage {
     pub content: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredSummary {
+    pub text: String,
+    /// Id of the last message covered by the summary.
+    pub upto_id: i64,
+    pub tokens: u32,
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -74,6 +82,9 @@ impl Store {
             "#,
         )?;
         self.ensure_column("conversations", "context_used", "INTEGER")?;
+        self.ensure_column("conversations", "summary", "TEXT")?;
+        self.ensure_column("conversations", "summary_upto_id", "INTEGER")?;
+        self.ensure_column("conversations", "summary_tokens", "INTEGER")?;
         self.backfill_context_usage()?;
         Ok(())
     }
@@ -145,6 +156,65 @@ impl Store {
             )
             .optional()?
             .flatten())
+    }
+
+    pub fn set_conversation_context_used(&self, id: i64, used: Option<u32>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE conversations SET context_used = ?1 WHERE id = ?2",
+            params![used, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn conversation_summary(&self, id: i64) -> Result<Option<StoredSummary>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT summary, summary_upto_id, summary_tokens
+                 FROM conversations WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<u32>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        Ok(row.and_then(|(text, upto_id, tokens)| {
+            let text = text?;
+            if text.trim().is_empty() {
+                return None;
+            }
+            Some(StoredSummary {
+                text,
+                upto_id: upto_id.unwrap_or(0),
+                tokens: tokens.unwrap_or(0),
+            })
+        }))
+    }
+
+    pub fn set_conversation_summary(&self, id: i64, summary: &StoredSummary) -> Result<()> {
+        self.conn.execute(
+            "UPDATE conversations
+             SET summary = ?1, summary_upto_id = ?2, summary_tokens = ?3
+             WHERE id = ?4",
+            params![summary.text, summary.upto_id, summary.tokens, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_conversation_summary(&self, id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE conversations
+             SET summary = NULL, summary_upto_id = NULL, summary_tokens = NULL,
+                 updated_at = unixepoch()
+             WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
     }
 
     pub fn list_conversations(&self) -> Result<Vec<ConversationSummary>> {
@@ -325,6 +395,12 @@ impl Store {
                 params![conversation_id, id],
             )?;
         }
+        let watermark = self
+            .conversation_summary(conversation_id)?
+            .map(|summary| summary.upto_id);
+        if watermark.is_some_and(|watermark| ids.iter().any(|id| *id <= watermark)) {
+            self.clear_conversation_summary(conversation_id)?;
+        }
         self.recalculate_context_used(conversation_id)?;
         Ok(ids)
     }
@@ -336,6 +412,12 @@ impl Store {
             "DELETE FROM messages WHERE conversation_id = ?1 AND id >= ?2",
             params![conversation_id, message_id],
         )?;
+        let watermark = self
+            .conversation_summary(conversation_id)?
+            .map(|summary| summary.upto_id);
+        if deleted > 0 && watermark.is_some_and(|watermark| message_id <= watermark) {
+            self.clear_conversation_summary(conversation_id)?;
+        }
         self.recalculate_context_used(conversation_id)?;
         Ok(deleted)
     }
@@ -368,7 +450,7 @@ fn context_used_from_json(json: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{context_used_from_json, Store};
+    use super::{context_used_from_json, Store, StoredSummary};
     use crate::api::StreamStats;
 
     #[test]
@@ -462,5 +544,88 @@ mod tests {
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id, user1);
         assert_eq!(store.conversation_context_used(id).unwrap(), None);
+    }
+
+    #[test]
+    fn stores_and_clears_conversation_summary() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_conversation("model", "title").unwrap();
+        let message = store.add_message(id, "user", "one", None).unwrap();
+        let summary = StoredSummary {
+            text: "The user discussed one.".into(),
+            upto_id: message,
+            tokens: 9,
+        };
+
+        store.set_conversation_summary(id, &summary).unwrap();
+        assert_eq!(store.conversation_summary(id).unwrap(), Some(summary));
+
+        store.clear_conversation_summary(id).unwrap();
+        assert_eq!(store.conversation_summary(id).unwrap(), None);
+    }
+
+    #[test]
+    fn deleting_turns_invalidates_the_summary() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_conversation("model", "title").unwrap();
+        let user1 = store.add_message(id, "user", "one", None).unwrap();
+        let assistant1 = store
+            .add_message(id, "assistant", "two", Some(&stats(2, 3)))
+            .unwrap();
+        let summary = StoredSummary {
+            text: "summary".into(),
+            upto_id: assistant1,
+            tokens: 3,
+        };
+
+        store.set_conversation_summary(id, &summary).unwrap();
+        store.delete_turn(id, user1).unwrap();
+        assert_eq!(store.conversation_summary(id).unwrap(), None);
+    }
+
+    #[test]
+    fn truncating_from_a_summarized_message_invalidates_the_summary() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_conversation("model", "title").unwrap();
+        store.add_message(id, "user", "one", None).unwrap();
+        let assistant1 = store
+            .add_message(id, "assistant", "two", Some(&stats(2, 3)))
+            .unwrap();
+        store.add_message(id, "user", "three", None).unwrap();
+        store
+            .add_message(id, "assistant", "four", Some(&stats(4, 5)))
+            .unwrap();
+
+        let summary = StoredSummary {
+            text: "summary".into(),
+            upto_id: assistant1,
+            tokens: 3,
+        };
+        store.set_conversation_summary(id, &summary).unwrap();
+        store.delete_from_message(id, assistant1).unwrap();
+        assert_eq!(store.conversation_summary(id).unwrap(), None);
+    }
+
+    #[test]
+    fn deleting_recent_turns_keeps_the_summary() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_conversation("model", "title").unwrap();
+        store.add_message(id, "user", "one", None).unwrap();
+        let assistant1 = store
+            .add_message(id, "assistant", "two", Some(&stats(2, 3)))
+            .unwrap();
+        let user2 = store.add_message(id, "user", "three", None).unwrap();
+        store
+            .add_message(id, "assistant", "four", Some(&stats(4, 5)))
+            .unwrap();
+
+        let summary = StoredSummary {
+            text: "summary".into(),
+            upto_id: assistant1,
+            tokens: 3,
+        };
+        store.set_conversation_summary(id, &summary).unwrap();
+        store.delete_turn(id, user2).unwrap();
+        assert_eq!(store.conversation_summary(id).unwrap(), Some(summary));
     }
 }

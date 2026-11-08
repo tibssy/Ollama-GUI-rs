@@ -13,11 +13,26 @@ use crate::api::{
     StreamStats,
 };
 use crate::config::Settings;
-use crate::store::{Store, StoredMessage};
+use crate::store::{Store, StoredMessage, StoredSummary};
 use crate::stt::{self, PreparedBackend, SttEvent};
 
 /// Seconds without speech activity before local TTS/STT models are released.
 const SPEECH_IDLE_UNLOAD_SECS: u32 = 60;
+
+/// Compress older history once the context reaches this fraction of `num_ctx`.
+const CONTEXT_COMPRESS_RATIO: f64 = 0.85;
+/// Number of recent user turns kept verbatim.
+const CONTEXT_KEEP_TURNS: usize = 5;
+/// Cap the rolling summary at this fraction of `num_ctx`.
+const CONTEXT_SUMMARY_RATIO: f64 = 0.10;
+/// Feed summarization this fraction of `num_ctx` at a time.
+const CONTEXT_CHUNK_RATIO: f64 = 0.45;
+const SUMMARY_TEMPERATURE: f64 = 0.2;
+const SUMMARY_SYSTEM_PROMPT: &str = "You maintain a compact summary of an ongoing chat. \
+Merge the existing summary with the older messages provided. Preserve the user's goals, \
+preferences, decisions, facts, names, numbers, file paths, code identifiers, and unresolved \
+tasks. Remove greetings, filler, repetition, and raw code that is not essential. Output only \
+the updated summary, without commentary.";
 
 pub struct AppState {
     pub settings: RefCell<Settings>,
@@ -74,6 +89,20 @@ enum SpeechEvent {
     AudioUnavailable,
     Error(String),
     Finished,
+}
+
+struct CompressionPlan {
+    model: String,
+    num_ctx: u32,
+    existing: Option<String>,
+    upto_id: i64,
+    chunks: Vec<String>,
+}
+
+struct CompressionResult {
+    text: String,
+    tokens: u32,
+    upto_id: i64,
 }
 
 struct SpeechSynthesis {
@@ -754,6 +783,9 @@ struct ChatWindow {
     speech_stream_tx: RefCell<Option<async_channel::Sender<String>>>,
     speech_text: RefCell<SpeechTextBuffer>,
     tts_idle_token: Arc<AtomicU64>,
+    summary_notice: RefCell<Option<gtk::Box>>,
+    compressing: Cell<bool>,
+    pending_generation: RefCell<Option<i64>>,
     stt_session: RefCell<Option<crate::stt::SttSession>>,
     stt_prefix: RefCell<String>,
     stt_listening: Cell<bool>,
@@ -1016,6 +1048,9 @@ impl ChatWindow {
             speech_stream_tx: RefCell::new(None),
             speech_text: RefCell::new(SpeechTextBuffer::default()),
             tts_idle_token: Arc::new(AtomicU64::new(0)),
+            summary_notice: RefCell::new(None),
+            compressing: Cell::new(false),
+            pending_generation: RefCell::new(None),
             stt_session: RefCell::new(None),
             stt_prefix: RefCell::new(String::new()),
             stt_listening: Cell::new(false),
@@ -1378,6 +1413,63 @@ impl ChatWindow {
         self.update_context_indicator(used);
     }
 
+    /// Show or hide the "earlier messages summarized" row above the chat.
+    fn refresh_summary_notice(&self, conversation_id: i64) {
+        if let Some(notice) = self.summary_notice.borrow_mut().take() {
+            self.messages_box.remove(&notice);
+        }
+        if *self.current_id.borrow() != Some(conversation_id) {
+            return;
+        }
+
+        let summary = self
+            .state
+            .store
+            .borrow()
+            .conversation_summary(conversation_id)
+            .ok()
+            .flatten();
+        let Some(summary) = summary else {
+            return;
+        };
+
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        row.add_css_class("card");
+        row.set_margin_start(12);
+        row.set_margin_end(12);
+        row.set_margin_top(6);
+        row.set_margin_bottom(6);
+
+        let icon = gtk::Image::from_icon_name("document-open-recent-symbolic");
+        icon.set_valign(gtk::Align::Center);
+        row.append(&icon);
+
+        let label = gtk::Label::new(Some(&format!(
+            "Earlier messages summarized (~{} tokens)",
+            group_digits(summary.tokens)
+        )));
+        label.set_xalign(0.0);
+        label.set_hexpand(true);
+        label.set_wrap(true);
+        label.add_css_class("dim-label");
+        row.append(&label);
+
+        let button = gtk::Button::with_label("View");
+        button.add_css_class("flat");
+        button.set_valign(gtk::Align::Center);
+        let text = summary.text.clone();
+        button.connect_clicked(move |button| {
+            let parent = button
+                .root()
+                .and_then(|root| root.downcast::<gtk::Window>().ok());
+            show_summary_dialog(parent.as_ref(), &text);
+        });
+        row.append(&button);
+
+        self.messages_box.prepend(&row);
+        *self.summary_notice.borrow_mut() = Some(row);
+    }
+
     // ----- Conversations ---------------------------------------------------
 
     fn reload_sidebar(self: &Rc<Self>) {
@@ -1450,6 +1542,7 @@ impl ChatWindow {
         self.stop_streaming();
         self.stop_speech();
         self.stop_stt();
+        *self.pending_generation.borrow_mut() = None;
         *self.current_id.borrow_mut() = Some(id);
 
         let (title, model, messages) = {
@@ -1470,6 +1563,7 @@ impl ChatWindow {
         };
 
         self.clear_messages();
+        self.refresh_summary_notice(id);
         for message in &messages {
             self.add_message_widget(id, message);
         }
@@ -1508,6 +1602,7 @@ impl ChatWindow {
         self.stop_streaming();
         self.stop_speech();
         self.stop_stt();
+        *self.pending_generation.borrow_mut() = None;
         *self.current_id.borrow_mut() = None;
         self.chat_list.unselect_all();
         self.show_empty();
@@ -1520,6 +1615,7 @@ impl ChatWindow {
         while let Some(child) = self.messages_box.first_child() {
             self.messages_box.remove(&child);
         }
+        *self.summary_notice.borrow_mut() = None;
         self.speech_buttons.borrow_mut().clear();
     }
 
@@ -2704,7 +2800,170 @@ impl ChatWindow {
         self.start_generation(conversation_id);
     }
 
+    // ----- Context compression --------------------------------------------
+
+    fn maybe_compress_context(self: &Rc<Self>, conversation_id: i64) {
+        if self.compressing.get() {
+            return;
+        }
+        if let Some(plan) = self.compression_plan(conversation_id) {
+            self.start_compression(conversation_id, plan);
+        }
+    }
+
+    fn compression_plan(&self, conversation_id: i64) -> Option<CompressionPlan> {
+        let model = self.selected_model();
+        if model.is_empty() {
+            return None;
+        }
+        let (num_ctx, system_prompt) = {
+            let settings = self.state.settings.borrow();
+            (
+                settings.num_ctx.max(1),
+                settings.system_prompt.trim().to_string(),
+            )
+        };
+
+        let (messages, summary, used) = {
+            let store = self.state.store.borrow();
+            (
+                store.messages(conversation_id).ok()?,
+                store.conversation_summary(conversation_id).ok().flatten(),
+                store
+                    .conversation_context_used(conversation_id)
+                    .ok()
+                    .flatten(),
+            )
+        };
+
+        build_compression_plan(
+            model,
+            num_ctx,
+            &system_prompt,
+            &messages,
+            summary.as_ref(),
+            used,
+        )
+    }
+
+    fn start_compression(self: &Rc<Self>, conversation_id: i64, plan: CompressionPlan) {
+        self.compressing.set(true);
+        tracing::info!("context: summarizing earlier messages for conversation {conversation_id}");
+        self.toast("Summarizing earlier messages…");
+
+        let client = self.state.client.borrow().clone();
+        let (tx, rx) = async_channel::bounded(1);
+        self.state.runtime.spawn(async move {
+            let result = run_compression(client, plan).await;
+            let _ = tx.send(result).await;
+        });
+
+        let win = self.clone();
+        glib::spawn_future_local(async move {
+            let result = rx.recv().await;
+            win.finish_compression(conversation_id, result);
+        });
+    }
+
+    fn finish_compression(
+        self: &Rc<Self>,
+        conversation_id: i64,
+        result: Result<anyhow::Result<CompressionResult>, async_channel::RecvError>,
+    ) {
+        self.compressing.set(false);
+        let mut succeeded = false;
+
+        match result {
+            Ok(Ok(result)) => {
+                let stored = StoredSummary {
+                    text: result.text,
+                    upto_id: result.upto_id,
+                    tokens: result.tokens,
+                };
+                match self
+                    .state
+                    .store
+                    .borrow()
+                    .set_conversation_summary(conversation_id, &stored)
+                {
+                    Ok(()) => {
+                        succeeded = true;
+                        let estimated = self.estimated_request_tokens(conversation_id);
+                        let _ = self
+                            .state
+                            .store
+                            .borrow()
+                            .set_conversation_context_used(conversation_id, Some(estimated));
+                        tracing::info!(
+                            "context: summarized older messages, about {estimated} tokens remain"
+                        );
+                    }
+                    Err(err) => {
+                        self.toast(&format!("Could not save the summary: {err:#}"));
+                    }
+                }
+            }
+            Ok(Err(err)) => {
+                self.toast(&format!("Could not summarize earlier messages: {err:#}"));
+            }
+            Err(_) => {
+                self.toast("Could not summarize earlier messages.");
+            }
+        }
+
+        if *self.current_id.borrow() == Some(conversation_id) {
+            self.refresh_context_indicator();
+            self.refresh_summary_notice(conversation_id);
+        }
+        self.reload_sidebar();
+
+        let pending = self.pending_generation.borrow_mut().take();
+        if let Some(pending) = pending {
+            if succeeded {
+                self.start_generation(pending);
+            } else {
+                self.start_generation_now(pending);
+            }
+        }
+    }
+
+    fn estimated_request_tokens(&self, conversation_id: i64) -> u32 {
+        let (system_prompt, messages, summary) = {
+            let settings = self.state.settings.borrow();
+            let store = self.state.store.borrow();
+            (
+                settings.system_prompt.trim().to_string(),
+                store.messages(conversation_id).unwrap_or_default(),
+                store.conversation_summary(conversation_id).ok().flatten(),
+            )
+        };
+        let kept: Vec<&StoredMessage> = match &summary {
+            Some(summary) => messages
+                .iter()
+                .filter(|message| message.id > summary.upto_id)
+                .collect(),
+            None => messages.iter().collect(),
+        };
+        estimate_request_tokens(&system_prompt, summary.as_ref(), &kept)
+    }
+
     fn start_generation(self: &Rc<Self>, conversation_id: i64) {
+        if self.active.borrow().is_some() {
+            return;
+        }
+        if self.compressing.get() {
+            *self.pending_generation.borrow_mut() = Some(conversation_id);
+            return;
+        }
+        if let Some(plan) = self.compression_plan(conversation_id) {
+            *self.pending_generation.borrow_mut() = Some(conversation_id);
+            self.start_compression(conversation_id, plan);
+            return;
+        }
+        self.start_generation_now(conversation_id);
+    }
+
+    fn start_generation_now(self: &Rc<Self>, conversation_id: i64) {
         if self.active.borrow().is_some() {
             return;
         }
@@ -2728,27 +2987,19 @@ impl ChatWindow {
             }
         };
 
-        let system_prompt = self
-            .state
-            .settings
-            .borrow()
-            .system_prompt
-            .trim()
-            .to_string();
-        let mut messages = Vec::new();
-        if !system_prompt.is_empty() {
-            messages.push(ChatMessage::new("system", system_prompt));
-        }
-        messages.extend(
-            history
-                .into_iter()
-                .map(|message| ChatMessage::new(&message.role, message.content)),
-        );
-
+        let (system_prompt, summary) = {
+            let settings = self.state.settings.borrow();
+            let store = self.state.store.borrow();
+            (
+                settings.system_prompt.trim().to_string(),
+                store.conversation_summary(conversation_id).ok().flatten(),
+            )
+        };
         let (temperature, num_ctx) = {
             let settings = self.state.settings.borrow();
-            (settings.temperature, settings.num_ctx)
+            (settings.temperature, settings.num_ctx.max(1))
         };
+        let messages = build_request_messages(&system_prompt, summary.as_ref(), &history, num_ctx);
 
         let request = ChatRequest {
             model,
@@ -2900,6 +3151,7 @@ impl ChatWindow {
         self.set_streaming_ui(false);
         self.reload_sidebar();
         self.refresh_context_indicator();
+        self.maybe_compress_context(active.conv_id);
         self.scroll_to_bottom();
 
         let streaming_speech = self.speech_stream_tx.borrow().is_some();
@@ -4043,6 +4295,309 @@ fn sentences_for_speech(text: &str, max_chars: usize) -> (Vec<String>, bool) {
     (result, false)
 }
 
+/// Rough token estimate: ASCII text is about four characters per token, while
+/// non-ASCII characters are counted as one token each.
+fn estimate_tokens(text: &str) -> u32 {
+    let mut tokens = 0.0f64;
+    for character in text.chars() {
+        tokens += if character.is_ascii() { 0.25 } else { 1.0 };
+    }
+    tokens.ceil() as u32
+}
+
+fn context_needs_compression(used: u32, num_ctx: u32) -> bool {
+    used as f64 >= num_ctx as f64 * CONTEXT_COMPRESS_RATIO
+}
+
+fn estimate_request_tokens(
+    system_prompt: &str,
+    summary: Option<&StoredSummary>,
+    messages: &[&StoredMessage],
+) -> u32 {
+    let mut total = estimate_tokens(system_prompt);
+    if let Some(summary) = summary {
+        total = total
+            .saturating_add(estimate_tokens(&summary.text))
+            .saturating_add(8);
+    }
+    total.saturating_add(
+        messages
+            .iter()
+            .map(|message| estimate_tokens(&message.content).saturating_add(4))
+            .sum::<u32>(),
+    )
+}
+
+/// Index where the last `keep_turns` user turns begin. Returns zero when there
+/// are fewer turns than requested, meaning nothing is old enough to summarize.
+fn kept_turn_start(messages: &[StoredMessage], keep_turns: usize) -> usize {
+    if keep_turns == 0 {
+        return messages.len();
+    }
+
+    let mut seen = 0usize;
+    for (index, message) in messages.iter().enumerate().rev() {
+        if message.role == "user" {
+            seen += 1;
+            if seen == keep_turns {
+                return index;
+            }
+        }
+    }
+    0
+}
+
+fn chunk_messages(messages: &[&StoredMessage], max_tokens: u32) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut used = 0u32;
+
+    for message in messages {
+        let role = match message.role.as_str() {
+            "user" => "User",
+            "assistant" => "Assistant",
+            other => other,
+        };
+        let line = format!("{role}: {}\n", message.content.trim());
+        let tokens = estimate_tokens(&line);
+        if !current.is_empty() && used.saturating_add(tokens) > max_tokens {
+            chunks.push(std::mem::take(&mut current));
+            used = 0;
+        }
+        current.push_str(&line);
+        used = used.saturating_add(tokens);
+    }
+
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn summary_budget(num_ctx: u32) -> u32 {
+    ((num_ctx as f64 * CONTEXT_SUMMARY_RATIO) as u32).max(256)
+}
+
+fn summary_chunk_budget(num_ctx: u32, summary_budget: u32) -> u32 {
+    let chunk = (num_ctx as f64 * CONTEXT_CHUNK_RATIO) as u32;
+    let available = num_ctx
+        .saturating_sub(summary_budget)
+        .saturating_sub(128)
+        .max(128);
+    chunk.saturating_sub(256).max(128).min(available)
+}
+
+fn build_request_messages(
+    system_prompt: &str,
+    summary: Option<&StoredSummary>,
+    history: &[StoredMessage],
+    num_ctx: u32,
+) -> Vec<ChatMessage> {
+    let kept: Vec<&StoredMessage> = match summary {
+        Some(summary) => history
+            .iter()
+            .filter(|message| message.id > summary.upto_id)
+            .collect(),
+        None => history.iter().collect(),
+    };
+
+    // If the kept turns alone are too large, drop the oldest ones for this
+    // request without touching the stored history.
+    let budget = (num_ctx as f64 * CONTEXT_COMPRESS_RATIO) as u32;
+    let min_start = kept
+        .iter()
+        .rposition(|message| message.role == "user")
+        .unwrap_or_else(|| kept.len().saturating_sub(1));
+    let mut start = 0;
+    while start < min_start
+        && estimate_request_tokens(system_prompt, summary, &kept[start..]) > budget
+    {
+        start += 1;
+        while start < min_start && kept[start].role != "user" {
+            start += 1;
+        }
+    }
+    let kept = &kept[start..];
+
+    let mut messages = Vec::new();
+    if !system_prompt.trim().is_empty() {
+        messages.push(ChatMessage::new("system", system_prompt));
+    }
+    if let Some(summary) = summary {
+        messages.push(ChatMessage::new(
+            "system",
+            format!("Summary of earlier conversation:\n{}", summary.text),
+        ));
+    }
+    messages.extend(
+        kept.iter()
+            .map(|message| ChatMessage::new(&message.role, message.content.clone())),
+    );
+    messages
+}
+
+fn build_compression_plan(
+    model: String,
+    num_ctx: u32,
+    system_prompt: &str,
+    messages: &[StoredMessage],
+    summary: Option<&StoredSummary>,
+    used: Option<u32>,
+) -> Option<CompressionPlan> {
+    let cutoff = kept_turn_start(messages, CONTEXT_KEEP_TURNS);
+    if cutoff == 0 {
+        return None;
+    }
+
+    let watermark = summary.map(|summary| summary.upto_id).unwrap_or(0);
+    let older: Vec<&StoredMessage> = messages[..cutoff]
+        .iter()
+        .filter(|message| message.id > watermark)
+        .collect();
+    if older.is_empty() {
+        return None;
+    }
+
+    let relevant: Vec<&StoredMessage> = match summary {
+        Some(summary) => messages
+            .iter()
+            .filter(|message| message.id > summary.upto_id)
+            .collect(),
+        None => messages.iter().collect(),
+    };
+    let estimated = estimate_request_tokens(system_prompt, summary, &relevant);
+    let used = used.map_or(estimated, |used| used.max(estimated));
+    if !context_needs_compression(used, num_ctx) {
+        return None;
+    }
+
+    let budget = summary_budget(num_ctx);
+    let chunks = chunk_messages(&older, summary_chunk_budget(num_ctx, budget));
+    if chunks.is_empty() {
+        return None;
+    }
+
+    Some(CompressionPlan {
+        model,
+        num_ctx,
+        existing: summary.map(|summary| summary.text.clone()),
+        upto_id: older.last().map(|message| message.id)?,
+        chunks,
+    })
+}
+
+async fn run_compression(
+    client: OllamaClient,
+    plan: CompressionPlan,
+) -> anyhow::Result<CompressionResult> {
+    let budget = summary_budget(plan.num_ctx);
+    let mut summary = plan.existing.unwrap_or_default();
+
+    for chunk in &plan.chunks {
+        let mut content = String::new();
+        if !summary.trim().is_empty() {
+            content.push_str("Existing summary:\n");
+            content.push_str(summary.trim());
+            content.push_str("\n\n");
+        }
+        content.push_str("Older messages to merge:\n");
+        content.push_str(chunk);
+
+        let request = ChatRequest {
+            model: plan.model.clone(),
+            messages: vec![
+                ChatMessage::new("system", SUMMARY_SYSTEM_PROMPT),
+                ChatMessage::new("user", content),
+            ],
+            stream: false,
+            options: Some(ChatOptions {
+                temperature: Some(SUMMARY_TEMPERATURE),
+                num_ctx: Some(plan.num_ctx),
+                num_predict: Some(budget as i64),
+                ..Default::default()
+            }),
+            keep_alive: Some("5m".to_string()),
+            think: None,
+        };
+
+        let reply = client.chat_once(&request).await?;
+        tracing::debug!(
+            "context: summary chunk used {:?} prompt tokens and {:?} output tokens",
+            reply.stats.prompt_eval_count,
+            reply.stats.eval_count
+        );
+        let text = reply.content.trim();
+        if text.is_empty() {
+            anyhow::bail!("summarization returned an empty response");
+        }
+        summary = clamp_summary(text, budget);
+    }
+
+    if summary.trim().is_empty() {
+        anyhow::bail!("summary is empty");
+    }
+    Ok(CompressionResult {
+        text: summary.trim().to_string(),
+        tokens: estimate_tokens(&summary),
+        upto_id: plan.upto_id,
+    })
+}
+
+fn clamp_summary(text: &str, max_tokens: u32) -> String {
+    let mut used = 0.0f64;
+    let mut end = 0usize;
+    for (index, character) in text.char_indices() {
+        used += if character.is_ascii() { 0.25 } else { 1.0 };
+        if used > max_tokens as f64 {
+            break;
+        }
+        end = index + character.len_utf8();
+    }
+    if end == 0 {
+        return String::new();
+    }
+
+    let mut clamped = text[..end].trim_end().to_string();
+    if end < text.len() {
+        if let Some(position) = clamped.rfind(['.', '!', '?', '\n']) {
+            clamped.truncate(position + 1);
+        }
+    }
+    clamped
+}
+
+fn show_summary_dialog(parent: Option<&gtk::Window>, text: &str) {
+    let dialog = gtk::Window::builder()
+        .title("Conversation summary")
+        .modal(true)
+        .default_width(560)
+        .default_height(420)
+        .build();
+    let header = gtk::HeaderBar::new();
+    dialog.set_titlebar(Some(&header));
+    if let Some(parent) = parent {
+        dialog.set_transient_for(Some(parent));
+    }
+
+    let scrolled = gtk::ScrolledWindow::new();
+    scrolled.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    scrolled.set_hexpand(true);
+    scrolled.set_vexpand(true);
+
+    let label = gtk::Label::new(Some(text));
+    label.set_wrap(true);
+    label.set_xalign(0.0);
+    label.set_selectable(true);
+    label.set_margin_top(16);
+    label.set_margin_bottom(16);
+    label.set_margin_start(16);
+    label.set_margin_end(16);
+    scrolled.set_child(Some(&label));
+
+    dialog.set_child(Some(&scrolled));
+    dialog.present();
+}
+
 fn spawn_playback_thread(
     generation: Arc<AtomicU64>,
 ) -> anyhow::Result<async_channel::Sender<PlaybackChunk>> {
@@ -4178,10 +4733,12 @@ fn capability_description(capability: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_wav, format_percent, group_digits, plain_text_for_speech, sentences_for_speech,
-        split_sentences, take_complete_sentences, tts_language, voice_options_for_backend,
-        SpeechTextBuffer,
+        build_compression_plan, build_request_messages, chunk_messages, clamp_summary,
+        context_needs_compression, decode_wav, estimate_tokens, format_percent, group_digits,
+        kept_turn_start, plain_text_for_speech, sentences_for_speech, split_sentences,
+        take_complete_sentences, tts_language, voice_options_for_backend, SpeechTextBuffer,
     };
+    use crate::store::{StoredMessage, StoredSummary};
 
     #[test]
     fn groups_thousands() {
@@ -4376,6 +4933,179 @@ mod tests {
             assert_eq!(channels, 1);
             assert_eq!(sample_rate, 24_000);
             assert!(samples.len() > 1_000);
+        });
+    }
+
+    fn stored_message(id: i64, role: &str, content: &str) -> StoredMessage {
+        StoredMessage {
+            id,
+            role: role.to_string(),
+            content: content.to_string(),
+        }
+    }
+
+    #[test]
+    fn keeps_only_the_last_five_turns() {
+        let mut messages = Vec::new();
+        for turn in 0..7 {
+            messages.push(stored_message(turn * 2 + 1, "user", &format!("u{turn}")));
+            messages.push(stored_message(
+                turn * 2 + 2,
+                "assistant",
+                &format!("a{turn}"),
+            ));
+        }
+
+        assert_eq!(kept_turn_start(&messages, 5), 4);
+        assert_eq!(kept_turn_start(&messages[..6], 5), 0);
+        assert_eq!(kept_turn_start(&[], 5), 0);
+    }
+
+    #[test]
+    fn builds_a_request_with_a_summary() {
+        let history = vec![
+            stored_message(1, "user", "old question"),
+            stored_message(2, "assistant", "old answer"),
+            stored_message(3, "user", "new question"),
+            stored_message(4, "assistant", "new answer"),
+        ];
+        let summary = StoredSummary {
+            text: "They talked about old things.".into(),
+            upto_id: 2,
+            tokens: 8,
+        };
+
+        let request = build_request_messages("Be concise.", Some(&summary), &history, 8192);
+        assert_eq!(request.len(), 4);
+        assert_eq!(request[0].role, "system");
+        assert_eq!(request[0].content, "Be concise.");
+        assert_eq!(request[1].role, "system");
+        assert!(request[1].content.contains("old things"));
+        assert_eq!(request[2].content, "new question");
+        assert_eq!(request[3].content, "new answer");
+    }
+
+    #[test]
+    fn estimates_tokens_for_ascii_and_cjk() {
+        assert_eq!(estimate_tokens(""), 0);
+        assert_eq!(estimate_tokens("hello world"), 3);
+        assert_eq!(estimate_tokens("日本語"), 3);
+    }
+
+    #[test]
+    fn triggers_compression_at_eighty_five_percent() {
+        assert!(!context_needs_compression(8_499, 10_000));
+        assert!(context_needs_compression(8_500, 10_000));
+        assert!(context_needs_compression(8_501, 10_000));
+    }
+
+    #[test]
+    fn request_trim_keeps_the_last_user_turn() {
+        let history: Vec<StoredMessage> = (0..20)
+            .map(|index| {
+                stored_message(
+                    index,
+                    if index % 2 == 0 { "user" } else { "assistant" },
+                    &"word ".repeat(200),
+                )
+            })
+            .collect();
+
+        let request = build_request_messages("", None, &history, 512);
+        assert_eq!(request.iter().filter(|m| m.role == "user").count(), 1);
+        assert_eq!(request.last().map(|m| m.role.as_str()), Some("assistant"));
+    }
+
+    #[test]
+    fn plans_compression_only_when_needed() {
+        let mut messages = Vec::new();
+        for turn in 0..7 {
+            messages.push(stored_message(
+                turn * 2 + 1,
+                "user",
+                &format!("question {turn} {}", "word ".repeat(50)),
+            ));
+            messages.push(stored_message(
+                turn * 2 + 2,
+                "assistant",
+                &format!("answer {turn} {}", "word ".repeat(50)),
+            ));
+        }
+
+        let plan = build_compression_plan("model".into(), 8192, "", &messages, None, Some(8_500))
+            .expect("compression plan");
+        assert_eq!(plan.upto_id, 4);
+        assert!(!plan.chunks.is_empty());
+
+        assert!(
+            build_compression_plan("model".into(), 8192, "", &messages, None, Some(6_000))
+                .is_none()
+        );
+
+        let summary = StoredSummary {
+            text: "old".into(),
+            upto_id: 4,
+            tokens: 3,
+        };
+        assert!(build_compression_plan(
+            "model".into(),
+            8192,
+            "",
+            &messages,
+            Some(&summary),
+            Some(9_000),
+        )
+        .is_none());
+
+        let short = &messages[..8];
+        assert!(
+            build_compression_plan("model".into(), 8192, "", short, None, Some(9_000)).is_none()
+        );
+    }
+
+    #[test]
+    fn clamps_long_summaries() {
+        let clamped = clamp_summary("One. Two. Three. Four.", 2);
+        assert_eq!(clamped, "One.");
+    }
+
+    #[test]
+    fn splits_long_histories_into_chunks() {
+        let messages: Vec<StoredMessage> = (0..6)
+            .map(|index| stored_message(index, "user", &"word ".repeat(40)))
+            .collect();
+        let refs: Vec<&StoredMessage> = messages.iter().collect();
+        assert!(chunk_messages(&refs, 40).len() > 1);
+    }
+
+    #[test]
+    #[ignore = "requires a local Ollama daemon and a chat model"]
+    fn compresses_older_turns_with_ollama() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let client = crate::api::OllamaClient::new("http://localhost:11434", "");
+            let models = client.list_models().await.expect("list models");
+            let model = models
+                .iter()
+                .find(|model| model.is_chat_model())
+                .map(|model| model.name.clone())
+                .expect("no chat-capable models installed");
+
+            let plan = super::CompressionPlan {
+                model,
+                num_ctx: 4096,
+                existing: None,
+                upto_id: 42,
+                chunks: vec![
+                    "User: My name is Ada and I prefer tea.\nAssistant: Noted, Ada.\n".to_string(),
+                ],
+            };
+            let result = super::run_compression(client, plan)
+                .await
+                .expect("summarize older turns");
+            println!("summary: {}", result.text);
+            assert!(!result.text.trim().is_empty());
+            assert_eq!(result.upto_id, 42);
         });
     }
 

@@ -23,6 +23,8 @@ The MVP is working:
   assistant) and automatic multi-turn sending/reading
 - Context usage indicator (tokens used / window size, percentage) with a
   per-conversation percentage in the sidebar
+- Automatic context compression: at 85% usage, older turns are summarized while
+  the last five turns stay verbatim
 - Conversations persisted locally in SQLite
 - New / delete chat, automatic titles from the first message
 - Model picker with search, per-conversation model selection (chat-capable
@@ -156,6 +158,18 @@ Audio is captured at the device rate, mixed to mono, resampled to 16 kHz, and
 processed in 512-sample frames by the bundled Silero VAD model. While speech is
 active, partial transcripts update the input field every ~1.5 seconds; the final
 transcript replaces the partial text when the end-of-speech silence is detected.
+
+## Context compression
+
+When a reply pushes context usage to 85% of the configured **Context size**,
+the app summarizes older turns in the background and keeps the last five user
+turns verbatim. The summary is stored with the conversation and reused
+incrementally on later turns, so it is not regenerated on every request.
+Original messages remain stored and visible in the chat.
+
+An **Earlier messages summarized** row above the conversation opens the current
+summary. If summarization fails, the next request falls back to the most recent
+turns within the context budget.
 
 ## Live voice conversation
 

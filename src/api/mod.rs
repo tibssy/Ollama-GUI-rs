@@ -103,6 +103,12 @@ pub struct StreamStats {
     pub prompt_eval_count: Option<u32>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ChatReply {
+    pub content: String,
+    pub stats: StreamStats,
+}
+
 impl StreamStats {
     pub fn tokens_per_second(&self) -> Option<f64> {
         let count = self.eval_count? as f64;
@@ -223,6 +229,30 @@ impl OllamaClient {
             bail!("Ollama returned HTTP {status}: {detail}");
         }
         Ok(response)
+    }
+
+    /// Run a non-streaming chat request. Used for background tasks such as
+    /// conversation summaries.
+    pub async fn chat_once(&self, request: &ChatRequest) -> Result<ChatReply> {
+        let response = self.chat(request).await?;
+        let chunk: ChatChunk = response
+            .json()
+            .await
+            .context("parsing Ollama chat response")?;
+        if let Some(error) = chunk.error {
+            bail!(error);
+        }
+        Ok(ChatReply {
+            content: chunk
+                .message
+                .map(|message| message.content)
+                .unwrap_or_default(),
+            stats: StreamStats {
+                eval_count: chunk.eval_count,
+                eval_duration: chunk.eval_duration,
+                prompt_eval_count: chunk.prompt_eval_count,
+            },
+        })
     }
 
     /// Generate speech with an Ollama speech-capable model via the
@@ -431,6 +461,16 @@ mod tests {
         assert_eq!(json["options"]["temperature"], 0.5);
         assert_eq!(json["options"]["num_ctx"], 4096);
         assert!(json["options"].get("seed").is_none());
+    }
+
+    #[test]
+    fn parses_non_streaming_chat_reply() {
+        let json = r#"{"model":"m","message":{"role":"assistant","content":"summary"},"done":true,"eval_count":5,"prompt_eval_count":11}"#;
+        let chunk: ChatChunk = serde_json::from_str(json).unwrap();
+        assert_eq!(chunk.message.unwrap().content, "summary");
+        assert_eq!(chunk.eval_count, Some(5));
+        assert_eq!(chunk.prompt_eval_count, Some(11));
+        assert!(chunk.done);
     }
 
     #[test]
