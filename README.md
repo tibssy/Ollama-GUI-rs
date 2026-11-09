@@ -194,10 +194,19 @@ address. Keep both switches off to disable memory entirely.
 After each reply the app asks the conversation model for compact notes about
 durable facts and explicit preferences. The notes are embedded with the
 configured **Embedding model** (default `all-minilm`; pull it with
-`ollama pull all-minilm`) and stored in SQLite. Notes are deduplicated by text
-and cosine similarity. Before each request the user's message is embedded, the
-most relevant notes from the matching pool are retrieved, and a small system
-message is added. The memory block is capped at about 8% of the context window.
+`ollama pull all-minilm`) and stored in SQLite. The capture date is included in
+the embedded text, so it participates in semantic matching. Notes are
+deduplicated by text and cosine similarity. Before each request the user's
+message is embedded, the most relevant notes from the matching pool are
+retrieved, and a small system message is added. The memory block is capped at
+about 8% of the context window.
+
+Queries with relative dates such as “yesterday”, “last Friday”, or “three days
+ago”, or with an explicit `YYYY-MM-DD` date, are resolved against the local
+date. Notes captured on that date, or notes whose text mentions it, are
+preferred. The extraction prompt also asks the model to resolve relative dates
+inside notes to absolute `YYYY-MM-DD` dates, so a note captured later can still
+be found by the date of the event it describes.
 
 Only the user's messages are used for extraction, so the assistant's suggestions
 and advice are not stored as user preferences. Changing the **Embedding model**

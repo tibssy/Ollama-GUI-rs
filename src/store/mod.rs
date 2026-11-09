@@ -1,11 +1,11 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::api::StreamStats;
-use crate::memory::{self, MemoryEntry, MemoryPool};
+use crate::memory::{self, DateHint, MemoryEntry, MemoryPool};
 
 #[derive(Debug, Clone)]
 pub struct ConversationSummary {
@@ -293,6 +293,72 @@ impl Store {
             self.memory_count(MemoryPool::Local)?,
             self.memory_count(MemoryPool::Cloud)?,
         ))
+    }
+
+    /// Today's local date in YYYY-MM-DD form.
+    pub fn local_date(&self) -> Result<String> {
+        Ok(self
+            .conn
+            .query_row("SELECT date('now','localtime')", [], |row| row.get(0))?)
+    }
+
+    /// Resolve a relative date from the user's query to an inclusive
+    /// YYYY-MM-DD range using SQLite's local-time date arithmetic.
+    pub fn resolve_date_hint(&self, hint: DateHint) -> Result<(String, String)> {
+        match hint {
+            DateHint::Exact(date) => {
+                let normalized: Option<String> =
+                    self.conn
+                        .query_row("SELECT date(?1)", params![date], |row| row.get(0))?;
+                match normalized {
+                    Some(date) => Ok((date.clone(), date)),
+                    None => bail!("invalid date"),
+                }
+            }
+            DateHint::Today => {
+                let date = self.local_date()?;
+                Ok((date.clone(), date))
+            }
+            DateHint::Yesterday => self.date_offset(1),
+            DateHint::DaysAgo(days) => self.date_offset(days),
+            DateHint::LastWeekday(weekday) => {
+                let modifier = format!("weekday {weekday}");
+                let date: String = self.conn.query_row(
+                    "SELECT date('now','localtime','-7 days', ?1)",
+                    params![modifier],
+                    |row| row.get(0),
+                )?;
+                Ok((date.clone(), date))
+            }
+            DateHint::LastWeek => Ok(self.conn.query_row(
+                "SELECT date('now','localtime','-13 days'),
+                        date('now','localtime','-7 days')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?),
+            DateHint::LastMonth => Ok(self.conn.query_row(
+                "SELECT date('now','localtime','start of month','-1 month'),
+                        date('now','localtime','start of month','-1 day')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?),
+            DateHint::LastYear => Ok(self.conn.query_row(
+                "SELECT date('now','localtime','start of year','-1 year'),
+                        date('now','localtime','start of year','-1 day')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?),
+        }
+    }
+
+    fn date_offset(&self, days: u32) -> Result<(String, String)> {
+        let modifier = format!("-{days} days");
+        let date: String = self.conn.query_row(
+            "SELECT date('now','localtime', ?1)",
+            params![modifier],
+            |row| row.get(0),
+        )?;
+        Ok((date.clone(), date))
     }
 
     /// Load the notes for one pool and embedding model. Results are cached
@@ -639,7 +705,8 @@ fn context_used_from_json(json: &str) -> Option<u32> {
 mod tests {
     use super::{context_used_from_json, Store, StoredSummary};
     use crate::api::StreamStats;
-    use crate::memory::MemoryPool;
+    use crate::memory::{DateHint, MemoryPool};
+    use rusqlite::params;
 
     #[test]
     fn context_used_sums_prompt_and_generated_tokens() {
@@ -849,7 +916,7 @@ mod tests {
             .unwrap();
         assert_eq!(local.len(), 1);
         assert_eq!(local[0].text, "The user prefers dark mode.");
-        let hits = crate::memory::search_entries(&local, &[1.0, 0.0], 4, 0.0);
+        let hits = crate::memory::search_entries(&local, &[1.0, 0.0], 4, 0.0, None);
         assert_eq!(hits.len(), 1);
 
         let cloud = store
@@ -932,6 +999,44 @@ mod tests {
 
         assert_eq!(store.clear_memories(None).unwrap(), 1);
         assert_eq!(store.memory_counts().unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn resolves_relative_date_hints() {
+        let store = Store::open_in_memory().unwrap();
+        let today = store.local_date().unwrap();
+        assert_eq!(today.len(), 10);
+
+        let (start, end) = store.resolve_date_hint(DateHint::Today).unwrap();
+        assert_eq!(
+            (start.as_str(), end.as_str()),
+            (today.as_str(), today.as_str())
+        );
+
+        let (start, end) = store.resolve_date_hint(DateHint::LastWeekday(5)).unwrap();
+        assert_eq!(start, end);
+        let weekday: String = store
+            .conn
+            .query_row("SELECT strftime('%w', ?1)", params![start], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(weekday, "5");
+
+        let (start, end) = store.resolve_date_hint(DateHint::LastWeek).unwrap();
+        assert!(start <= end);
+        let (start, end) = store.resolve_date_hint(DateHint::LastMonth).unwrap();
+        assert!(start <= end);
+        let (start, end) = store.resolve_date_hint(DateHint::LastYear).unwrap();
+        assert!(start <= end);
+
+        let (start, end) = store
+            .resolve_date_hint(DateHint::Exact("2026-11-06".into()))
+            .unwrap();
+        assert_eq!((start.as_str(), end.as_str()), ("2026-11-06", "2026-11-06"));
+        assert!(store
+            .resolve_date_hint(DateHint::Exact("2026-99-99".into()))
+            .is_err());
     }
 
     #[test]

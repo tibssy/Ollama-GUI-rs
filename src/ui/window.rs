@@ -126,6 +126,7 @@ struct MemoryJob {
     pool: MemoryPool,
     model: String,
     embedding_model: String,
+    created_date: String,
     transcript: String,
     max_chars: usize,
     num_ctx: u32,
@@ -3320,8 +3321,28 @@ impl ChatWindow {
             )
         };
         let budget = memory::memory_context_budget(num_ctx);
+        let date_hint = memory::date_hint(text);
+        let date_range = date_hint.clone().and_then(|hint| {
+            self.state
+                .store
+                .borrow()
+                .resolve_date_hint(hint)
+                .map_err(|err| {
+                    tracing::warn!("memory: could not resolve date hint: {err:#}");
+                    err
+                })
+                .ok()
+        });
+        let mut query = text.to_string();
+        if let Some((start, end)) = &date_range {
+            if start == end {
+                query.push_str(&format!("\nDate: {start}"));
+            } else {
+                query.push_str(&format!("\nDate range: {start} to {end}"));
+            }
+            tracing::debug!("memory: date hint {date_hint:?} resolved to {start}..{end}");
+        }
         let client = self.state.client.borrow().clone();
-        let query = text.to_string();
         let model_for_check = model.clone();
 
         self.memory_lookup.set(true);
@@ -3338,6 +3359,9 @@ impl ChatWindow {
                     &query_vector,
                     top_k,
                     memory::MEMORY_MIN_SCORE,
+                    date_range
+                        .as_ref()
+                        .map(|(start, end)| (start.as_str(), end.as_str())),
                 );
                 tracing::debug!(
                     "memory: retrieved {} note(s) from the {} pool",
@@ -3987,12 +4011,14 @@ impl ChatWindow {
         }
 
         let max_chars = self.state.settings.borrow().memory_summary_chars.max(200) as usize;
+        let created_date = self.state.store.borrow().local_date().unwrap_or_default();
         let job = MemoryJob {
             conversation_id,
             upto_id,
             pool,
             model: model.to_string(),
             embedding_model,
+            created_date,
             transcript,
             max_chars,
             num_ctx,
@@ -5999,7 +6025,10 @@ async fn run_memory_job(client: OllamaClient, job: MemoryJob) -> anyhow::Result<
     let request = ChatRequest {
         model: job.model.clone(),
         messages: vec![
-            ChatMessage::new("system", memory::summary_prompt(job.max_chars)),
+            ChatMessage::new(
+                "system",
+                memory::summary_prompt(job.max_chars, &job.created_date),
+            ),
             ChatMessage::new("user", format!("Transcript:\n{}", job.transcript)),
         ],
         stream: false,
@@ -6024,8 +6053,11 @@ async fn run_memory_job(client: OllamaClient, job: MemoryJob) -> anyhow::Result<
         return Ok(result);
     }
 
+    // Encode the capture date into the vector so date-flavoured queries can
+    // match even when the note itself does not repeat the date.
+    let embedding_text = format!("[{}] {text}", job.created_date);
     let mut vectors = client
-        .embed(&job.embedding_model, std::slice::from_ref(&text))
+        .embed(&job.embedding_model, std::slice::from_ref(&embedding_text))
         .await?;
     let vector = vectors.pop().filter(|vector| !vector.is_empty());
     if vector.is_none() {

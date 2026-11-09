@@ -6,6 +6,8 @@ pub const MEMORY_MIN_SCORE: f32 = 0.35;
 pub const MEMORY_DUPLICATE_SCORE: f32 = 0.90;
 /// Shorter summaries are considered empty.
 pub const MEMORY_MIN_SUMMARY_CHARS: usize = 24;
+/// Ranking bonus for notes captured inside a date the user asked about.
+const MEMORY_DATE_BOOST: f32 = 0.10;
 
 /// Cap the injected memory context at this fraction of `num_ctx`.
 const MEMORY_CONTEXT_RATIO: f64 = 0.08;
@@ -70,6 +72,98 @@ pub struct MemoryHit {
     pub score: f32,
 }
 
+/// A date expression found in a user query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DateHint {
+    Exact(String),
+    Today,
+    Yesterday,
+    DaysAgo(u32),
+    /// SQLite weekday number: 0 = Sunday, 1 = Monday, ... 6 = Saturday.
+    LastWeekday(u8),
+    LastWeek,
+    LastMonth,
+    LastYear,
+}
+
+/// Find a date expression in a user query. Explicit YYYY-MM-DD dates win,
+/// then weekdays (so "last Friday" wins over "last week"), then broader
+/// phrases.
+pub fn date_hint(query: &str) -> Option<DateHint> {
+    let lower = query.to_lowercase();
+    if let Some(date) = first_date(&lower) {
+        return Some(DateHint::Exact(date.to_string()));
+    }
+    if lower.contains("day before yesterday") {
+        return Some(DateHint::DaysAgo(2));
+    }
+
+    for (name, weekday) in [
+        ("monday", 1),
+        ("tuesday", 2),
+        ("wednesday", 3),
+        ("thursday", 4),
+        ("friday", 5),
+        ("saturday", 6),
+        ("sunday", 0),
+    ] {
+        if lower.contains(&format!("last {name}")) || lower.contains(&format!("{name} last week")) {
+            return Some(DateHint::LastWeekday(weekday));
+        }
+    }
+
+    if lower.contains("yesterday") {
+        return Some(DateHint::Yesterday);
+    }
+    if lower.contains("today") || lower.contains("tonight") || lower.contains("this morning") {
+        return Some(DateHint::Today);
+    }
+    if lower.contains("last week") {
+        return Some(DateHint::LastWeek);
+    }
+    if lower.contains("last month") {
+        return Some(DateHint::LastMonth);
+    }
+    if lower.contains("last year") {
+        return Some(DateHint::LastYear);
+    }
+    parse_days_ago(&lower).map(DateHint::DaysAgo)
+}
+
+fn parse_days_ago(lower: &str) -> Option<u32> {
+    if lower.contains("a week ago") {
+        return Some(7);
+    }
+    for (word, days) in [
+        ("one", 1),
+        ("two", 2),
+        ("three", 3),
+        ("four", 4),
+        ("five", 5),
+        ("six", 6),
+        ("seven", 7),
+        ("eight", 8),
+        ("nine", 9),
+        ("ten", 10),
+    ] {
+        if lower.contains(&format!("{word} days ago")) {
+            return Some(days);
+        }
+    }
+
+    let tokens: Vec<&str> = lower.split_whitespace().collect();
+    for window in tokens.windows(3) {
+        if window[1] == "days" && window[2] == "ago" {
+            if let Ok(days) = window[0].parse::<u32>() {
+                if (1..=31).contains(&days) {
+                    return Some(days);
+                }
+            }
+        }
+    }
+    None
+}
+
 pub fn encode_vector(vector: &[f32]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(vector.len() * 4);
     for value in vector {
@@ -111,21 +205,44 @@ pub fn search_entries(
     query: &[f32],
     top_k: usize,
     min_score: f32,
+    date_range: Option<(&str, &str)>,
 ) -> Vec<MemoryHit> {
     if query.is_empty() || top_k == 0 {
         return Vec::new();
     }
 
-    let mut hits: Vec<MemoryHit> = entries
+    let mut scored: Vec<(MemoryHit, bool)> = entries
         .iter()
         .filter(|entry| entry.vector.len() == query.len())
-        .map(|entry| MemoryHit {
-            text: entry.text.clone(),
-            created: entry.created.clone(),
-            score: cosine(query, &entry.vector),
+        .filter_map(|entry| {
+            let semantic = cosine(query, &entry.vector);
+            if semantic < min_score {
+                return None;
+            }
+            let in_range = date_range.is_some_and(|(start, end)| {
+                let capture_in_range =
+                    entry.created.as_str() >= start && entry.created.as_str() <= end;
+                capture_in_range || note_has_date_in_range(&entry.text, start, end)
+            });
+            Some((
+                MemoryHit {
+                    text: entry.text.clone(),
+                    created: entry.created.clone(),
+                    score: semantic + if in_range { MEMORY_DATE_BOOST } else { 0.0 },
+                },
+                in_range,
+            ))
         })
-        .filter(|hit| hit.score >= min_score)
         .collect();
+
+    // When the user names a date, prefer notes captured on that date or notes
+    // whose text explicitly mentions it. Fall back to all hits if nothing
+    // matches, so a missing date does not hide relevant context.
+    if date_range.is_some() && scored.iter().any(|(_, in_range)| *in_range) {
+        scored.retain(|(_, in_range)| *in_range);
+    }
+
+    let mut hits: Vec<MemoryHit> = scored.into_iter().map(|(hit, _)| hit).collect();
     hits.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
@@ -133,6 +250,28 @@ pub fn search_entries(
     });
     hits.truncate(top_k);
     hits
+}
+
+/// Find YYYY-MM-DD dates in note text and check whether any fall in the range.
+fn note_has_date_in_range(text: &str, start: &str, end: &str) -> bool {
+    text_dates(text).any(|candidate| candidate >= start && candidate <= end)
+}
+
+fn first_date(text: &str) -> Option<&str> {
+    text_dates(text).next()
+}
+
+fn text_dates(text: &str) -> impl Iterator<Item = &str> {
+    text.as_bytes().windows(10).filter_map(|window| {
+        let candidate = std::str::from_utf8(window).ok()?;
+        let bytes = candidate.as_bytes();
+        let looks_like_date = bytes[4] == b'-'
+            && bytes[7] == b'-'
+            && bytes[..4].iter().all(u8::is_ascii_digit)
+            && bytes[5..7].iter().all(u8::is_ascii_digit)
+            && bytes[8..10].iter().all(u8::is_ascii_digit);
+        looks_like_date.then_some(candidate)
+    })
 }
 
 pub fn max_similarity(entries: &[MemoryEntry], vector: &[f32]) -> f32 {
@@ -217,14 +356,16 @@ pub fn sanitize_note(text: &str, max_chars: usize) -> String {
     }
 }
 
-pub fn summary_prompt(max_chars: usize) -> String {
+pub fn summary_prompt(max_chars: usize, date: &str) -> String {
     format!(
-        "You are a memory extraction function. Read only the user's messages in the transcript \
-         and output only a bullet list of durable facts and explicit preferences the user \
-         stated about themselves that would help in future conversations. Ignore the \
-         assistant's replies, suggestions, advice, questions, and offers of help. Do not \
-         answer the conversation and do not include greetings, filler, transient details, or \
-         raw code. Example:\n- The user's name is Alex.\n- The user prefers dark mode.\n\
+        "You are a memory extraction function. The conversation date is {date}. Read only the \
+         user's messages in the transcript and output only a bullet list of durable facts and \
+         explicit preferences the user stated about themselves that would help in future \
+         conversations. Preserve dates and resolve relative dates such as 'yesterday' or \
+         'last Friday' to absolute dates (YYYY-MM-DD) in the notes. Ignore the assistant's \
+         replies, suggestions, advice, questions, and offers of help. Do not answer the \
+         conversation and do not include greetings, filler, transient details, or raw code. \
+         Example:\n- The user's name is Alex.\n- The user prefers dark mode.\n\
          Max {max_chars} characters. If there is nothing durable, output nothing."
     )
 }
@@ -305,9 +446,10 @@ fn estimate_tokens(text: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_transcript, clamp_text, cosine, decode_vector, encode_vector, format_memory_context,
-        max_similarity, memory_context_budget, model_is_cloud, model_names_match, sanitize_note,
-        search_entries, MemoryEntry, MemoryHit, MEMORY_MIN_SCORE,
+        build_transcript, clamp_text, cosine, date_hint, decode_vector, encode_vector,
+        format_memory_context, max_similarity, memory_context_budget, model_is_cloud,
+        model_names_match, sanitize_note, search_entries, DateHint, MemoryEntry, MemoryHit,
+        MEMORY_MIN_SCORE,
     };
     use crate::store::StoredMessage;
 
@@ -348,13 +490,74 @@ mod tests {
             entry("far", vec![0.0, 1.0], "2026-11-08"),
             entry("also close", vec![0.9, 0.1], "2026-11-07"),
         ];
-        let hits = search_entries(&entries, &[1.0, 0.0], 1, MEMORY_MIN_SCORE);
+        let hits = search_entries(&entries, &[1.0, 0.0], 1, MEMORY_MIN_SCORE, None);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].text, "close");
 
-        let hits = search_entries(&entries, &[1.0, 0.0], 10, MEMORY_MIN_SCORE);
+        let hits = search_entries(&entries, &[1.0, 0.0], 10, MEMORY_MIN_SCORE, None);
         assert_eq!(hits.len(), 2);
         assert!(hits[0].score >= hits[1].score);
+    }
+
+    #[test]
+    fn search_prefers_notes_from_the_requested_date() {
+        let entries = vec![
+            entry("recipe from Friday", vec![1.0, 0.0], "2026-11-06"),
+            entry("recipe from earlier", vec![1.0, 0.0], "2026-11-01"),
+        ];
+        let hits = search_entries(
+            &entries,
+            &[1.0, 0.0],
+            2,
+            0.0,
+            Some(("2026-11-06", "2026-11-06")),
+        );
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].created, "2026-11-06");
+    }
+
+    #[test]
+    fn search_matches_dates_mentioned_in_note_text() {
+        let entries = vec![
+            entry("lasagna on 2026-11-06", vec![1.0, 0.0], "2026-11-09"),
+            entry("pizza on 2026-10-30", vec![1.0, 0.0], "2026-10-30"),
+        ];
+        let hits = search_entries(
+            &entries,
+            &[1.0, 0.0],
+            4,
+            0.0,
+            Some(("2026-11-06", "2026-11-06")),
+        );
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].text.contains("lasagna"));
+    }
+
+    #[test]
+    fn finds_relative_dates_in_queries() {
+        assert_eq!(
+            date_hint("Do you remember what I cooked last Friday?"),
+            Some(DateHint::LastWeekday(5))
+        );
+        assert_eq!(
+            date_hint("What did we talk about yesterday?"),
+            Some(DateHint::Yesterday)
+        );
+        assert_eq!(
+            date_hint("What did we discuss today?"),
+            Some(DateHint::Today)
+        );
+        assert_eq!(date_hint("Show me last month"), Some(DateHint::LastMonth));
+        assert_eq!(date_hint("three days ago"), Some(DateHint::DaysAgo(3)));
+        assert_eq!(
+            date_hint("the day before yesterday"),
+            Some(DateHint::DaysAgo(2))
+        );
+        assert_eq!(
+            date_hint("What did I cook on 2026-11-06?"),
+            Some(DateHint::Exact("2026-11-06".into()))
+        );
+        assert_eq!(date_hint("hello there"), None);
     }
 
     #[test]
