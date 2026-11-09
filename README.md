@@ -24,6 +24,8 @@ The MVP is working:
 - Context usage indicator (tokens used / window size, percentage) with a
   per-conversation percentage in the sidebar
 - Collapsible sidebar with a header toggle, menu item, and Ctrl+B shortcut
+- Optional background mode with a system tray icon, live-state indicator, and
+  tray actions for window visibility, live conversation, and quit
 - Automatic context compression: at 85% usage, older turns are summarized while
   the last five turns stay verbatim
 - Optional thinking mode for reasoning models, with on/off or low/medium/high
@@ -88,7 +90,9 @@ install -Dm755 target/release/ollama-gui ~/.local/bin/ollama-gui
 install -Dm644 data/io.github.ltux.OllamaGui.desktop ~/.local/share/applications/io.github.ltux.OllamaGui.desktop
 install -Dm644 data/io.github.ltux.OllamaGui.metainfo.xml ~/.local/share/metainfo/io.github.ltux.OllamaGui.metainfo.xml
 install -Dm644 data/icons/io.github.ltux.OllamaGui.svg ~/.local/share/icons/hicolor/scalable/apps/io.github.ltux.OllamaGui.svg
+install -Dm644 data/icons/io.github.ltux.OllamaGui-live.svg ~/.local/share/icons/hicolor/scalable/apps/io.github.ltux.OllamaGui-live.svg
 update-desktop-database ~/.local/share/applications 2>/dev/null || true
+gtk-update-icon-cache -f -t ~/.local/share/icons/hicolor 2>/dev/null || true
 ```
 
 ## Configuration
@@ -180,6 +184,21 @@ Use the sidebar button in the header, **Toggle Sidebar** in the main menu, or
 Ctrl+B to hide or show the conversation list. The choice is remembered between
 sessions. The chat column keeps its width when the sidebar is hidden, so
 toggling the sidebar does not re-wrap long conversations.
+
+## Background mode
+
+Enable **Keep running in the background** under Preferences → Application to
+keep the app alive after the window is closed. Closing the window hides it to
+the system tray; use the tray icon or the **Show/Hide Window** tray action to
+bring it back.
+
+The tray menu can show or hide the window, start or stop live conversation
+without opening the window, and quit the app. The tray icon changes when live
+voice conversation is active.
+
+The tray uses the freedesktop StatusNotifierItem specification, so a compatible
+panel or host is required (KDE, GNOME's AppIndicator extension, Waybar, and
+similar).
 
 ## Thinking
 
@@ -280,6 +299,7 @@ src/
                      encoder/decoder and greedy TDT decoding
   stt.rs             microphone capture, resampling, Silero VAD and the
                      streaming transcription worker
+  tray.rs            StatusNotifierItem tray, icon state and menu actions
   ui/window.rs       split-view shell, chat controller, settings dialog,
                      sentence queuing and background speech playback
   ui/markdown.rs     pulldown-cmark -> native GTK tags + GtkSourceView blocks

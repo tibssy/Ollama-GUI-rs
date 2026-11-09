@@ -4,6 +4,7 @@ mod paradee;
 mod parakeet;
 mod store;
 mod stt;
+mod tray;
 mod ui;
 mod whistle;
 

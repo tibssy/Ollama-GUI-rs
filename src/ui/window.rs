@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use gtk::prelude::*;
 use gtk::{gdk, gio, glib};
+use ksni::TrayMethods;
 use libadwaita as adw;
 use libadwaita::prelude::*;
 
@@ -15,6 +16,7 @@ use crate::api::{
 use crate::config::Settings;
 use crate::store::{Store, StoredMessage, StoredSummary};
 use crate::stt::{self, PreparedBackend, SttEvent};
+use crate::tray::{StatusTray, TrayCommand};
 
 /// Seconds without speech activity before local TTS/STT models are released.
 const SPEECH_IDLE_UNLOAD_SECS: u32 = 60;
@@ -902,6 +904,9 @@ struct ChatWindow {
     sidebar_animation_token: Cell<u64>,
     last_split_width: Cell<i32>,
     sidebar_width_stale: Cell<bool>,
+    tray: RefCell<Option<ksni::Handle<StatusTray>>>,
+    tray_live: Cell<bool>,
+    tray_live_available: Cell<bool>,
 
     current_id: RefCell<Option<i64>>,
     active: RefCell<Option<ActiveStream>>,
@@ -1212,6 +1217,9 @@ impl ChatWindow {
             sidebar_animation_token: Cell::new(0),
             last_split_width: Cell::new(0),
             sidebar_width_stale: Cell::new(false),
+            tray: RefCell::new(None),
+            tray_live: Cell::new(false),
+            tray_live_available: Cell::new(false),
             current_id: RefCell::new(None),
             active: RefCell::new(None),
             speech_buttons: RefCell::new(Vec::new()),
@@ -1392,6 +1400,7 @@ impl ChatWindow {
         self.refresh_models();
         self.input.grab_focus();
         self.update_stt_ui();
+        self.apply_background_startup();
     }
 
     // ----- Models ----------------------------------------------------------
@@ -1464,6 +1473,7 @@ impl ChatWindow {
         }
         self.update_think_button();
         self.update_speech_buttons();
+        self.update_tray_state();
     }
 
     fn refresh_models(self: &Rc<Self>) {
@@ -2625,6 +2635,7 @@ impl ChatWindow {
         }
 
         self.update_think_button();
+        self.update_tray_state();
         if !self.live_button.is_visible() {
             return;
         }
@@ -3714,6 +3725,166 @@ impl ChatWindow {
         }
     }
 
+    fn live_available(&self) -> bool {
+        let enabled = {
+            let settings = self.state.settings.borrow();
+            settings.stt_enabled && settings.tts_enabled
+        };
+        enabled && self.resolve_tts().is_some()
+    }
+
+    fn start_tray(self: &Rc<Self>, row: Option<adw::SwitchRow>) {
+        if let Some(handle) = self.tray.borrow().as_ref() {
+            if !handle.is_closed() {
+                self.window.set_hide_on_close(true);
+                return;
+            }
+        }
+        self.tray.borrow_mut().take();
+
+        let (commands_tx, commands_rx) = async_channel::unbounded();
+        let live = self.live_mode.get() || self.live_pending.get();
+        let live_available = self.live_available();
+        self.tray_live.set(live);
+        self.tray_live_available.set(live_available);
+        let tray = StatusTray {
+            commands: commands_tx,
+            live,
+            live_available,
+        };
+        let (result_tx, result_rx) = async_channel::bounded(1);
+        self.state.runtime.spawn(async move {
+            let result = tray.spawn().await.map_err(|err| format!("{err}"));
+            let _ = result_tx.send(result).await;
+        });
+
+        let win = self.clone();
+        glib::spawn_future_local(async move {
+            match result_rx.recv().await {
+                Ok(Ok(handle)) => {
+                    let enabled = win.state.settings.borrow().run_in_background;
+                    if !enabled {
+                        win.state.runtime.spawn(async move {
+                            handle.shutdown().await;
+                        });
+                        return;
+                    }
+
+                    *win.tray.borrow_mut() = Some(handle);
+                    win.window.set_hide_on_close(true);
+                    win.update_tray_state();
+
+                    let win = win.clone();
+                    glib::spawn_future_local(async move {
+                        while let Ok(command) = commands_rx.recv().await {
+                            match command {
+                                TrayCommand::ToggleWindow(token) => {
+                                    win.toggle_window_from_tray(token);
+                                }
+                                TrayCommand::ToggleLive => win.toggle_live(),
+                                TrayCommand::Quit => win.quit_from_tray(),
+                            }
+                        }
+                    });
+                }
+                Ok(Err(err)) => {
+                    tracing::warn!("system tray unavailable: {err}");
+                    win.toast("System tray is unavailable; background mode is disabled.");
+                    win.state.settings.borrow_mut().run_in_background = false;
+                    win.save_settings();
+                    win.window.set_hide_on_close(false);
+                    if !win.window.is_visible() {
+                        win.window.present();
+                    }
+                    if let Some(row) = row {
+                        row.set_active(false);
+                    }
+                }
+                Err(_) => {}
+            }
+        });
+    }
+
+    fn stop_tray(&self) {
+        let handle = self.tray.borrow_mut().take();
+        if let Some(handle) = handle {
+            self.state.runtime.spawn(async move {
+                handle.shutdown().await;
+            });
+        }
+    }
+
+    fn update_tray_state(&self) {
+        let live = self.live_mode.get() || self.live_pending.get();
+        let live_available = self.live_available();
+        if self.tray_live.get() == live && self.tray_live_available.get() == live_available {
+            return;
+        }
+        self.tray_live.set(live);
+        self.tray_live_available.set(live_available);
+
+        let Some(handle) = self.tray.borrow().clone() else {
+            return;
+        };
+        self.state.runtime.spawn(async move {
+            let _ = handle
+                .update(move |tray| {
+                    tray.live = live;
+                    tray.live_available = live_available;
+                })
+                .await;
+        });
+    }
+
+    fn set_background_enabled(self: &Rc<Self>, enabled: bool, row: Option<adw::SwitchRow>) {
+        let changed = {
+            let mut settings = self.state.settings.borrow_mut();
+            if settings.run_in_background == enabled {
+                false
+            } else {
+                settings.run_in_background = enabled;
+                true
+            }
+        };
+        if changed {
+            self.save_settings();
+        }
+
+        if enabled {
+            self.window.set_hide_on_close(true);
+            self.start_tray(row);
+        } else {
+            self.stop_tray();
+            self.window.set_hide_on_close(false);
+        }
+    }
+
+    fn apply_background_startup(self: &Rc<Self>) {
+        if self.state.settings.borrow().run_in_background {
+            self.window.set_hide_on_close(true);
+            self.start_tray(None);
+        }
+    }
+
+    fn toggle_window_from_tray(&self, token: Option<String>) {
+        if self.window.is_active() {
+            self.window.set_visible(false);
+        } else {
+            if let Some(token) = token {
+                self.window.set_startup_id(&token);
+            }
+            self.window.present();
+        }
+    }
+
+    fn quit_from_tray(self: &Rc<Self>) {
+        self.stop_stt();
+        self.stop_speech();
+        if let Some(app) = self.window.application() {
+            app.quit();
+        }
+    }
+
     fn apply_theme(&self) {
         let theme = self.state.settings.borrow().theme.clone();
         let scheme = match theme.as_str() {
@@ -3741,6 +3912,22 @@ impl ChatWindow {
         connection.add(&key_row);
 
         page.add(&connection);
+
+        let application = adw::PreferencesGroup::new();
+        application.set_title("Application");
+
+        let background_row = adw::SwitchRow::new();
+        background_row.set_title("Keep running in the background");
+        background_row.set_subtitle("Closing the window hides it to the system tray");
+        background_row.set_active(self.state.settings.borrow().run_in_background);
+        application.add(&background_row);
+        page.add(&application);
+        {
+            let win = self.clone();
+            background_row.connect_active_notify(move |row| {
+                win.set_background_enabled(row.is_active(), Some(row.clone()));
+            });
+        }
 
         let generation = adw::PreferencesGroup::new();
         generation.set_title("Generation");

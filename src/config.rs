@@ -19,6 +19,8 @@ pub struct Settings {
     pub theme: String,
     /// Whether the conversation sidebar is shown
     pub sidebar_visible: bool,
+    /// Keep the app running in the system tray when the window is closed
+    pub run_in_background: bool,
     /// "auto", "paradee" or "builtin"
     pub tts_backend: String,
     /// Language code such as "en-us" or "es"
@@ -56,6 +58,7 @@ impl Default for Settings {
             think_level: "medium".to_string(),
             theme: "system".to_string(),
             sidebar_visible: true,
+            run_in_background: false,
             tts_backend: "auto".to_string(),
             tts_language: "en-us".to_string(),
             tts_voice: "af_heart".to_string(),
