@@ -13,6 +13,8 @@ pub struct Settings {
     pub num_ctx: u32,
     /// "system", "light" or "dark"
     pub theme: String,
+    /// Whether the conversation sidebar is shown
+    pub sidebar_visible: bool,
     /// "auto", "paradee" or "builtin"
     pub tts_backend: String,
     /// Language code such as "en-us" or "es"
@@ -47,6 +49,7 @@ impl Default for Settings {
             temperature: 0.7,
             num_ctx: 8192,
             theme: "system".to_string(),
+            sidebar_visible: true,
             tts_backend: "auto".to_string(),
             tts_language: "en-us".to_string(),
             tts_voice: "af_heart".to_string(),

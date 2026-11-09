@@ -774,6 +774,8 @@ struct ChatWindow {
     context_bar: gtk::LevelBar,
     toast_overlay: adw::ToastOverlay,
     menu_button: gtk::MenuButton,
+    split_view: adw::OverlaySplitView,
+    sidebar_button: gtk::Button,
 
     current_id: RefCell<Option<i64>>,
     active: RefCell<Option<ActiveStream>>,
@@ -990,6 +992,11 @@ impl ChatWindow {
         let header = adw::HeaderBar::new();
         header.set_title_widget(Some(&title_widget));
 
+        let sidebar_button = gtk::Button::from_icon_name("sidebar-show-symbolic");
+        sidebar_button.add_css_class("flat");
+        sidebar_button.set_tooltip_text(Some("Hide sidebar (Ctrl+B)"));
+        header.pack_start(&sidebar_button);
+
         let menu_button = gtk::MenuButton::new();
         menu_button.set_icon_name("open-menu-symbolic");
         menu_button.set_tooltip_text(Some("Main menu"));
@@ -999,20 +1006,13 @@ impl ChatWindow {
         content_toolbar.add_top_bar(&header);
         content_toolbar.set_content(Some(&content_box));
 
-        let sidebar_page = adw::NavigationPage::builder()
-            .title("Chats")
-            .child(&sidebar_toolbar)
-            .build();
-        let content_page = adw::NavigationPage::builder()
-            .title("Chat")
-            .child(&content_toolbar)
-            .build();
-
-        let split = adw::NavigationSplitView::new();
-        split.set_sidebar(Some(&sidebar_page));
-        split.set_content(Some(&content_page));
+        let sidebar_visible = state.settings.borrow().sidebar_visible;
+        let split = adw::OverlaySplitView::new();
+        split.set_sidebar(Some(&sidebar_toolbar));
+        split.set_content(Some(&content_toolbar));
         split.set_min_sidebar_width(240.0);
         split.set_max_sidebar_width(320.0);
+        split.set_show_sidebar(sidebar_visible);
 
         let toast_overlay = adw::ToastOverlay::new();
         toast_overlay.set_child(Some(&split));
@@ -1040,6 +1040,8 @@ impl ChatWindow {
             context_bar,
             toast_overlay,
             menu_button,
+            split_view: split,
+            sidebar_button,
             current_id: RefCell::new(None),
             active: RefCell::new(None),
             speech_buttons: RefCell::new(Vec::new()),
@@ -1065,6 +1067,18 @@ impl ChatWindow {
     }
 
     fn wire(self: &Rc<Self>) {
+        self.sync_sidebar_visibility(self.split_view.shows_sidebar());
+        {
+            let win = self.clone();
+            self.sidebar_button
+                .connect_clicked(move |_| win.toggle_sidebar());
+        }
+        {
+            let win = self.clone();
+            self.split_view.connect_show_sidebar_notify(move |split| {
+                win.sync_sidebar_visibility(split.shows_sidebar());
+            });
+        }
         {
             let win = self.clone();
             self.send_button
@@ -1133,6 +1147,7 @@ impl ChatWindow {
         let menu = gio::Menu::new();
         let section = gio::Menu::new();
         section.append(Some("New Chat"), Some("win.new-chat"));
+        section.append(Some("Toggle Sidebar"), Some("win.toggle-sidebar"));
         section.append(Some("Preferences"), Some("win.preferences"));
         section.append(Some("About Ollama GUI"), Some("win.about"));
         section.append(Some("Quit"), Some("app.quit"));
@@ -1143,6 +1158,12 @@ impl ChatWindow {
             let action = gio::SimpleAction::new("new-chat", None);
             let win = self.clone();
             action.connect_activate(move |_, _| win.new_chat());
+            self.window.add_action(&action);
+        }
+        {
+            let action = gio::SimpleAction::new("toggle-sidebar", None);
+            let win = self.clone();
+            action.connect_activate(move |_, _| win.toggle_sidebar());
             self.window.add_action(&action);
         }
         {
@@ -1160,6 +1181,7 @@ impl ChatWindow {
 
         if let Some(app) = self.window.application() {
             app.set_accels_for_action("win.new-chat", &["<primary>n"]);
+            app.set_accels_for_action("win.toggle-sidebar", &["<primary>b"]);
             app.set_accels_for_action("win.preferences", &["<primary>comma"]);
         }
     }
@@ -3197,6 +3219,32 @@ impl ChatWindow {
     fn save_settings(&self) {
         if let Err(err) = self.state.settings.borrow().save() {
             self.toast(&format!("Could not save settings: {err:#}"));
+        }
+    }
+
+    fn toggle_sidebar(&self) {
+        self.split_view
+            .set_show_sidebar(!self.split_view.shows_sidebar());
+    }
+
+    fn sync_sidebar_visibility(&self, visible: bool) {
+        self.sidebar_button.set_tooltip_text(Some(if visible {
+            "Hide sidebar (Ctrl+B)"
+        } else {
+            "Show sidebar (Ctrl+B)"
+        }));
+
+        let changed = {
+            let mut settings = self.state.settings.borrow_mut();
+            if settings.sidebar_visible == visible {
+                false
+            } else {
+                settings.sidebar_visible = visible;
+                true
+            }
+        };
+        if changed {
+            self.save_settings();
         }
     }
 

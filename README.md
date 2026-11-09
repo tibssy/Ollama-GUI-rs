@@ -23,6 +23,7 @@ The MVP is working:
   assistant) and automatic multi-turn sending/reading
 - Context usage indicator (tokens used / window size, percentage) with a
   per-conversation percentage in the sidebar
+- Collapsible sidebar with a header toggle, menu item, and Ctrl+B shortcut
 - Automatic context compression: at 85% usage, older turns are summarized while
   the last five turns stay verbatim
 - Conversations persisted locally in SQLite
@@ -170,6 +171,12 @@ Original messages remain stored and visible in the chat.
 An **Earlier messages summarized** row above the conversation opens the current
 summary. If summarization fails, the next request falls back to the most recent
 turns within the context budget.
+
+## Sidebar
+
+Use the sidebar button in the header, **Toggle Sidebar** in the main menu, or
+Ctrl+B to hide or show the conversation list. The choice is remembered between
+sessions.
 
 ## Live voice conversation
 
