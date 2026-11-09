@@ -105,6 +105,121 @@ struct CompressionResult {
     upto_id: i64,
 }
 
+#[derive(Clone)]
+struct ThinkingUi {
+    container: gtk::Box,
+    label: gtk::Label,
+    spinner: gtk::Spinner,
+    view: gtk::TextView,
+}
+
+impl ThinkingUi {
+    fn new(bubble: &gtk::Box) -> Self {
+        let container = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        container.add_css_class("thinking-box");
+        container.set_visible(false);
+
+        let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let icon = gtk::Image::from_icon_name("applications-science-symbolic");
+        icon.add_css_class("dim-label");
+        icon.set_valign(gtk::Align::Center);
+        header.append(&icon);
+
+        let label = gtk::Label::new(Some("Thinking…"));
+        label.set_xalign(0.0);
+        label.set_hexpand(true);
+        label.add_css_class("dim-label");
+        header.append(&label);
+
+        let spinner = gtk::Spinner::new();
+        spinner.set_valign(gtk::Align::Center);
+        spinner.set_visible(false);
+        header.append(&spinner);
+
+        let toggle_icon = gtk::Image::from_icon_name("pan-end-symbolic");
+        let toggle = gtk::ToggleButton::new();
+        toggle.set_child(Some(&toggle_icon));
+        toggle.add_css_class("flat");
+        toggle.set_valign(gtk::Align::Center);
+        toggle.set_tooltip_text(Some("Show thinking"));
+        header.append(&toggle);
+        container.append(&header);
+
+        let view = gtk::TextView::builder()
+            .editable(false)
+            .cursor_visible(false)
+            .wrap_mode(gtk::WrapMode::WordChar)
+            .build();
+        view.add_css_class("thinking-text");
+
+        let content = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vscrollbar_policy(gtk::PolicyType::Automatic)
+            .max_content_height(260)
+            .propagate_natural_height(true)
+            .child(&view)
+            .build();
+        content.set_visible(false);
+        container.append(&content);
+
+        bubble.prepend(&container);
+
+        {
+            let content = content.clone();
+            let toggle_icon = toggle_icon.clone();
+            let toggle = toggle.clone();
+            toggle.connect_toggled(move |button| {
+                let expanded = button.is_active();
+                content.set_visible(expanded);
+                toggle_icon.set_icon_name(Some(if expanded {
+                    "pan-down-symbolic"
+                } else {
+                    "pan-end-symbolic"
+                }));
+                button.set_tooltip_text(Some(if expanded {
+                    "Hide thinking"
+                } else {
+                    "Show thinking"
+                }));
+            });
+        }
+
+        Self {
+            container,
+            label,
+            spinner,
+            view,
+        }
+    }
+
+    fn show(&self) {
+        if !self.container.is_visible() {
+            self.container.set_visible(true);
+            self.label.set_text("Thinking…");
+            self.spinner.set_visible(true);
+            self.spinner.start();
+        }
+    }
+
+    fn append(&self, delta: &str) {
+        let buffer = self.view.buffer();
+        let mut end = buffer.end_iter();
+        buffer.insert(&mut end, delta);
+    }
+
+    fn finish(&self) {
+        if self.spinner.is_visible() {
+            self.spinner.stop();
+            self.spinner.set_visible(false);
+            self.label.set_text("Thought");
+            tracing::debug!(
+                "thinking: captured {} characters",
+                self.view.buffer().char_count()
+            );
+        }
+    }
+}
+
 struct SpeechSynthesis {
     choice: TtsChoice,
     voice: String,
@@ -771,6 +886,8 @@ struct ChatWindow {
     stop_button: gtk::Button,
     mic_button: gtk::Button,
     live_button: gtk::Button,
+    think_button: gtk::ToggleButton,
+    think_bar: gtk::Box,
     context_label: gtk::Label,
     context_bar: gtk::LevelBar,
     toast_overlay: adw::ToastOverlay,
@@ -949,6 +1066,19 @@ impl ChatWindow {
         live_button.set_tooltip_text(Some("Start live voice conversation"));
         live_button.set_visible(false);
 
+        let think_button = gtk::ToggleButton::with_label("Think");
+        think_button.add_css_class("flat");
+        think_button.add_css_class("think-toggle");
+        think_button.set_tooltip_text(Some("Thinking mode"));
+        think_button.set_active(state.settings.borrow().think_enabled);
+        think_button.set_visible(false);
+
+        let think_bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        think_bar.set_margin_start(6);
+        think_bar.set_margin_top(2);
+        think_bar.append(&think_button);
+        think_bar.set_visible(false);
+
         let composer_buttons = gtk::Box::new(gtk::Orientation::Vertical, 6);
         composer_buttons.set_valign(gtk::Align::End);
         composer_buttons.append(&live_button);
@@ -956,14 +1086,18 @@ impl ChatWindow {
         composer_buttons.append(&stop_button);
         composer_buttons.append(&send_button);
 
+        let composer_input = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        composer_input.set_hexpand(true);
+        composer_input.append(&think_bar);
+        composer_input.append(&input);
+
         let composer = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         composer.add_css_class("composer");
         composer.set_margin_top(6);
         composer.set_margin_bottom(12);
         composer.set_margin_start(12);
         composer.set_margin_end(12);
-        input.set_hexpand(true);
-        composer.append(&input);
+        composer.append(&composer_input);
         composer.append(&composer_buttons);
 
         let content_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -1042,6 +1176,8 @@ impl ChatWindow {
             stop_button,
             mic_button,
             live_button,
+            think_button,
+            think_bar,
             context_label,
             context_bar,
             toast_overlay,
@@ -1089,6 +1225,14 @@ impl ChatWindow {
             let win = self.clone();
             self.sidebar_button
                 .connect_clicked(move |_| win.toggle_sidebar());
+        }
+        {
+            let win = self.clone();
+            self.think_button.connect_toggled(move |button| {
+                win.state.settings.borrow_mut().think_enabled = button.is_active();
+                win.save_settings();
+                win.update_think_button();
+            });
         }
         {
             let win = self.clone();
@@ -1271,6 +1415,7 @@ impl ChatWindow {
 
         let selected = self.selected_model();
         if selected.is_empty() {
+            self.update_think_button();
             self.update_speech_buttons();
             return;
         }
@@ -1278,6 +1423,7 @@ impl ChatWindow {
         let models = self.state.models.borrow();
         let Some(model) = models.iter().find(|model| model.name == selected) else {
             drop(models);
+            self.update_think_button();
             self.update_speech_buttons();
             return;
         };
@@ -1291,6 +1437,7 @@ impl ChatWindow {
             label.set_tooltip_text(capability_description(capability));
             self.capability_box.append(&label);
         }
+        self.update_think_button();
         self.update_speech_buttons();
     }
 
@@ -1829,6 +1976,23 @@ impl ChatWindow {
             .unwrap_or(false)
     }
 
+    fn update_think_button(&self) {
+        let supported = self.selected_model_supports("thinking");
+        let live = self.live_mode.get() || self.live_pending.get();
+        self.think_bar.set_visible(supported);
+        self.think_button.set_visible(supported);
+        self.think_button.set_sensitive(supported && !live);
+        self.think_button.set_tooltip_text(Some(if !supported {
+            "Thinking is not supported by the selected model"
+        } else if live {
+            "Thinking is disabled during live conversation"
+        } else if self.think_button.is_active() {
+            "Thinking mode is on"
+        } else {
+            "Thinking mode is off"
+        }));
+    }
+
     fn update_speech_buttons(&self) {
         let available = self.resolve_tts().is_some();
         for button in self.speech_buttons.borrow().iter() {
@@ -2289,6 +2453,7 @@ impl ChatWindow {
             self.mic_button.set_tooltip_text(Some("Dictate"));
         }
 
+        self.update_think_button();
         if !self.live_button.is_visible() {
             return;
         }
@@ -3034,11 +3199,18 @@ impl ChatWindow {
                 store.conversation_summary(conversation_id).ok().flatten(),
             )
         };
-        let (temperature, num_ctx) = {
+        let (temperature, num_ctx, think_enabled) = {
             let settings = self.state.settings.borrow();
-            (settings.temperature, settings.num_ctx.max(1))
+            (
+                settings.temperature,
+                settings.num_ctx.max(1),
+                settings.think_enabled,
+            )
         };
         let messages = build_request_messages(&system_prompt, summary.as_ref(), &history, num_ctx);
+        let think = self
+            .selected_model_supports("thinking")
+            .then_some(think_enabled && !self.live_mode.get() && !self.live_pending.get());
 
         let request = ChatRequest {
             model,
@@ -3050,10 +3222,11 @@ impl ChatWindow {
                 ..Default::default()
             }),
             keep_alive: Some("5m".to_string()),
-            think: None,
+            think,
         };
 
         let (row, bubble, assistant_view) = self.add_assistant_bubble();
+        let thinking = ThinkingUi::new(&bubble);
         let assistant_buffer = assistant_view.buffer();
         let content = Rc::new(RefCell::new(String::new()));
         let stats: Rc<RefCell<Option<StreamStats>>> = Rc::new(RefCell::new(None));
@@ -3089,8 +3262,17 @@ impl ChatWindow {
             let mut final_stats = None;
             while let Ok(event) = rx.recv().await {
                 match event {
+                    StreamEvent::Thinking(delta) => {
+                        let follow = win.near_bottom();
+                        thinking.show();
+                        thinking.append(&delta);
+                        if follow {
+                            win.scroll_to_bottom();
+                        }
+                    }
                     StreamEvent::Delta(delta) => {
                         let follow = win.near_bottom();
+                        thinking.finish();
                         assistant_buffer.insert(&mut assistant_buffer.end_iter(), &delta);
                         content.borrow_mut().push_str(&delta);
                         win.feed_streaming_speech(&delta);
@@ -3108,6 +3290,7 @@ impl ChatWindow {
                 }
             }
 
+            thinking.finish();
             if let Some(stream_stats) = final_stats {
                 *stats.borrow_mut() = Some(stream_stats);
             }

@@ -26,6 +26,8 @@ The MVP is working:
 - Collapsible sidebar with a header toggle, menu item, and Ctrl+B shortcut
 - Automatic context compression: at 85% usage, older turns are summarized while
   the last five turns stay verbatim
+- Optional thinking mode for reasoning models, shown in a collapsible thinking
+  panel and automatically disabled in live voice conversations
 - Conversations persisted locally in SQLite
 - New / delete chat, automatic titles from the first message
 - Model picker with search, per-conversation model selection (chat-capable
@@ -33,8 +35,8 @@ The MVP is working:
 - Capability badges for the selected model (completion, vision, tools, thinking,
   audio, speech)
 - Settings for server URL, API key, system prompt, temperature, context size,
-  theme, text-to-speech, auto-read, speech language, voice, dictation, and VAD
-  timings
+  thinking, theme, text-to-speech, auto-read, speech language, voice, dictation,
+  and VAD timings
 - Native markdown rendering: headings, bold/italic/strikethrough, lists, quotes,
   tables, links, inline code, and fenced code blocks with copy buttons
 - Code blocks use GtkSourceView and syntax highlighting when language specs are installed
@@ -178,6 +180,16 @@ Use the sidebar button in the header, **Toggle Sidebar** in the main menu, or
 Ctrl+B to hide or show the conversation list. The choice is remembered between
 sessions. The chat column keeps its width when the sidebar is hidden, so
 toggling the sidebar does not re-wrap long conversations.
+
+## Thinking
+
+For models that advertise the `thinking` capability, a **Think** toggle appears
+above the composer. When enabled, reasoning streams into the assistant bubble
+behind a collapsible **Thinking** row with a spinner and chevron button. The row
+can be expanded to read the reasoning and collapsed again with the same button.
+The toggle choice is remembered between sessions.
+
+Thinking is always disabled during live voice conversation.
 
 ## Live voice conversation
 

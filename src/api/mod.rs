@@ -120,6 +120,7 @@ impl StreamStats {
 #[derive(Debug)]
 pub enum StreamEvent {
     Delta(String),
+    Thinking(String),
     Done(StreamStats),
     Error(String),
 }
@@ -144,6 +145,8 @@ struct ChatChunk {
 struct ChunkMessage {
     #[serde(default)]
     content: String,
+    #[serde(default)]
+    thinking: String,
 }
 
 #[derive(Clone)]
@@ -417,6 +420,9 @@ async fn handle_line(
     }
 
     if let Some(message) = chunk.message {
+        if !message.thinking.is_empty() {
+            let _ = tx.send(StreamEvent::Thinking(message.thinking)).await;
+        }
         if !message.content.is_empty() {
             let _ = tx.send(StreamEvent::Delta(message.content)).await;
         }
@@ -471,6 +477,14 @@ mod tests {
         assert_eq!(chunk.eval_count, Some(5));
         assert_eq!(chunk.prompt_eval_count, Some(11));
         assert!(chunk.done);
+    }
+
+    #[test]
+    fn parses_thinking_chunks() {
+        let json = r#"{"message":{"role":"assistant","thinking":"step 1"},"done":false}"#;
+        let chunk: ChatChunk = serde_json::from_str(json).unwrap();
+        assert_eq!(chunk.message.unwrap().thinking, "step 1");
+        assert!(!chunk.done);
     }
 
     #[test]
@@ -551,6 +565,7 @@ mod tests {
             while let Ok(event) = rx.recv().await {
                 match event {
                     StreamEvent::Delta(delta) => text.push_str(&delta),
+                    StreamEvent::Thinking(_) => {}
                     StreamEvent::Done(stats) => {
                         done = true;
                         println!("stats: {stats:?}");

@@ -11,6 +11,8 @@ pub struct Settings {
     pub system_prompt: String,
     pub temperature: f64,
     pub num_ctx: u32,
+    /// Ask thinking-capable models to emit their reasoning
+    pub think_enabled: bool,
     /// "system", "light" or "dark"
     pub theme: String,
     /// Whether the conversation sidebar is shown
@@ -48,6 +50,7 @@ impl Default for Settings {
             system_prompt: String::new(),
             temperature: 0.7,
             num_ctx: 8192,
+            think_enabled: true,
             theme: "system".to_string(),
             sidebar_visible: true,
             tts_backend: "auto".to_string(),
