@@ -195,7 +195,7 @@ impl ThinkingUi {
     }
 
     fn show(&self) {
-        if !self.container.is_visible() {
+        if !self.container.get_visible() {
             self.container.set_visible(true);
             self.label.set_text("Thinking…");
             self.spinner.set_visible(true);
@@ -210,7 +210,7 @@ impl ThinkingUi {
     }
 
     fn finish(&self) {
-        if self.spinner.is_visible() {
+        if self.spinner.get_visible() {
             self.spinner.stop();
             self.spinner.set_visible(false);
             self.label.set_text("Thought");
@@ -1246,6 +1246,12 @@ impl ChatWindow {
 
     fn wire(self: &Rc<Self>) {
         self.sync_sidebar_visibility(self.split_view.shows_sidebar());
+        {
+            let win = self.clone();
+            self.window.connect_visible_notify(move |_| {
+                win.update_stt_ui();
+            });
+        }
         {
             let win = self.clone();
             glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
@@ -2636,7 +2642,9 @@ impl ChatWindow {
 
         self.update_think_button();
         self.update_tray_state();
-        if !self.live_button.is_visible() {
+        // Check the button's own visibility flag: is_visible() is also false
+        // while the window is hidden, which would skip updating the icon.
+        if !self.live_button.get_visible() {
             return;
         }
         if live_active {
