@@ -56,6 +56,30 @@
   background: transparent;
 }
 
+.attachment-strip {
+  padding: 2px 0 4px;
+}
+
+.attachment-thumb {
+  border-radius: 10px;
+}
+
+.attachment-thumb image {
+  border-radius: 10px;
+}
+
+.attachment-remove {
+  min-width: 18px;
+  min-height: 18px;
+  padding: 0;
+  margin: 2px;
+  background: alpha(@window_bg_color, 0.85);
+}
+
+.message-image {
+  border-radius: 10px;
+}
+
 .status-online {
   color: @success_color;
 }

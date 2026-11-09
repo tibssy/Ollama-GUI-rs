@@ -23,6 +23,14 @@ pub struct StoredMessage {
     pub content: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct StoredImage {
+    pub mime: String,
+    pub width: u32,
+    pub height: u32,
+    pub data: Vec<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredSummary {
     pub text: String,
@@ -91,6 +99,19 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_messages_conversation
                 ON messages(conversation_id, id);
+
+            CREATE TABLE IF NOT EXISTS message_images(
+                id          INTEGER PRIMARY KEY,
+                message_id  INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                mime        TEXT NOT NULL,
+                width       INTEGER NOT NULL,
+                height      INTEGER NOT NULL,
+                data        BLOB NOT NULL,
+                created_at  INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_message_images_message
+                ON message_images(message_id);
 
             CREATE TABLE IF NOT EXISTS memories(
                 id              INTEGER PRIMARY KEY,
@@ -558,6 +579,34 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Insert a message and its images atomically.
+    pub fn add_message_with_images(
+        &self,
+        conversation_id: i64,
+        role: &str,
+        content: &str,
+        stats: Option<&StreamStats>,
+        images: &[StoredImage],
+    ) -> Result<i64> {
+        let tx = self.conn.unchecked_transaction()?;
+        let message_id = self.add_message(conversation_id, role, content, stats)?;
+        for image in images {
+            tx.execute(
+                "INSERT INTO message_images(message_id, mime, width, height, data)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    message_id,
+                    image.mime,
+                    image.width,
+                    image.height,
+                    image.data
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(message_id)
+    }
+
     pub fn messages(&self, conversation_id: i64) -> Result<Vec<StoredMessage>> {
         self.messages_after(conversation_id, 0)
     }
@@ -583,6 +632,38 @@ impl Store {
             messages.push(row?);
         }
         Ok(messages)
+    }
+
+    /// Load every image in a conversation, grouped by message id.
+    pub fn images_for_conversation(
+        &self,
+        conversation_id: i64,
+    ) -> Result<HashMap<i64, Vec<StoredImage>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT i.message_id, i.mime, i.width, i.height, i.data
+             FROM message_images i
+             JOIN messages m ON m.id = i.message_id
+             WHERE m.conversation_id = ?1
+             ORDER BY i.id ASC",
+        )?;
+        let rows = stmt.query_map(params![conversation_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                StoredImage {
+                    mime: row.get(1)?,
+                    width: row.get::<_, i64>(2)? as u32,
+                    height: row.get::<_, i64>(3)? as u32,
+                    data: row.get(4)?,
+                },
+            ))
+        })?;
+
+        let mut images: HashMap<i64, Vec<StoredImage>> = HashMap::new();
+        for row in rows {
+            let (message_id, image) = row?;
+            images.entry(message_id).or_default().push(image);
+        }
+        Ok(images)
     }
 
     /// Remove a message together with its counterpart in the same turn.
@@ -703,7 +784,7 @@ fn context_used_from_json(json: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{context_used_from_json, Store, StoredSummary};
+    use super::{context_used_from_json, Store, StoredImage, StoredSummary};
     use crate::api::StreamStats;
     use crate::memory::{DateHint, MemoryPool};
     use rusqlite::params;
@@ -712,6 +793,35 @@ mod tests {
     fn context_used_sums_prompt_and_generated_tokens() {
         let json = r#"{"eval_count":12,"eval_duration":100,"prompt_eval_count":34}"#;
         assert_eq!(context_used_from_json(json), Some(46));
+    }
+
+    #[test]
+    fn stores_and_deletes_message_images() {
+        let store = Store::open_in_memory().unwrap();
+        let conversation = store.create_conversation("vision", "test").unwrap();
+        let images = vec![StoredImage {
+            mime: "image/png".into(),
+            width: 2,
+            height: 3,
+            data: vec![1, 2, 3],
+        }];
+
+        let message_id = store
+            .add_message_with_images(conversation, "user", "what is this?", None, &images)
+            .unwrap();
+
+        let all = store.images_for_conversation(conversation).unwrap();
+        let loaded = all.get(&message_id).expect("message images");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].mime, "image/png");
+        assert_eq!((loaded[0].width, loaded[0].height), (2, 3));
+        assert_eq!(loaded[0].data, vec![1, 2, 3]);
+
+        store.delete_turn(conversation, message_id).unwrap();
+        assert!(store
+            .images_for_conversation(conversation)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

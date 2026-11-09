@@ -1,8 +1,10 @@
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use base64::Engine as _;
 use gtk::prelude::*;
 use gtk::{gdk, gio, glib};
 use ksni::TrayMethods;
@@ -15,9 +17,10 @@ use crate::api::{
 };
 use crate::config::Settings;
 use crate::memory::{self, MemoryPool};
-use crate::store::{Store, StoredMessage, StoredSummary};
+use crate::store::{Store, StoredImage, StoredMessage, StoredSummary};
 use crate::stt::{self, PreparedBackend, SttEvent};
 use crate::tray::{StatusTray, TrayCommand};
+use crate::ui::image;
 
 /// Seconds without speech activity before local TTS/STT models are released.
 const SPEECH_IDLE_UNLOAD_SECS: u32 = 60;
@@ -84,6 +87,13 @@ struct ActiveStream {
     conv_id: i64,
     model: String,
     stats: Rc<RefCell<Option<StreamStats>>>,
+}
+
+struct PendingAttachment {
+    id: u64,
+    name: String,
+    image: StoredImage,
+    preview_data: Vec<u8>,
 }
 
 struct PlaybackChunk {
@@ -936,6 +946,10 @@ struct ChatWindow {
     messages_clamp: adw::Clamp,
     messages_scroll: gtk::ScrolledWindow,
     input: gtk::TextView,
+    attach_button: gtk::Button,
+    attachments_box: gtk::Box,
+    attachments: RefCell<Vec<PendingAttachment>>,
+    next_attachment_id: Cell<u64>,
     send_button: gtk::Button,
     stop_button: gtk::Button,
     mic_button: gtk::Button,
@@ -1110,7 +1124,14 @@ impl ChatWindow {
         input.set_bottom_margin(4);
         input.set_left_margin(6);
         input.set_right_margin(6);
-        input.set_tooltip_text(Some("Enter to send, Shift+Enter for a new line"));
+        input.set_tooltip_text(Some(
+            "Enter to send, Shift+Enter for a new line, Ctrl+L to focus",
+        ));
+
+        let attach_button = gtk::Button::from_icon_name("insert-image-symbolic");
+        attach_button.add_css_class("flat");
+        attach_button.set_tooltip_text(Some("Attach images (Ctrl+Shift+A)"));
+        attach_button.set_visible(false);
 
         let send_button = gtk::Button::from_icon_name("go-up-symbolic");
         send_button.add_css_class("suggested-action");
@@ -1162,8 +1183,13 @@ impl ChatWindow {
         think_bar.append(&think_menu_button);
         think_bar.set_visible(false);
 
+        let attachments_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        attachments_box.add_css_class("attachment-strip");
+        attachments_box.set_visible(false);
+
         let composer_buttons = gtk::Box::new(gtk::Orientation::Vertical, 6);
         composer_buttons.set_valign(gtk::Align::End);
+        composer_buttons.append(&attach_button);
         composer_buttons.append(&live_button);
         composer_buttons.append(&mic_button);
         composer_buttons.append(&stop_button);
@@ -1172,6 +1198,7 @@ impl ChatWindow {
         let composer_input = gtk::Box::new(gtk::Orientation::Vertical, 2);
         composer_input.set_hexpand(true);
         composer_input.append(&think_bar);
+        composer_input.append(&attachments_box);
         composer_input.append(&input);
 
         let composer = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -1255,6 +1282,10 @@ impl ChatWindow {
             messages_clamp: clamp,
             messages_scroll,
             input,
+            attach_button,
+            attachments_box,
+            attachments: RefCell::new(Vec::new()),
+            next_attachment_id: Cell::new(0),
             send_button,
             stop_button,
             mic_button,
@@ -1330,6 +1361,30 @@ impl ChatWindow {
         }
         {
             let win = self.clone();
+            self.attach_button
+                .connect_clicked(move |_| win.choose_images());
+        }
+        {
+            let win = self.clone();
+            let drop_target =
+                gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
+            drop_target.connect_drop(move |_, value, _, _| {
+                let Ok(files) = value.get::<gdk::FileList>() else {
+                    return false;
+                };
+                let files = files.files();
+                if files.is_empty() {
+                    return false;
+                }
+                for file in files {
+                    win.load_attachment(file);
+                }
+                true
+            });
+            self.input.add_controller(drop_target);
+        }
+        {
+            let win = self.clone();
             self.think_button.connect_toggled(move |button| {
                 win.state.settings.borrow_mut().think_enabled = button.is_active();
                 win.save_settings();
@@ -1373,6 +1428,25 @@ impl ChatWindow {
                 }
             });
             self.input.add_controller(controller);
+        }
+        {
+            let win = self.clone();
+            let controller = gtk::EventControllerKey::new();
+            controller.connect_key_pressed(move |_, key, _, modifier| {
+                let control = modifier.contains(gdk::ModifierType::CONTROL_MASK);
+                let shift = modifier.contains(gdk::ModifierType::SHIFT_MASK);
+                let character = key.to_unicode().map(|value| value.to_ascii_lowercase());
+                if control && shift && character == Some('a') {
+                    win.choose_images();
+                    return glib::Propagation::Stop;
+                }
+                if control && !shift && character == Some('l') {
+                    win.input.grab_focus();
+                    return glib::Propagation::Stop;
+                }
+                glib::Propagation::Proceed
+            });
+            self.window.add_controller(controller);
         }
         {
             let input = self.input.clone();
@@ -1516,6 +1590,7 @@ impl ChatWindow {
             child.unparent();
         }
         self.refresh_thinking_control();
+        self.update_attachment_ui();
 
         let selected = self.selected_model();
         if selected.is_empty() {
@@ -1836,7 +1911,7 @@ impl ChatWindow {
         *self.pending_generation.borrow_mut() = None;
         *self.current_id.borrow_mut() = Some(id);
 
-        let (title, model, messages) = {
+        let (title, model, messages, images) = {
             let store = self.state.store.borrow();
             (
                 store
@@ -1850,13 +1925,18 @@ impl ChatWindow {
                     .flatten()
                     .unwrap_or_default(),
                 store.messages(id).unwrap_or_default(),
+                store.images_for_conversation(id).unwrap_or_default(),
             )
         };
 
         self.clear_messages();
         self.refresh_summary_notice(id);
         for message in &messages {
-            self.add_message_widget(id, message);
+            let message_images = images
+                .get(&message.id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            self.add_message_widget(id, message, message_images);
         }
 
         self.title_widget.set_title(&title);
@@ -1910,9 +1990,14 @@ impl ChatWindow {
         self.speech_buttons.borrow_mut().clear();
     }
 
-    fn add_message_widget(self: &Rc<Self>, conversation_id: i64, message: &StoredMessage) {
+    fn add_message_widget(
+        self: &Rc<Self>,
+        conversation_id: i64,
+        message: &StoredMessage,
+        images: &[StoredImage],
+    ) {
         if message.role == "user" {
-            self.add_user_message(conversation_id, Some(message.id), &message.content);
+            self.add_user_message(conversation_id, Some(message.id), &message.content, images);
         } else {
             let (_row, bubble, view) = self.add_assistant_bubble();
             // A GtkTextView populated before its first allocation caches a zero
@@ -1944,6 +2029,7 @@ impl ChatWindow {
                 &bubble,
                 "assistant",
                 &message.content,
+                &[],
                 Some(message.id),
             );
         }
@@ -1954,25 +2040,37 @@ impl ChatWindow {
         conversation_id: i64,
         message_id: Option<i64>,
         text: &str,
+        images: &[StoredImage],
     ) {
-        let label = gtk::Label::new(Some(text));
-        label.set_wrap(true);
-        label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-        label.set_max_width_chars(60);
-        label.set_selectable(true);
-        label.set_xalign(0.0);
-
-        let bubble = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let bubble = gtk::Box::new(gtk::Orientation::Vertical, 6);
         bubble.add_css_class("user-bubble");
         bubble.set_halign(gtk::Align::End);
-        bubble.append(&label);
+
+        if !images.is_empty() {
+            let image_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
+            image_box.set_halign(gtk::Align::Start);
+            for image in images {
+                image_box.append(&image::message_widget(image, self.window.upcast_ref()));
+            }
+            bubble.append(&image_box);
+        }
+
+        if !text.is_empty() {
+            let label = gtk::Label::new(Some(text));
+            label.set_wrap(true);
+            label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+            label.set_max_width_chars(60);
+            label.set_selectable(true);
+            label.set_xalign(0.0);
+            bubble.append(&label);
+        }
 
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         row.set_halign(gtk::Align::Fill);
         row.append(&bubble);
         self.messages_box.append(&row);
 
-        self.attach_message_actions(conversation_id, &bubble, "user", text, message_id);
+        self.attach_message_actions(conversation_id, &bubble, "user", text, images, message_id);
     }
 
     fn add_assistant_bubble(&self) -> (gtk::Box, gtk::Box, gtk::TextView) {
@@ -2004,6 +2102,7 @@ impl ChatWindow {
         bubble: &gtk::Box,
         role: &str,
         content: &str,
+        images: &[StoredImage],
         message_id: Option<i64>,
     ) {
         let Some(message_id) = message_id else {
@@ -2029,21 +2128,40 @@ impl ChatWindow {
             actions.append(&regenerate);
         }
 
-        let copy = message_action_button("edit-copy-symbolic", "Copy message");
-        {
-            let text = content.to_string();
-            copy.connect_clicked(move |button| {
-                if let Some(display) = gdk::Display::default() {
-                    display.clipboard().set_text(&text);
-                }
-                button.set_icon_name("object-select-symbolic");
-                let button = button.clone();
-                glib::timeout_add_seconds_local_once(1, move || {
-                    button.set_icon_name("edit-copy-symbolic");
+        if !content.trim().is_empty() || !images.is_empty() {
+            let copy_image = content.trim().is_empty();
+            let copy = message_action_button(
+                "edit-copy-symbolic",
+                if copy_image {
+                    "Copy image"
+                } else {
+                    "Copy message"
+                },
+            );
+            {
+                let text = content.to_string();
+                let image_data = images.first().map(|image| image.data.clone());
+                copy.connect_clicked(move |button| {
+                    if copy_image {
+                        if let Some(data) = &image_data {
+                            if let Some(texture) = image::texture(data) {
+                                if let Some(display) = gdk::Display::default() {
+                                    display.clipboard().set_texture(&texture);
+                                }
+                            }
+                        }
+                    } else if let Some(display) = gdk::Display::default() {
+                        display.clipboard().set_text(&text);
+                    }
+                    button.set_icon_name("object-select-symbolic");
+                    let button = button.clone();
+                    glib::timeout_add_seconds_local_once(1, move || {
+                        button.set_icon_name("edit-copy-symbolic");
+                    });
                 });
-            });
+            }
+            actions.append(&copy);
         }
-        actions.append(&copy);
 
         if role == "assistant" {
             let speech = message_action_button("audio-volume-high-symbolic", "Read aloud");
@@ -3189,6 +3307,162 @@ impl ChatWindow {
         });
     }
 
+    // ----- Image attachments ------------------------------------------------
+
+    fn update_attachment_ui(self: &Rc<Self>) {
+        let supported = self.selected_model_supports("vision");
+        self.attach_button.set_visible(supported);
+        if !supported && !self.attachments.borrow().is_empty() {
+            self.attachments.borrow_mut().clear();
+            self.refresh_attachment_previews();
+            self.toast("The selected model does not support images.");
+        }
+    }
+
+    fn choose_images(self: &Rc<Self>) {
+        let dialog = gtk::FileDialog::builder()
+            .title("Attach images")
+            .accept_label("Attach")
+            .modal(true)
+            .build();
+
+        let filter = gtk::FileFilter::new();
+        filter.set_name(Some("Images"));
+        filter.add_mime_type("image/*");
+        for pattern in ["*.png", "*.jpg", "*.jpeg", "*.webp", "*.gif", "*.bmp"] {
+            filter.add_pattern(pattern);
+        }
+        let filters = gio::ListStore::new::<gtk::FileFilter>();
+        filters.append(&filter);
+        dialog.set_filters(Some(&filters));
+        dialog.set_default_filter(Some(&filter));
+
+        let win = self.clone();
+        dialog.open_multiple(
+            Some(&self.window),
+            None::<&gio::Cancellable>,
+            move |result| {
+                let Ok(files) = result else {
+                    tracing::warn!("image: file dialog failed");
+                    return;
+                };
+                tracing::debug!("image: file dialog returned {} file(s)", files.n_items());
+                for index in 0..files.n_items() {
+                    if let Some(file) = files.item(index).and_downcast::<gio::File>() {
+                        win.load_attachment(file);
+                    }
+                }
+            },
+        );
+    }
+
+    fn load_attachment(self: &Rc<Self>, file: gio::File) {
+        if self.attachments.borrow().len() >= image::MAX_ATTACHMENTS {
+            self.toast(&format!(
+                "You can attach at most {} images.",
+                image::MAX_ATTACHMENTS
+            ));
+            return;
+        }
+
+        let name = file
+            .basename()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|| "image".to_string());
+        tracing::debug!("image: loading {name}");
+        match file.load_contents(None::<&gio::Cancellable>) {
+            Ok((contents, _)) => self.add_attachment_bytes(&name, contents.to_vec()),
+            Err(err) => self.toast(&format!("Could not read {name}: {err}")),
+        }
+    }
+
+    fn add_attachment_bytes(self: &Rc<Self>, name: &str, data: Vec<u8>) {
+        tracing::debug!("image: processing {name} ({} bytes)", data.len());
+        if data.len() > image::MAX_FILE_BYTES {
+            self.toast(&format!(
+                "{name} is too large. The limit is {} MB.",
+                image::MAX_FILE_BYTES / (1024 * 1024)
+            ));
+            return;
+        }
+
+        let processed = match image::process(&data) {
+            Ok(processed) => processed,
+            Err(err) => {
+                self.toast(&format!("Could not attach {name}: {err:#}"));
+                return;
+            }
+        };
+
+        tracing::debug!(
+            "image: attached {name} as {}x{} {} ({} bytes)",
+            processed.width,
+            processed.height,
+            processed.mime,
+            processed.data.len()
+        );
+        let id = self.next_attachment_id.get() + 1;
+        self.next_attachment_id.set(id);
+        self.attachments.borrow_mut().push(PendingAttachment {
+            id,
+            name: name.to_string(),
+            image: StoredImage {
+                mime: processed.mime,
+                width: processed.width,
+                height: processed.height,
+                data: processed.data,
+            },
+            preview_data: processed.preview_data,
+        });
+        self.refresh_attachment_previews();
+    }
+
+    fn refresh_attachment_previews(self: &Rc<Self>) {
+        while let Some(child) = self.attachments_box.first_child() {
+            self.attachments_box.remove(&child);
+        }
+
+        let attachments = self.attachments.borrow();
+        self.attachments_box.set_visible(!attachments.is_empty());
+        for attachment in attachments.iter() {
+            let overlay = gtk::Overlay::new();
+            overlay.add_css_class("attachment-thumb");
+            overlay.set_tooltip_text(Some(&attachment.name));
+
+            if let Some(texture) = image::texture(&attachment.preview_data) {
+                let picture = gtk::Image::from_paintable(Some(&texture));
+                overlay.set_child(Some(&picture));
+            } else {
+                overlay.set_child(Some(&gtk::Label::new(Some("Image"))));
+            }
+
+            let remove = gtk::Button::from_icon_name("window-close-symbolic");
+            remove.add_css_class("flat");
+            remove.add_css_class("circular");
+            remove.add_css_class("attachment-remove");
+            remove.set_halign(gtk::Align::End);
+            remove.set_valign(gtk::Align::Start);
+            remove.set_tooltip_text(Some("Remove image"));
+
+            let win = self.clone();
+            let id = attachment.id;
+            remove.connect_clicked(move |_| win.remove_attachment(id));
+            overlay.add_overlay(&remove);
+
+            self.attachments_box.append(&overlay);
+        }
+    }
+
+    fn remove_attachment(self: &Rc<Self>, id: u64) {
+        self.attachments.borrow_mut().retain(|item| item.id != id);
+        self.refresh_attachment_previews();
+    }
+
+    fn clear_attachments(self: &Rc<Self>) {
+        self.attachments.borrow_mut().clear();
+        self.refresh_attachment_previews();
+    }
+
     fn send_message(self: &Rc<Self>) {
         if self.active.borrow().is_some() || self.memory_lookup.get() {
             return;
@@ -3199,7 +3473,7 @@ impl ChatWindow {
             .text(&buffer.start_iter(), &buffer.end_iter(), true)
             .trim()
             .to_string();
-        if text.is_empty() {
+        if text.is_empty() && self.attachments.borrow().is_empty() {
             return;
         }
 
@@ -3213,6 +3487,17 @@ impl ChatWindow {
             return;
         }
 
+        let images: Vec<StoredImage> = self
+            .attachments
+            .borrow()
+            .iter()
+            .map(|attachment| attachment.image.clone())
+            .collect();
+        if !images.is_empty() && !self.selected_model_supports("vision") {
+            self.toast("The selected model does not support images.");
+            return;
+        }
+
         let existing_id = *self.current_id.borrow();
         let conversation_id = match existing_id {
             Some(id) => {
@@ -3220,7 +3505,11 @@ impl ChatWindow {
                 id
             }
             None => {
-                let title = title_from(&text);
+                let title = if text.is_empty() {
+                    "Image".to_string()
+                } else {
+                    title_from(&text)
+                };
                 let id = match self
                     .state
                     .store
@@ -3239,24 +3528,25 @@ impl ChatWindow {
             }
         };
 
-        let user_id =
-            match self
-                .state
-                .store
-                .borrow()
-                .add_message(conversation_id, "user", &text, None)
-            {
-                Ok(id) => id,
-                Err(err) => {
-                    self.toast(&format!("Could not save message: {err:#}"));
-                    return;
-                }
-            };
+        let user_id = match self.state.store.borrow().add_message_with_images(
+            conversation_id,
+            "user",
+            &text,
+            None,
+            &images,
+        ) {
+            Ok(id) => id,
+            Err(err) => {
+                self.toast(&format!("Could not save message: {err:#}"));
+                return;
+            }
+        };
 
-        self.add_user_message(conversation_id, Some(user_id), &text);
+        self.add_user_message(conversation_id, Some(user_id), &text, &images);
         self.main_stack.set_visible_child_name("chat");
 
         buffer.set_text("");
+        self.clear_attachments();
         self.reload_sidebar();
         self.start_generation_with_memory(conversation_id, &text);
     }
@@ -3264,6 +3554,15 @@ impl ChatWindow {
     /// Look up relevant long-term notes before starting a reply. Embedding is
     /// asynchronous, so the send button stays disabled until the request starts.
     fn start_generation_with_memory(self: &Rc<Self>, conversation_id: i64, text: &str) {
+        // An image-only message has no useful text to embed for memory lookup.
+        if text.trim().is_empty() {
+            self.start_generation(GenerationRequest {
+                conversation_id,
+                memory_context: None,
+            });
+            return;
+        }
+
         let model = self.selected_model();
         if model.is_empty() {
             self.start_generation(GenerationRequest {
@@ -3601,7 +3900,16 @@ impl ChatWindow {
             .borrow()
             .set_conversation_model(conversation_id, &model);
 
-        let history = match self.state.store.borrow().messages(conversation_id) {
+        let (history, images) = {
+            let store = self.state.store.borrow();
+            (
+                store.messages(conversation_id),
+                store
+                    .images_for_conversation(conversation_id)
+                    .unwrap_or_default(),
+            )
+        };
+        let history = match history {
             Ok(messages) => messages,
             Err(err) => {
                 self.toast(&format!("Could not load chat: {err:#}"));
@@ -3626,6 +3934,7 @@ impl ChatWindow {
             memory_context.as_deref(),
             summary.as_ref(),
             &history,
+            &images,
             num_ctx,
         );
         let think = self.think_setting();
@@ -3785,6 +4094,7 @@ impl ChatWindow {
                     &active.bubble,
                     "assistant",
                     &content,
+                    &[],
                     Some(assistant_id),
                 );
             }
@@ -5912,6 +6222,7 @@ fn build_request_messages(
     memory_context: Option<&str>,
     summary: Option<&StoredSummary>,
     history: &[StoredMessage],
+    images: &HashMap<i64, Vec<StoredImage>>,
     num_ctx: u32,
 ) -> Vec<ChatMessage> {
     let kept: Vec<&StoredMessage> = match summary {
@@ -5953,10 +6264,16 @@ fn build_request_messages(
             format!("Summary of earlier conversation:\n{}", summary.text),
         ));
     }
-    messages.extend(
-        kept.iter()
-            .map(|message| ChatMessage::new(&message.role, message.content.clone())),
-    );
+    messages.extend(kept.iter().map(|message| {
+        let mut chat = ChatMessage::new(&message.role, message.content.clone());
+        if let Some(message_images) = images.get(&message.id) {
+            chat.images = message_images
+                .iter()
+                .map(|image| base64::engine::general_purpose::STANDARD.encode(&image.data))
+                .collect();
+        }
+        chat
+    }));
     messages
 }
 
@@ -6321,7 +6638,8 @@ mod tests {
         kept_turn_start, plain_text_for_speech, sentences_for_speech, split_sentences,
         take_complete_sentences, tts_language, voice_options_for_backend, SpeechTextBuffer,
     };
-    use crate::store::{StoredMessage, StoredSummary};
+    use crate::store::{StoredImage, StoredMessage, StoredSummary};
+    use std::collections::HashMap;
 
     #[test]
     fn groups_thousands() {
@@ -6558,7 +6876,14 @@ mod tests {
             tokens: 8,
         };
 
-        let request = build_request_messages("Be concise.", None, Some(&summary), &history, 8192);
+        let request = build_request_messages(
+            "Be concise.",
+            None,
+            Some(&summary),
+            &history,
+            &HashMap::new(),
+            8192,
+        );
         assert_eq!(request.len(), 4);
         assert_eq!(request[0].role, "system");
         assert_eq!(request[0].content, "Be concise.");
@@ -6576,6 +6901,7 @@ mod tests {
             Some("Relevant long-term memory:\n- likes dark mode"),
             None,
             &history,
+            &HashMap::new(),
             8192,
         );
         assert_eq!(request.len(), 3);
@@ -6583,6 +6909,25 @@ mod tests {
         assert_eq!(request[1].role, "system");
         assert!(request[1].content.contains("dark mode"));
         assert_eq!(request[2].content, "new question");
+    }
+
+    #[test]
+    fn request_includes_message_images() {
+        let history = vec![stored_message(1, "user", "what is this?")];
+        let mut images = HashMap::new();
+        images.insert(
+            1,
+            vec![StoredImage {
+                mime: "image/png".into(),
+                width: 1,
+                height: 1,
+                data: b"abc".to_vec(),
+            }],
+        );
+
+        let request = build_request_messages("", None, None, &history, &images, 8192);
+        assert_eq!(request.len(), 1);
+        assert_eq!(request[0].images, vec!["YWJj".to_string()]);
     }
 
     #[test]
@@ -6611,7 +6956,7 @@ mod tests {
             })
             .collect();
 
-        let request = build_request_messages("", None, None, &history, 512);
+        let request = build_request_messages("", None, None, &history, &HashMap::new(), 512);
         assert_eq!(request.iter().filter(|m| m.role == "user").count(), 1);
         assert_eq!(request.last().map(|m| m.role.as_str()), Some("assistant"));
     }

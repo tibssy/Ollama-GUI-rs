@@ -38,6 +38,8 @@ The MVP is working:
   models only; decision and embedding models are hidden)
 - Capability badges for the selected model (completion, vision, tools, thinking,
   audio, speech)
+- Vision models: attach up to four images from the file picker or by drag-and-drop,
+  with thumbnails, local storage, and click-to-enlarge
 - Settings for server URL, API key, system prompt, temperature, context size,
   thinking, long-term memory, theme, text-to-speech, auto-read, speech language,
   voice, dictation, and VAD timings
@@ -49,7 +51,6 @@ The MVP is working:
 ### Roadmap
 
 - Model manager: pull with progress, delete, show model details
-- Vision models: image attachments
 - Tool-call and `think` blocks
 - Chat search (SQLite FTS5), rename, export/import
 - Flatpak packaging
@@ -216,6 +217,25 @@ current note counts.
 
 If no embedding model is installed, memory is skipped with a one-time warning
 and chat continues normally.
+
+## Images
+
+Vision-capable models can receive images. Attach up to four images with the
+image button in the composer or drag files onto the input. Pending images appear
+as thumbnails and can be removed before sending. Click an image in a chat bubble
+to open a larger view.
+
+Images are decoded, rotated according to their EXIF orientation, downscaled to at
+most 1568 px on the longest edge, and re-encoded before being stored. Re-encoding
+also drops most embedded metadata. The processed bytes live in SQLite with the
+message and are deleted when the turn is removed.
+
+Images are sent only to the selected vision model. They are not included in
+long-term memory extraction, context summaries, or embedding requests. The
+attach button appears only when the selected model reports the `vision`
+capability (`lfm3-omni`, `lfm3-vl`, `bonsai-2`, and similar models); switching to
+a model without vision clears pending attachments. Ctrl+Shift+A opens the image
+picker, and Ctrl+L focuses the composer.
 
 ## Sidebar
 

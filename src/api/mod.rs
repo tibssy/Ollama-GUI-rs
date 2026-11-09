@@ -75,6 +75,9 @@ pub struct ChatOptions {
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    /// Base64-encoded images for vision-capable Ollama models.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
 }
 
 impl ChatMessage {
@@ -82,6 +85,7 @@ impl ChatMessage {
         Self {
             role: role.to_string(),
             content: content.into(),
+            images: Vec::new(),
         }
     }
 }
@@ -603,6 +607,18 @@ mod tests {
         assert_eq!(json["options"]["temperature"], 0.5);
         assert_eq!(json["options"]["num_ctx"], 4096);
         assert!(json["options"].get("seed").is_none());
+    }
+
+    #[test]
+    fn chat_message_omits_empty_images() {
+        let message = ChatMessage::new("user", "hi");
+        let json = serde_json::to_value(&message).unwrap();
+        assert!(json.get("images").is_none());
+
+        let mut message = ChatMessage::new("user", "look");
+        message.images = vec!["YWJj".into()];
+        let json = serde_json::to_value(&message).unwrap();
+        assert_eq!(json["images"][0], "YWJj");
     }
 
     #[test]
