@@ -13,6 +13,8 @@ pub struct Settings {
     pub num_ctx: u32,
     /// Ask thinking-capable models to emit their reasoning
     pub think_enabled: bool,
+    /// Reasoning level for models that expose named thinking levels
+    pub think_level: String,
     /// "system", "light" or "dark"
     pub theme: String,
     /// Whether the conversation sidebar is shown
@@ -51,6 +53,7 @@ impl Default for Settings {
             temperature: 0.7,
             num_ctx: 8192,
             think_enabled: true,
+            think_level: "medium".to_string(),
             theme: "system".to_string(),
             sidebar_visible: true,
             tts_backend: "auto".to_string(),

@@ -10,7 +10,7 @@ use libadwaita::prelude::*;
 
 use crate::api::{
     self, ChatMessage, ChatOptions, ChatRequest, ModelSummary, OllamaClient, StreamEvent,
-    StreamStats,
+    StreamStats, ThinkSetting, ThinkingControl,
 };
 use crate::config::Settings;
 use crate::store::{Store, StoredMessage, StoredSummary};
@@ -887,7 +887,11 @@ struct ChatWindow {
     mic_button: gtk::Button,
     live_button: gtk::Button,
     think_button: gtk::ToggleButton,
+    think_menu_button: gtk::MenuButton,
+    think_menu_box: gtk::Box,
     think_bar: gtk::Box,
+    think_control: RefCell<Option<ThinkingControl>>,
+    thinking_model: RefCell<String>,
     context_label: gtk::Label,
     context_bar: gtk::LevelBar,
     toast_overlay: adw::ToastOverlay,
@@ -1073,10 +1077,26 @@ impl ChatWindow {
         think_button.set_active(state.settings.borrow().think_enabled);
         think_button.set_visible(false);
 
+        let think_menu_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        think_menu_box.set_margin_top(6);
+        think_menu_box.set_margin_bottom(6);
+        think_menu_box.set_margin_start(6);
+        think_menu_box.set_margin_end(6);
+        let think_popover = gtk::Popover::new();
+        think_popover.set_child(Some(&think_menu_box));
+
+        let think_menu_button = gtk::MenuButton::builder().label("Think").build();
+        think_menu_button.set_popover(Some(&think_popover));
+        think_menu_button.add_css_class("flat");
+        think_menu_button.add_css_class("think-toggle");
+        think_menu_button.set_tooltip_text(Some("Thinking level"));
+        think_menu_button.set_visible(false);
+
         let think_bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         think_bar.set_margin_start(6);
         think_bar.set_margin_top(2);
         think_bar.append(&think_button);
+        think_bar.append(&think_menu_button);
         think_bar.set_visible(false);
 
         let composer_buttons = gtk::Box::new(gtk::Orientation::Vertical, 6);
@@ -1177,7 +1197,11 @@ impl ChatWindow {
             mic_button,
             live_button,
             think_button,
+            think_menu_button,
+            think_menu_box,
             think_bar,
+            think_control: RefCell::new(None),
+            thinking_model: RefCell::new(String::new()),
             context_label,
             context_bar,
             toast_overlay,
@@ -1385,7 +1409,7 @@ impl ChatWindow {
             .unwrap_or_default()
     }
 
-    fn select_model_in_dropdown(&self, model: &str) {
+    fn select_model_in_dropdown(self: &Rc<Self>, model: &str) {
         let Some(list) = self
             .model_dropdown
             .model()
@@ -1408,10 +1432,11 @@ impl ChatWindow {
         self.update_capabilities();
     }
 
-    fn update_capabilities(&self) {
+    fn update_capabilities(self: &Rc<Self>) {
         while let Some(child) = self.capability_box.first_child() {
             child.unparent();
         }
+        self.refresh_thinking_control();
 
         let selected = self.selected_model();
         if selected.is_empty() {
@@ -1976,21 +2001,167 @@ impl ChatWindow {
             .unwrap_or(false)
     }
 
+    fn refresh_thinking_control(self: &Rc<Self>) {
+        let model = self.selected_model();
+        if model.is_empty() || !self.selected_model_supports("thinking") {
+            self.thinking_model.borrow_mut().clear();
+            *self.think_control.borrow_mut() = None;
+            self.rebuild_think_menu();
+            self.update_think_button();
+            return;
+        }
+        if *self.thinking_model.borrow() == model {
+            self.update_think_button();
+            return;
+        }
+
+        *self.thinking_model.borrow_mut() = model.clone();
+        *self.think_control.borrow_mut() = None;
+        self.update_think_button();
+
+        let client = self.state.client.borrow().clone();
+        let request_model = model.clone();
+        let (tx, rx) = async_channel::bounded(1);
+        self.state.runtime.spawn(async move {
+            let result = client.model_thinking(&request_model).await;
+            let _ = tx.send(result).await;
+        });
+
+        let win = self.clone();
+        glib::spawn_future_local(async move {
+            let Ok(result) = rx.recv().await else {
+                return;
+            };
+            if win.selected_model() != model {
+                return;
+            }
+            match result {
+                Ok(control) => win.set_thinking_control(control),
+                Err(err) => {
+                    tracing::warn!("thinking controls unavailable: {err:#}");
+                    win.set_thinking_control(None);
+                }
+            }
+        });
+    }
+
+    fn set_thinking_control(self: &Rc<Self>, control: Option<ThinkingControl>) {
+        if let Some(control) = &control {
+            if control.is_level_only() {
+                let stored = self.state.settings.borrow().think_level.clone();
+                let preferred = control.preferred_level(&stored);
+                if preferred != stored {
+                    self.state.settings.borrow_mut().think_level = preferred;
+                    self.save_settings();
+                }
+            }
+        }
+
+        *self.think_control.borrow_mut() = control;
+        self.rebuild_think_menu();
+        self.update_think_button();
+    }
+
+    fn rebuild_think_menu(self: &Rc<Self>) {
+        while let Some(child) = self.think_menu_box.first_child() {
+            self.think_menu_box.remove(&child);
+        }
+
+        let Some(control) = self.think_control.borrow().clone() else {
+            return;
+        };
+        if !control.is_level_only() {
+            return;
+        }
+
+        let selected = self.selected_think_level(&control);
+        for level in &control.levels {
+            let button = gtk::Button::new();
+            button.add_css_class("flat");
+
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            let check = gtk::Image::from_icon_name("object-select-symbolic");
+            check.set_visible(*level == selected);
+            row.append(&check);
+            let label = gtk::Label::new(Some(&title_case(level)));
+            label.set_xalign(0.0);
+            label.set_hexpand(true);
+            row.append(&label);
+            button.set_child(Some(&row));
+
+            let win = self.clone();
+            let level = level.clone();
+            button.connect_clicked(move |_| {
+                win.state.settings.borrow_mut().think_level = level.clone();
+                win.save_settings();
+                win.think_menu_button.popdown();
+                win.rebuild_think_menu();
+                win.update_think_button();
+            });
+            self.think_menu_box.append(&button);
+        }
+    }
+
+    fn selected_think_level(&self, control: &ThinkingControl) -> String {
+        control.preferred_level(&self.state.settings.borrow().think_level)
+    }
+
+    fn think_setting(&self) -> Option<ThinkSetting> {
+        if !self.selected_model_supports("thinking") {
+            return None;
+        }
+
+        let live = self.live_mode.get() || self.live_pending.get();
+        let control = self.think_control.borrow().clone();
+        if let Some(control) = control.filter(|control| control.is_level_only()) {
+            let level = if live {
+                control.lowest_level().unwrap_or("low").to_string()
+            } else {
+                self.selected_think_level(&control)
+            };
+            return Some(ThinkSetting::Level(level));
+        }
+
+        let enabled = self.state.settings.borrow().think_enabled && !live;
+        Some(ThinkSetting::Bool(enabled))
+    }
+
     fn update_think_button(&self) {
         let supported = self.selected_model_supports("thinking");
         let live = self.live_mode.get() || self.live_pending.get();
+        let control = self.think_control.borrow().clone();
+
         self.think_bar.set_visible(supported);
-        self.think_button.set_visible(supported);
-        self.think_button.set_sensitive(supported && !live);
-        self.think_button.set_tooltip_text(Some(if !supported {
-            "Thinking is not supported by the selected model"
-        } else if live {
-            "Thinking is disabled during live conversation"
-        } else if self.think_button.is_active() {
-            "Thinking mode is on"
+        if !supported {
+            self.think_button.set_visible(false);
+            self.think_menu_button.set_visible(false);
+            return;
+        }
+
+        let level_only = control.as_ref().is_some_and(ThinkingControl::is_level_only);
+        self.think_button.set_visible(!level_only);
+        self.think_menu_button.set_visible(level_only);
+
+        if let Some(control) = control.as_ref().filter(|control| control.is_level_only()) {
+            let level = self.selected_think_level(control);
+            self.think_menu_button
+                .set_label(&format!("Think: {}", title_case(&level)));
+            self.think_menu_button.set_sensitive(!live);
+            self.think_menu_button.set_tooltip_text(Some(if live {
+                "Live mode uses the lowest reasoning level"
+            } else {
+                "Reasoning level"
+            }));
         } else {
-            "Thinking mode is off"
-        }));
+            self.think_button.set_sensitive(!live);
+            self.think_button.set_tooltip_text(Some(if live {
+                "Thinking is disabled during live conversation"
+            } else if self.think_button.is_active() {
+                "Thinking mode is on"
+            } else {
+                "Thinking mode is off"
+            }));
+        }
     }
 
     fn update_speech_buttons(&self) {
@@ -3199,18 +3370,13 @@ impl ChatWindow {
                 store.conversation_summary(conversation_id).ok().flatten(),
             )
         };
-        let (temperature, num_ctx, think_enabled) = {
+        let (temperature, num_ctx) = {
             let settings = self.state.settings.borrow();
-            (
-                settings.temperature,
-                settings.num_ctx.max(1),
-                settings.think_enabled,
-            )
+            (settings.temperature, settings.num_ctx.max(1))
         };
         let messages = build_request_messages(&system_prompt, summary.as_ref(), &history, num_ctx);
-        let think = self
-            .selected_model_supports("thinking")
-            .then_some(think_enabled && !self.live_mode.get() && !self.live_pending.get());
+        let think = self.think_setting();
+        tracing::debug!("chat: thinking setting {think:?}");
 
         let request = ChatRequest {
             model,
@@ -4249,6 +4415,14 @@ fn group_digits(value: u32) -> String {
         out.push(ch);
     }
     out
+}
+
+fn title_case(value: &str) -> String {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
 }
 
 fn format_percent(percent: f64) -> String {

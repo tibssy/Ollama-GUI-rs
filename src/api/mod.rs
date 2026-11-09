@@ -83,6 +83,13 @@ impl ChatMessage {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum ThinkSetting {
+    Bool(bool),
+    Level(String),
+}
+
 #[derive(Debug, Serialize)]
 pub struct ChatRequest {
     pub model: String,
@@ -93,7 +100,7 @@ pub struct ChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keep_alive: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub think: Option<bool>,
+    pub think: Option<ThinkSetting>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -101,6 +108,37 @@ pub struct StreamStats {
     pub eval_count: Option<u32>,
     pub eval_duration: Option<u64>,
     pub prompt_eval_count: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThinkingControl {
+    pub supports_off: bool,
+    pub levels: Vec<String>,
+    pub default: Option<String>,
+}
+
+impl ThinkingControl {
+    pub fn is_level_only(&self) -> bool {
+        !self.supports_off && !self.levels.is_empty()
+    }
+
+    pub fn lowest_level(&self) -> Option<&str> {
+        self.levels.first().map(String::as_str)
+    }
+
+    pub fn preferred_level(&self, stored: &str) -> String {
+        if self.levels.iter().any(|level| level == stored) {
+            return stored.to_string();
+        }
+        if let Some(default) = self
+            .default
+            .as_deref()
+            .filter(|default| self.levels.iter().any(|level| level == default))
+        {
+            return default.to_string();
+        }
+        self.levels.first().cloned().unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -213,6 +251,21 @@ impl OllamaClient {
             .cloned()
             .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
         serde_json::from_value(models).context("unexpected /api/tags payload")
+    }
+
+    /// Fetch the model's thinking controls from `/api/show`.
+    pub async fn model_thinking(&self, model: &str) -> Result<Option<ThinkingControl>> {
+        let response = self
+            .request(reqwest::Method::POST, "/api/show")
+            .json(&serde_json::json!({ "model": model }))
+            .send()
+            .await
+            .context("could not reach Ollama")?;
+        if !response.status().is_success() {
+            bail!("Ollama returned HTTP {}", response.status());
+        }
+        let body: serde_json::Value = response.json().await?;
+        Ok(parse_thinking_control(&body))
     }
 
     pub async fn chat(&self, request: &ChatRequest) -> Result<reqwest::Response> {
@@ -435,6 +488,33 @@ async fn handle_line(
     Ok(chunk.done)
 }
 
+fn parse_thinking_control(body: &serde_json::Value) -> Option<ThinkingControl> {
+    let thinking = body.get("thinking")?;
+    let mut supports_off = false;
+    let mut levels = Vec::new();
+
+    if let Some(values) = thinking.get("values").and_then(serde_json::Value::as_array) {
+        for value in values {
+            match value {
+                serde_json::Value::Bool(false) => supports_off = true,
+                serde_json::Value::String(level) => levels.push(level.clone()),
+                _ => {}
+            }
+        }
+    }
+
+    let default = thinking
+        .get("default")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+
+    Some(ThinkingControl {
+        supports_off,
+        levels,
+        default,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,6 +565,43 @@ mod tests {
         let chunk: ChatChunk = serde_json::from_str(json).unwrap();
         assert_eq!(chunk.message.unwrap().thinking, "step 1");
         assert!(!chunk.done);
+    }
+
+    #[test]
+    fn parses_level_only_thinking_controls() {
+        let body = serde_json::json!({
+            "thinking": {"values": ["low", "medium", "high"], "default": "medium"}
+        });
+        let control = parse_thinking_control(&body).expect("thinking controls");
+        assert!(!control.supports_off);
+        assert!(control.is_level_only());
+        assert_eq!(control.lowest_level(), Some("low"));
+        assert_eq!(control.preferred_level("high"), "high");
+        assert_eq!(control.preferred_level("unsupported"), "medium");
+    }
+
+    #[test]
+    fn parses_boolean_thinking_controls() {
+        let body = serde_json::json!({
+            "thinking": {"values": [true, false], "default": true}
+        });
+        let control = parse_thinking_control(&body).expect("thinking controls");
+        assert!(control.supports_off);
+        assert!(!control.is_level_only());
+    }
+
+    #[test]
+    fn serializes_think_levels() {
+        let request = ChatRequest {
+            model: "gpt-oss".into(),
+            messages: vec![ChatMessage::new("user", "hi")],
+            stream: true,
+            options: None,
+            keep_alive: None,
+            think: Some(ThinkSetting::Level("low".into())),
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["think"], "low");
     }
 
     #[test]
@@ -554,7 +671,7 @@ mod tests {
                     ..Default::default()
                 }),
                 keep_alive: Some("30s".into()),
-                think: Some(false),
+                think: Some(ThinkSetting::Bool(false)),
             };
 
             let (tx, rx) = async_channel::unbounded();

@@ -26,8 +26,8 @@ The MVP is working:
 - Collapsible sidebar with a header toggle, menu item, and Ctrl+B shortcut
 - Automatic context compression: at 85% usage, older turns are summarized while
   the last five turns stay verbatim
-- Optional thinking mode for reasoning models, shown in a collapsible thinking
-  panel and automatically disabled in live voice conversations
+- Optional thinking mode for reasoning models, with on/off or low/medium/high
+  controls and automatic minimization in live voice conversations
 - Conversations persisted locally in SQLite
 - New / delete chat, automatic titles from the first message
 - Model picker with search, per-conversation model selection (chat-capable
@@ -189,7 +189,11 @@ behind a collapsible **Thinking** row with a spinner and chevron button. The row
 can be expanded to read the reasoning and collapsed again with the same button.
 The toggle choice is remembered between sessions.
 
-Thinking is always disabled during live voice conversation.
+Models with named reasoning levels show a level selector instead of an on/off
+toggle. For example, gpt-oss exposes **Low**, **Medium**, and **High**; it cannot
+fully disable reasoning, so the lowest level is used during live conversation.
+Other thinking models use the normal on/off toggle, and live conversation turns
+it off.
 
 ## Live voice conversation
 
