@@ -64,8 +64,9 @@
   border-radius: 10px;
 }
 
-.attachment-thumb image {
-  border-radius: 10px;
+.attachment-image {
+  background: alpha(currentColor, 0.06);
+  border-radius: 8px;
 }
 
 .attachment-remove {
@@ -77,6 +78,7 @@
 }
 
 .message-image {
+  background: alpha(currentColor, 0.05);
   border-radius: 10px;
 }
 

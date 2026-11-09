@@ -226,9 +226,12 @@ as thumbnails and can be removed before sending. Click an image in a chat bubble
 to open a larger view.
 
 Images are decoded, rotated according to their EXIF orientation, downscaled to at
-most 1568 px on the longest edge, and re-encoded before being stored. Re-encoding
-also drops most embedded metadata. The processed bytes live in SQLite with the
-message and are deleted when the turn is removed.
+most 1024 px on the longest edge and about one megapixel, then re-encoded. If the
+encoded payload is still larger than 1.5 MB, it is scaled down further. This
+keeps a single image from overwhelming a vision model or the Ollama session.
+Re-encoding also drops most embedded metadata. The processed bytes live in SQLite
+with the message and are deleted when the turn is removed. Every preview uses
+the same frame in the chat, so the layout does not jump between images.
 
 Images are sent only to the selected vision model. They are not included in
 long-term memory extraction, context summaries, or embedding requests. The

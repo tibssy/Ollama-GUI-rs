@@ -3429,12 +3429,7 @@ impl ChatWindow {
             overlay.add_css_class("attachment-thumb");
             overlay.set_tooltip_text(Some(&attachment.name));
 
-            if let Some(texture) = image::texture(&attachment.preview_data) {
-                let picture = gtk::Image::from_paintable(Some(&texture));
-                overlay.set_child(Some(&picture));
-            } else {
-                overlay.set_child(Some(&gtk::Label::new(Some("Image"))));
-            }
+            overlay.set_child(Some(&image::preview_widget(&attachment.preview_data)));
 
             let remove = gtk::Button::from_icon_name("window-close-symbolic");
             remove.add_css_class("flat");
