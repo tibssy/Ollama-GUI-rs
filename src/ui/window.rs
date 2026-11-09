@@ -1187,28 +1187,38 @@ impl ChatWindow {
         attachments_box.add_css_class("attachment-strip");
         attachments_box.set_visible(false);
 
-        let composer_buttons = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        composer_buttons.set_valign(gtk::Align::End);
-        composer_buttons.append(&attach_button);
-        composer_buttons.append(&live_button);
-        composer_buttons.append(&mic_button);
-        composer_buttons.append(&stop_button);
-        composer_buttons.append(&send_button);
+        let icon_row = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        icon_row.set_halign(gtk::Align::End);
+        icon_row.append(&attach_button);
+        icon_row.append(&live_button);
+        icon_row.append(&mic_button);
 
-        let composer_input = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        composer_input.set_hexpand(true);
-        composer_input.append(&think_bar);
-        composer_input.append(&attachments_box);
-        composer_input.append(&input);
+        let action_row = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        action_row.set_halign(gtk::Align::End);
+        action_row.append(&stop_button);
+        action_row.append(&send_button);
 
-        let composer = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let composer_buttons = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        composer_buttons.set_valign(gtk::Align::Start);
+        composer_buttons.set_halign(gtk::Align::End);
+        composer_buttons.append(&icon_row);
+        composer_buttons.append(&action_row);
+
+        let input_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        input_row.set_hexpand(true);
+        input.set_hexpand(true);
+        input_row.append(&input);
+        input_row.append(&composer_buttons);
+
+        let composer = gtk::Box::new(gtk::Orientation::Vertical, 2);
         composer.add_css_class("composer");
         composer.set_margin_top(6);
         composer.set_margin_bottom(12);
         composer.set_margin_start(12);
         composer.set_margin_end(12);
-        composer.append(&composer_input);
-        composer.append(&composer_buttons);
+        composer.append(&think_bar);
+        composer.append(&attachments_box);
+        composer.append(&input_row);
 
         let content_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
 
@@ -2048,7 +2058,7 @@ impl ChatWindow {
 
         if !images.is_empty() {
             let image_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
-            image_box.set_halign(gtk::Align::Start);
+            image_box.set_halign(gtk::Align::End);
             for image in images {
                 image_box.append(&image::message_widget(image, self.window.upcast_ref()));
             }
@@ -2066,7 +2076,7 @@ impl ChatWindow {
         }
 
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        row.set_halign(gtk::Align::Fill);
+        row.set_halign(gtk::Align::End);
         row.append(&bubble);
         self.messages_box.append(&row);
 
@@ -2090,6 +2100,7 @@ impl ChatWindow {
 
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         row.set_halign(gtk::Align::Fill);
+        row.set_hexpand(true);
         row.append(&bubble);
         self.messages_box.append(&row);
 
@@ -2110,11 +2121,7 @@ impl ChatWindow {
         };
 
         let actions = gtk::Box::new(gtk::Orientation::Horizontal, 2);
-        actions.set_halign(if role == "user" {
-            gtk::Align::End
-        } else {
-            gtk::Align::Start
-        });
+        actions.set_halign(gtk::Align::End);
         actions.set_margin_top(2);
 
         if role == "assistant" {

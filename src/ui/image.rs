@@ -192,7 +192,7 @@ pub fn message_widget(image: &StoredImage, parent: &gtk::Window) -> gtk::Widget 
     picture.set_size_request(MESSAGE_IMAGE_WIDTH, MESSAGE_IMAGE_HEIGHT);
     picture.set_content_fit(gtk::ContentFit::Contain);
     picture.set_can_shrink(true);
-    picture.set_halign(gtk::Align::Start);
+    picture.set_halign(gtk::Align::End);
     picture.add_css_class("message-image");
     picture.set_tooltip_text(Some(&format!(
         "Open image ({}×{})",
