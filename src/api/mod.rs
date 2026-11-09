@@ -21,6 +21,9 @@ pub struct ModelSummary {
     /// "embedding", "decision", "vision", "tools".
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// Set by Ollama for models hosted on ollama.com rather than pulled locally.
+    #[serde(default)]
+    pub remote_host: Option<String>,
 }
 
 impl ModelSummary {
@@ -311,6 +314,32 @@ impl OllamaClient {
         })
     }
 
+    /// Embed text with an Ollama embedding model via `/api/embed`.
+    pub async fn embed(&self, model: &str, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let response = tokio::time::timeout(
+            Duration::from_secs(30),
+            self.request(reqwest::Method::POST, "/api/embed")
+                .json(&serde_json::json!({ "model": model, "input": texts }))
+                .send(),
+        )
+        .await
+        .context("embedding request timed out")??;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            let detail = body.trim();
+            if detail.is_empty() {
+                bail!("Ollama embedding endpoint returned HTTP {status}");
+            }
+            bail!("Ollama embedding endpoint returned HTTP {status}: {detail}");
+        }
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .context("parsing Ollama embedding response")?;
+        parse_embeddings(&body)
+    }
+
     /// Generate speech with an Ollama speech-capable model via the
     /// OpenAI-compatible `/v1/audio/speech` endpoint. Returns WAV bytes.
     pub async fn speech(&self, model: &str, input: &str, voice: &str) -> Result<Vec<u8>> {
@@ -488,6 +517,33 @@ async fn handle_line(
     Ok(chunk.done)
 }
 
+fn parse_embeddings(body: &serde_json::Value) -> Result<Vec<Vec<f32>>> {
+    let embeddings = body
+        .get("embeddings")
+        .and_then(serde_json::Value::as_array)
+        .context("Ollama embedding response missing embeddings")?;
+
+    let mut result = Vec::with_capacity(embeddings.len());
+    for embedding in embeddings {
+        let values = embedding
+            .as_array()
+            .context("Ollama embedding was not an array")?;
+        let mut vector = Vec::with_capacity(values.len());
+        for value in values {
+            let number = value
+                .as_f64()
+                .context("Ollama embedding contained a non-number")?;
+            vector.push(number as f32);
+        }
+        result.push(vector);
+    }
+
+    if result.is_empty() {
+        bail!("Ollama returned no embeddings");
+    }
+    Ok(result)
+}
+
 fn parse_thinking_control(body: &serde_json::Value) -> Option<ThinkingControl> {
     let thinking = body.get("thinking")?;
     let mut supports_off = false;
@@ -611,6 +667,7 @@ mod tests {
             size: 0,
             details: ModelDetails::default(),
             capabilities: capabilities.iter().map(|c| c.to_string()).collect(),
+            remote_host: None,
         };
 
         assert!(model(&["completion"]).is_chat_model());
@@ -619,6 +676,51 @@ mod tests {
         assert!(!model(&["decision", "vision"]).is_chat_model());
         assert!(!model(&["embedding"]).is_chat_model());
         assert!(!model(&["completion", "decision"]).is_chat_model());
+    }
+
+    #[test]
+    fn parses_embeddings() {
+        let body = serde_json::json!({
+            "embeddings": [[0.1, 0.2, 0.3], [1.0, -2.0, 3.5]]
+        });
+        let vectors = parse_embeddings(&body).expect("embeddings");
+        assert_eq!(vectors.len(), 2);
+        assert_eq!(vectors[0], vec![0.1, 0.2, 0.3]);
+        assert_eq!(vectors[1], vec![1.0, -2.0, 3.5]);
+        assert!(parse_embeddings(&serde_json::json!({ "embeddings": [] })).is_err());
+        assert!(parse_embeddings(&serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn reads_remote_host_from_tags() {
+        let json = r#"{
+            "name": "gpt-oss:120b-cloud",
+            "size": 0,
+            "capabilities": ["completion"],
+            "remote_host": "https://ollama.com"
+        }"#;
+        let model: ModelSummary = serde_json::from_str(json).unwrap();
+        assert_eq!(model.remote_host.as_deref(), Some("https://ollama.com"));
+        assert!(crate::memory::model_is_cloud(
+            &model.name,
+            model.remote_host.as_deref(),
+            "http://localhost:11434"
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires a local Ollama embedding model"]
+    fn live_embedding_returns_vectors() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let client = OllamaClient::new("http://localhost:11434", "");
+            let vectors = client
+                .embed("all-minilm", &["Hello from Ollama GUI.".to_string()])
+                .await
+                .expect("embedding request");
+            assert_eq!(vectors.len(), 1);
+            assert!(!vectors[0].is_empty());
+        });
     }
 
     #[test]

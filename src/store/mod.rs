@@ -1,7 +1,11 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::api::StreamStats;
+use crate::memory::{self, MemoryEntry, MemoryPool};
 
 #[derive(Debug, Clone)]
 pub struct ConversationSummary {
@@ -29,6 +33,7 @@ pub struct StoredSummary {
 
 pub struct Store {
     conn: Connection,
+    memory_cache: RefCell<HashMap<(MemoryPool, String), Vec<MemoryEntry>>>,
 }
 
 impl Store {
@@ -39,12 +44,19 @@ impl Store {
         let path = dir.join("chats.db");
         let conn = Connection::open(&path)
             .with_context(|| format!("opening database {}", path.display()))?;
-        Self::from_connection(conn)
+        restrict_database_permissions(&path);
+        let store = Self::from_connection(conn)?;
+        // WAL and SHM files are created by the first migration.
+        restrict_database_permissions(&path);
+        Ok(store)
     }
 
     fn from_connection(conn: Connection) -> Result<Self> {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        let store = Self { conn };
+        let store = Self {
+            conn,
+            memory_cache: RefCell::new(HashMap::new()),
+        };
         store.migrate()?;
         Ok(store)
     }
@@ -79,12 +91,29 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_messages_conversation
                 ON messages(conversation_id, id);
+
+            CREATE TABLE IF NOT EXISTS memories(
+                id              INTEGER PRIMARY KEY,
+                pool            TEXT NOT NULL,
+                embedding_model TEXT NOT NULL,
+                dims            INTEGER NOT NULL,
+                text            TEXT NOT NULL,
+                vector          BLOB NOT NULL,
+                model           TEXT NOT NULL,
+                conversation_id INTEGER,
+                created_at      INTEGER NOT NULL DEFAULT (unixepoch()),
+                UNIQUE(pool, embedding_model, text)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_memories_lookup
+                ON memories(pool, embedding_model, dims);
             "#,
         )?;
         self.ensure_column("conversations", "context_used", "INTEGER")?;
         self.ensure_column("conversations", "summary", "TEXT")?;
         self.ensure_column("conversations", "summary_upto_id", "INTEGER")?;
         self.ensure_column("conversations", "summary_tokens", "INTEGER")?;
+        self.ensure_column("conversations", "memory_upto_id", "INTEGER")?;
         self.backfill_context_usage()?;
         Ok(())
     }
@@ -217,6 +246,132 @@ impl Store {
         Ok(())
     }
 
+    /// Last message id already summarized into long-term memory.
+    pub fn conversation_memory_checkpoint(&self, id: i64) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT COALESCE(memory_upto_id, 0) FROM conversations WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0))
+    }
+
+    pub fn set_conversation_memory_checkpoint(&self, id: i64, upto_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE conversations SET memory_upto_id = ?1 WHERE id = ?2",
+            params![upto_id, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn latest_message_id(&self, conversation_id: i64) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id FROM messages
+                 WHERE conversation_id = ?1 ORDER BY id DESC LIMIT 1",
+                params![conversation_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn memory_count(&self, pool: MemoryPool) -> Result<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM memories WHERE pool = ?1",
+            params![pool.as_str()],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
+    pub fn memory_counts(&self) -> Result<(usize, usize)> {
+        Ok((
+            self.memory_count(MemoryPool::Local)?,
+            self.memory_count(MemoryPool::Cloud)?,
+        ))
+    }
+
+    /// Load the notes for one pool and embedding model. Results are cached
+    /// until a note is added or memory is cleared.
+    pub fn memory_entries(
+        &self,
+        pool: MemoryPool,
+        embedding_model: &str,
+    ) -> Result<Vec<MemoryEntry>> {
+        let key = (pool, embedding_model.to_string());
+        if let Some(entries) = self.memory_cache.borrow().get(&key) {
+            return Ok(entries.clone());
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT text, vector, date(created_at, 'unixepoch', 'localtime')
+             FROM memories
+             WHERE pool = ?1 AND embedding_model = ?2
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![pool.as_str(), embedding_model], |row| {
+            let bytes: Vec<u8> = row.get(1)?;
+            Ok(MemoryEntry {
+                text: row.get(0)?,
+                vector: memory::decode_vector(&bytes),
+                created: row.get(2)?,
+            })
+        })?;
+        let mut entries = Vec::new();
+        for row in rows {
+            entries.push(row?);
+        }
+
+        self.memory_cache.borrow_mut().insert(key, entries.clone());
+        Ok(entries)
+    }
+
+    pub fn add_memory(
+        &self,
+        pool: MemoryPool,
+        embedding_model: &str,
+        model: &str,
+        conversation_id: Option<i64>,
+        text: &str,
+        vector: &[f32],
+    ) -> Result<bool> {
+        let bytes = memory::encode_vector(vector);
+        let changed = self.conn.execute(
+            "INSERT OR IGNORE INTO memories(
+                 pool, embedding_model, dims, text, vector, model, conversation_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                pool.as_str(),
+                embedding_model,
+                vector.len() as i64,
+                text,
+                bytes,
+                model,
+                conversation_id
+            ],
+        )?;
+        self.memory_cache
+            .borrow_mut()
+            .remove(&(pool, embedding_model.to_string()));
+        Ok(changed > 0)
+    }
+
+    pub fn clear_memories(&self, pool: Option<MemoryPool>) -> Result<usize> {
+        let changed = match pool {
+            Some(pool) => self.conn.execute(
+                "DELETE FROM memories WHERE pool = ?1",
+                params![pool.as_str()],
+            )?,
+            None => self.conn.execute("DELETE FROM memories", [])?,
+        };
+        self.memory_cache.borrow_mut().clear();
+        Ok(changed)
+    }
+
     pub fn list_conversations(&self) -> Result<Vec<ConversationSummary>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, title, model, context_used FROM conversations
@@ -338,11 +493,19 @@ impl Store {
     }
 
     pub fn messages(&self, conversation_id: i64) -> Result<Vec<StoredMessage>> {
+        self.messages_after(conversation_id, 0)
+    }
+
+    pub fn messages_after(
+        &self,
+        conversation_id: i64,
+        after_id: i64,
+    ) -> Result<Vec<StoredMessage>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, role, content FROM messages
-             WHERE conversation_id = ?1 ORDER BY id ASC",
+             WHERE conversation_id = ?1 AND id > ?2 ORDER BY id ASC",
         )?;
-        let rows = stmt.query_map(params![conversation_id], |row| {
+        let rows = stmt.query_map(params![conversation_id, after_id], |row| {
             Ok(StoredMessage {
                 id: row.get(0)?,
                 role: row.get(1)?,
@@ -434,6 +597,30 @@ impl Store {
     }
 }
 
+/// Chat history and memory notes contain personal data, so keep the database
+/// readable only by the owner.
+fn restrict_database_permissions(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            return;
+        };
+        for candidate in [
+            path.to_path_buf(),
+            path.with_file_name(format!("{name}-wal")),
+            path.with_file_name(format!("{name}-shm")),
+        ] {
+            if let Ok(metadata) = std::fs::metadata(&candidate) {
+                let mut permissions = metadata.permissions();
+                permissions.set_mode(0o600);
+                let _ = std::fs::set_permissions(&candidate, permissions);
+            }
+        }
+    }
+}
+
 fn context_used_from_json(json: &str) -> Option<u32> {
     #[derive(serde::Deserialize)]
     struct StoredStats {
@@ -452,6 +639,7 @@ fn context_used_from_json(json: &str) -> Option<u32> {
 mod tests {
     use super::{context_used_from_json, Store, StoredSummary};
     use crate::api::StreamStats;
+    use crate::memory::MemoryPool;
 
     #[test]
     fn context_used_sums_prompt_and_generated_tokens() {
@@ -627,5 +815,144 @@ mod tests {
         store.set_conversation_summary(id, &summary).unwrap();
         store.delete_turn(id, user2).unwrap();
         assert_eq!(store.conversation_summary(id).unwrap(), Some(summary));
+    }
+
+    #[test]
+    fn stores_and_searches_memories_by_pool() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_conversation("model", "title").unwrap();
+
+        assert!(store
+            .add_memory(
+                MemoryPool::Local,
+                "all-minilm",
+                "model",
+                Some(id),
+                "The user prefers dark mode.",
+                &[1.0, 0.0],
+            )
+            .unwrap());
+        assert!(store
+            .add_memory(
+                MemoryPool::Cloud,
+                "all-minilm",
+                "cloud-model",
+                None,
+                "The user's project is called NeuroPipe.",
+                &[1.0, 0.0],
+            )
+            .unwrap());
+
+        assert_eq!(store.memory_counts().unwrap(), (1, 1));
+        let local = store
+            .memory_entries(MemoryPool::Local, "all-minilm")
+            .unwrap();
+        assert_eq!(local.len(), 1);
+        assert_eq!(local[0].text, "The user prefers dark mode.");
+        let hits = crate::memory::search_entries(&local, &[1.0, 0.0], 4, 0.0);
+        assert_eq!(hits.len(), 1);
+
+        let cloud = store
+            .memory_entries(MemoryPool::Cloud, "all-minilm")
+            .unwrap();
+        assert_eq!(cloud.len(), 1);
+        assert_eq!(cloud[0].text, "The user's project is called NeuroPipe.");
+    }
+
+    #[test]
+    fn memory_dedup_ignores_duplicate_text() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(store
+            .add_memory(
+                MemoryPool::Local,
+                "all-minilm",
+                "model",
+                None,
+                "Same note.",
+                &[1.0],
+            )
+            .unwrap());
+        assert!(!store
+            .add_memory(
+                MemoryPool::Local,
+                "all-minilm",
+                "model",
+                None,
+                "Same note.",
+                &[1.0],
+            )
+            .unwrap());
+        assert_eq!(store.memory_count(MemoryPool::Local).unwrap(), 1);
+    }
+
+    #[test]
+    fn memory_entries_are_scoped_by_embedding_model() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .add_memory(
+                MemoryPool::Local,
+                "all-minilm",
+                "model",
+                None,
+                "Note.",
+                &[1.0, 0.0],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .memory_entries(MemoryPool::Local, "all-minilm")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(store
+            .memory_entries(MemoryPool::Local, "nomic-embed-text")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn clears_memory_pools() {
+        let store = Store::open_in_memory().unwrap();
+        for (pool, text) in [
+            (MemoryPool::Local, "local note"),
+            (MemoryPool::Cloud, "cloud note"),
+        ] {
+            store
+                .add_memory(pool, "all-minilm", "model", None, text, &[1.0])
+                .unwrap();
+        }
+
+        assert_eq!(store.clear_memories(Some(MemoryPool::Local)).unwrap(), 1);
+        assert_eq!(store.memory_counts().unwrap(), (0, 1));
+        assert!(store
+            .memory_entries(MemoryPool::Local, "all-minilm")
+            .unwrap()
+            .is_empty());
+
+        assert_eq!(store.clear_memories(None).unwrap(), 1);
+        assert_eq!(store.memory_counts().unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn tracks_memory_checkpoint_and_messages_after() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_conversation("model", "title").unwrap();
+        let first = store.add_message(id, "user", "one", None).unwrap();
+        let second = store.add_message(id, "assistant", "two", None).unwrap();
+        let third = store.add_message(id, "user", "three", None).unwrap();
+
+        assert_eq!(store.conversation_memory_checkpoint(id).unwrap(), 0);
+        assert_eq!(store.latest_message_id(id).unwrap(), Some(third));
+
+        store
+            .set_conversation_memory_checkpoint(id, second)
+            .unwrap();
+        assert_eq!(store.conversation_memory_checkpoint(id).unwrap(), second);
+
+        let messages = store.messages_after(id, second).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, third);
+        assert_eq!(store.messages_after(id, first).unwrap().len(), 2);
     }
 }

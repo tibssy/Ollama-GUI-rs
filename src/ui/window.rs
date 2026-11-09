@@ -14,6 +14,7 @@ use crate::api::{
     StreamStats, ThinkSetting, ThinkingControl,
 };
 use crate::config::Settings;
+use crate::memory::{self, MemoryPool};
 use crate::store::{Store, StoredMessage, StoredSummary};
 use crate::stt::{self, PreparedBackend, SttEvent};
 use crate::tray::{StatusTray, TrayCommand};
@@ -30,6 +31,11 @@ const CONTEXT_SUMMARY_RATIO: f64 = 0.10;
 /// Feed summarization this fraction of `num_ctx` at a time.
 const CONTEXT_CHUNK_RATIO: f64 = 0.45;
 const SUMMARY_TEMPERATURE: f64 = 0.2;
+/// Wait this long after a reply before extracting long-term memory.
+const MEMORY_DEBOUNCE_MS: u64 = 3_000;
+/// Feed memory extraction this fraction of `num_ctx` at a time.
+const MEMORY_TRANSCRIPT_RATIO: f64 = 0.45;
+const MEMORY_TEMPERATURE: f64 = 0.1;
 const SUMMARY_SYSTEM_PROMPT: &str = "You maintain a compact summary of an ongoing chat. \
 Merge the existing summary with the older messages provided. Preserve the user's goals, \
 preferences, decisions, facts, names, numbers, file paths, code identifiers, and unresolved \
@@ -76,6 +82,7 @@ struct ActiveStream {
     view: gtk::TextView,
     content: Rc<RefCell<String>>,
     conv_id: i64,
+    model: String,
     stats: Rc<RefCell<Option<StreamStats>>>,
 }
 
@@ -105,6 +112,50 @@ struct CompressionResult {
     text: String,
     tokens: u32,
     upto_id: i64,
+}
+
+#[derive(Clone)]
+struct GenerationRequest {
+    conversation_id: i64,
+    memory_context: Option<String>,
+}
+
+struct MemoryJob {
+    conversation_id: i64,
+    upto_id: i64,
+    pool: MemoryPool,
+    model: String,
+    embedding_model: String,
+    transcript: String,
+    max_chars: usize,
+    num_ctx: u32,
+    epoch: u64,
+}
+
+impl MemoryJob {
+    fn empty_result(&self) -> MemoryJobResult {
+        MemoryJobResult {
+            conversation_id: self.conversation_id,
+            upto_id: self.upto_id,
+            pool: self.pool,
+            model: self.model.clone(),
+            embedding_model: self.embedding_model.clone(),
+            text: None,
+            vector: None,
+            epoch: self.epoch,
+        }
+    }
+}
+
+struct MemoryJobResult {
+    conversation_id: i64,
+    upto_id: i64,
+    pool: MemoryPool,
+    model: String,
+    embedding_model: String,
+    text: Option<String>,
+    vector: Option<Vec<f32>>,
+    epoch: u64,
 }
 
 #[derive(Clone)]
@@ -918,7 +969,13 @@ struct ChatWindow {
     tts_idle_token: Arc<AtomicU64>,
     summary_notice: RefCell<Option<gtk::Box>>,
     compressing: Cell<bool>,
-    pending_generation: RefCell<Option<i64>>,
+    pending_generation: RefCell<Option<GenerationRequest>>,
+    memory_busy: Cell<bool>,
+    memory_pending: RefCell<Option<(i64, String)>>,
+    memory_token: Cell<u64>,
+    memory_epoch: Cell<u64>,
+    memory_lookup: Cell<bool>,
+    memory_warned: Cell<bool>,
     stt_session: RefCell<Option<crate::stt::SttSession>>,
     stt_prefix: RefCell<String>,
     stt_listening: Cell<bool>,
@@ -1231,6 +1288,12 @@ impl ChatWindow {
             summary_notice: RefCell::new(None),
             compressing: Cell::new(false),
             pending_generation: RefCell::new(None),
+            memory_busy: Cell::new(false),
+            memory_pending: RefCell::new(None),
+            memory_token: Cell::new(0),
+            memory_epoch: Cell::new(0),
+            memory_lookup: Cell::new(false),
+            memory_warned: Cell::new(false),
             stt_session: RefCell::new(None),
             stt_prefix: RefCell::new(String::new()),
             stt_listening: Cell::new(false),
@@ -1502,11 +1565,11 @@ impl ChatWindow {
     }
 
     fn apply_models(self: &Rc<Self>, models: Vec<ModelSummary>) {
-        let models: Vec<ModelSummary> = models
-            .into_iter()
-            .filter(ModelSummary::is_chat_model)
+        let names: Vec<String> = models
+            .iter()
+            .filter(|model| model.is_chat_model())
+            .map(|model| model.name.clone())
             .collect();
-        let names: Vec<String> = models.iter().map(|model| model.name.clone()).collect();
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         let list = gtk::StringList::new(&refs);
 
@@ -2242,7 +2305,10 @@ impl ChatWindow {
             self.load_conversation(conversation_id);
         }
         self.reload_sidebar();
-        self.start_generation(conversation_id);
+        self.start_generation(GenerationRequest {
+            conversation_id,
+            memory_context: None,
+        });
 
         if removed > 1 {
             self.toast("Regenerating; later turns were removed.");
@@ -3123,7 +3189,7 @@ impl ChatWindow {
     }
 
     fn send_message(self: &Rc<Self>) {
-        if self.active.borrow().is_some() {
+        if self.active.borrow().is_some() || self.memory_lookup.get() {
             return;
         }
 
@@ -3191,7 +3257,129 @@ impl ChatWindow {
 
         buffer.set_text("");
         self.reload_sidebar();
-        self.start_generation(conversation_id);
+        self.start_generation_with_memory(conversation_id, &text);
+    }
+
+    /// Look up relevant long-term notes before starting a reply. Embedding is
+    /// asynchronous, so the send button stays disabled until the request starts.
+    fn start_generation_with_memory(self: &Rc<Self>, conversation_id: i64, text: &str) {
+        let model = self.selected_model();
+        if model.is_empty() {
+            self.start_generation(GenerationRequest {
+                conversation_id,
+                memory_context: None,
+            });
+            return;
+        }
+        let Some(pool) = self.memory_pool_for(&model) else {
+            self.start_generation(GenerationRequest {
+                conversation_id,
+                memory_context: None,
+            });
+            return;
+        };
+
+        let embedding_model = self.embedding_model();
+        if !self.embedding_model_ready(&embedding_model) {
+            self.memory_warning(
+                "Long-term memory is paused: install an embedding model such as all-minilm.",
+            );
+            self.start_generation(GenerationRequest {
+                conversation_id,
+                memory_context: None,
+            });
+            return;
+        }
+
+        let entries = match self
+            .state
+            .store
+            .borrow()
+            .memory_entries(pool, &embedding_model)
+        {
+            Ok(entries) => entries,
+            Err(err) => {
+                tracing::warn!("memory: could not load notes: {err:#}");
+                Vec::new()
+            }
+        };
+        if entries.is_empty() {
+            tracing::debug!("memory: no notes in the {} pool", pool.as_str());
+            self.start_generation(GenerationRequest {
+                conversation_id,
+                memory_context: None,
+            });
+            return;
+        }
+
+        let (num_ctx, top_k) = {
+            let settings = self.state.settings.borrow();
+            (
+                settings.num_ctx.max(1),
+                settings.memory_retrieve_top_k.max(1) as usize,
+            )
+        };
+        let budget = memory::memory_context_budget(num_ctx);
+        let client = self.state.client.borrow().clone();
+        let query = text.to_string();
+        let model_for_check = model.clone();
+
+        self.memory_lookup.set(true);
+        self.send_button.set_sensitive(false);
+        let (tx, rx) = async_channel::bounded(1);
+        self.state.runtime.spawn(async move {
+            let result = async {
+                let mut vectors = client.embed(&embedding_model, &[query]).await?;
+                let Some(query_vector) = vectors.pop() else {
+                    anyhow::bail!("embedding response was empty");
+                };
+                let hits = memory::search_entries(
+                    &entries,
+                    &query_vector,
+                    top_k,
+                    memory::MEMORY_MIN_SCORE,
+                );
+                tracing::debug!(
+                    "memory: retrieved {} note(s) from the {} pool",
+                    hits.len(),
+                    pool.as_str()
+                );
+                Ok::<_, anyhow::Error>(memory::format_memory_context(&hits, budget))
+            }
+            .await;
+            let _ = tx.send(result).await;
+        });
+
+        let win = self.clone();
+        glib::spawn_future_local(async move {
+            let result = rx.recv().await;
+            win.memory_lookup.set(false);
+            win.send_button.set_sensitive(win.active.borrow().is_none());
+            if *win.current_id.borrow() != Some(conversation_id) {
+                return;
+            }
+            let memory_context = match result {
+                Ok(Ok(context)) => context,
+                Ok(Err(err)) => {
+                    win.memory_warning(&format!("Could not retrieve long-term memory: {err:#}"));
+                    None
+                }
+                Err(_) => None,
+            };
+            // If the model changed while the query was embedding, the notes may
+            // belong to the other pool. Drop them rather than crossing pools.
+            let memory_context = if win.selected_model() == model_for_check
+                && win.memory_pool_for(&model_for_check).is_some()
+            {
+                memory_context
+            } else {
+                None
+            };
+            win.start_generation(GenerationRequest {
+                conversation_id,
+                memory_context,
+            });
+        });
     }
 
     // ----- Context compression --------------------------------------------
@@ -3200,12 +3388,16 @@ impl ChatWindow {
         if self.compressing.get() {
             return;
         }
-        if let Some(plan) = self.compression_plan(conversation_id) {
+        if let Some(plan) = self.compression_plan(conversation_id, None) {
             self.start_compression(conversation_id, plan);
         }
     }
 
-    fn compression_plan(&self, conversation_id: i64) -> Option<CompressionPlan> {
+    fn compression_plan(
+        &self,
+        conversation_id: i64,
+        memory_context: Option<&str>,
+    ) -> Option<CompressionPlan> {
         let model = self.selected_model();
         if model.is_empty() {
             return None;
@@ -3234,6 +3426,7 @@ impl ChatWindow {
             model,
             num_ctx,
             &system_prompt,
+            memory_context,
             &messages,
             summary.as_ref(),
             used,
@@ -3282,7 +3475,13 @@ impl ChatWindow {
                 {
                     Ok(()) => {
                         succeeded = true;
-                        let estimated = self.estimated_request_tokens(conversation_id);
+                        let memory_context = self
+                            .pending_generation
+                            .borrow()
+                            .as_ref()
+                            .and_then(|request| request.memory_context.clone());
+                        let estimated = self
+                            .estimated_request_tokens(conversation_id, memory_context.as_deref());
                         let _ = self
                             .state
                             .store
@@ -3321,7 +3520,7 @@ impl ChatWindow {
         }
     }
 
-    fn estimated_request_tokens(&self, conversation_id: i64) -> u32 {
+    fn estimated_request_tokens(&self, conversation_id: i64, memory_context: Option<&str>) -> u32 {
         let (system_prompt, messages, summary) = {
             let settings = self.state.settings.borrow();
             let store = self.state.store.borrow();
@@ -3338,30 +3537,35 @@ impl ChatWindow {
                 .collect(),
             None => messages.iter().collect(),
         };
-        estimate_request_tokens(&system_prompt, summary.as_ref(), &kept)
+        estimate_request_tokens(&system_prompt, memory_context, summary.as_ref(), &kept)
     }
 
-    fn start_generation(self: &Rc<Self>, conversation_id: i64) {
+    fn start_generation(self: &Rc<Self>, request: GenerationRequest) {
         if self.active.borrow().is_some() {
             return;
         }
         if self.compressing.get() {
-            *self.pending_generation.borrow_mut() = Some(conversation_id);
+            *self.pending_generation.borrow_mut() = Some(request);
             return;
         }
-        if let Some(plan) = self.compression_plan(conversation_id) {
-            *self.pending_generation.borrow_mut() = Some(conversation_id);
+        let conversation_id = request.conversation_id;
+        if let Some(plan) =
+            self.compression_plan(conversation_id, request.memory_context.as_deref())
+        {
+            *self.pending_generation.borrow_mut() = Some(request);
             self.start_compression(conversation_id, plan);
             return;
         }
-        self.start_generation_now(conversation_id);
+        self.start_generation_now(request);
     }
 
-    fn start_generation_now(self: &Rc<Self>, conversation_id: i64) {
+    fn start_generation_now(self: &Rc<Self>, request: GenerationRequest) {
         if self.active.borrow().is_some() {
             return;
         }
 
+        let conversation_id = request.conversation_id;
+        let memory_context = request.memory_context;
         let model = self.selected_model();
         if model.is_empty() {
             self.toast("No chat model selected. Pull one with `ollama pull`, then refresh.");
@@ -3393,12 +3597,18 @@ impl ChatWindow {
             let settings = self.state.settings.borrow();
             (settings.temperature, settings.num_ctx.max(1))
         };
-        let messages = build_request_messages(&system_prompt, summary.as_ref(), &history, num_ctx);
+        let messages = build_request_messages(
+            &system_prompt,
+            memory_context.as_deref(),
+            summary.as_ref(),
+            &history,
+            num_ctx,
+        );
         let think = self.think_setting();
         tracing::debug!("chat: thinking setting {think:?}");
 
         let request = ChatRequest {
-            model,
+            model: model.clone(),
             messages,
             stream: true,
             options: Some(ChatOptions {
@@ -3427,6 +3637,7 @@ impl ChatWindow {
             view: assistant_view,
             content: content.clone(),
             conv_id: conversation_id,
+            model,
             stats: stats.clone(),
         });
 
@@ -3559,6 +3770,7 @@ impl ChatWindow {
         self.reload_sidebar();
         self.refresh_context_indicator();
         self.maybe_compress_context(active.conv_id);
+        self.schedule_memory(active.conv_id, active.model.clone());
         self.scroll_to_bottom();
 
         let streaming_speech = self.speech_stream_tx.borrow().is_some();
@@ -3597,6 +3809,409 @@ impl ChatWindow {
     fn set_streaming_ui(&self, streaming: bool) {
         self.send_button.set_sensitive(!streaming);
         self.stop_button.set_visible(streaming);
+    }
+
+    // ----- Long-term memory -----------------------------------------------
+
+    fn model_pool(&self, model: &str) -> MemoryPool {
+        let remote_host = self
+            .state
+            .models
+            .borrow()
+            .iter()
+            .find(|candidate| memory::model_names_match(&candidate.name, model))
+            .and_then(|candidate| candidate.remote_host.clone());
+        let base_url = self.state.settings.borrow().base_url.clone();
+        if memory::model_is_cloud(model, remote_host.as_deref(), &base_url) {
+            MemoryPool::Cloud
+        } else {
+            MemoryPool::Local
+        }
+    }
+
+    /// The pool to use for a model, if memory is enabled for that pool.
+    fn memory_pool_for(&self, model: &str) -> Option<MemoryPool> {
+        let pool = self.model_pool(model);
+        let enabled = {
+            let settings = self.state.settings.borrow();
+            match pool {
+                MemoryPool::Local => settings.memory_local_enabled,
+                MemoryPool::Cloud => settings.memory_cloud_enabled,
+            }
+        };
+        enabled.then_some(pool)
+    }
+
+    fn embedding_model(&self) -> String {
+        self.state
+            .settings
+            .borrow()
+            .memory_embedding_model
+            .trim()
+            .to_string()
+    }
+
+    /// When the model list is loaded, require a configured model that advertises
+    /// the embedding capability. Before the first refresh, let the request fail
+    /// naturally so memory is not blocked by a slow startup.
+    fn embedding_model_ready(&self, model: &str) -> bool {
+        if model.is_empty() {
+            return false;
+        }
+        let models = self.state.models.borrow();
+        if models.is_empty() {
+            return true;
+        }
+        models.iter().any(|candidate| {
+            memory::model_names_match(&candidate.name, model)
+                && candidate
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "embedding")
+        })
+    }
+
+    fn memory_warning(&self, message: &str) {
+        if self.memory_warned.replace(true) {
+            return;
+        }
+        tracing::warn!("memory: {message}");
+        self.toast(message);
+    }
+
+    /// Debounce memory extraction so rapid turns are batched and a reply that
+    /// is still streaming is not put under extra model load.
+    fn schedule_memory(self: &Rc<Self>, conversation_id: i64, model: String) {
+        let token = self.memory_token.get().wrapping_add(1);
+        self.memory_token.set(token);
+
+        let win = self.clone();
+        glib::timeout_add_local_once(
+            std::time::Duration::from_millis(MEMORY_DEBOUNCE_MS),
+            move || {
+                if win.memory_token.get() != token {
+                    return;
+                }
+                if win.active.borrow().is_some() {
+                    // The next completed reply will schedule again.
+                    return;
+                }
+                if win.compressing.get() {
+                    win.schedule_memory(conversation_id, model);
+                    return;
+                }
+                win.enqueue_memory(conversation_id, &model);
+            },
+        );
+    }
+
+    fn advance_memory_checkpoint(&self, conversation_id: i64) {
+        let latest = self
+            .state
+            .store
+            .borrow()
+            .latest_message_id(conversation_id)
+            .ok()
+            .flatten();
+        if let Some(upto_id) = latest {
+            let _ = self
+                .state
+                .store
+                .borrow()
+                .set_conversation_memory_checkpoint(conversation_id, upto_id);
+        }
+    }
+
+    fn enqueue_memory(self: &Rc<Self>, conversation_id: i64, model: &str) {
+        if model.is_empty() {
+            return;
+        }
+        if self.memory_busy.get() {
+            *self.memory_pending.borrow_mut() = Some((conversation_id, model.to_string()));
+            return;
+        }
+
+        let Some(pool) = self.memory_pool_for(model) else {
+            self.advance_memory_checkpoint(conversation_id);
+            return;
+        };
+
+        let embedding_model = self.embedding_model();
+        if !self.embedding_model_ready(&embedding_model) {
+            self.memory_warning(
+                "Long-term memory is paused: install an embedding model such as all-minilm.",
+            );
+            self.advance_memory_checkpoint(conversation_id);
+            return;
+        }
+
+        let checkpoint = match self
+            .state
+            .store
+            .borrow()
+            .conversation_memory_checkpoint(conversation_id)
+        {
+            Ok(checkpoint) => checkpoint,
+            Err(err) => {
+                tracing::warn!("memory: could not read checkpoint: {err:#}");
+                return;
+            }
+        };
+
+        let messages = match self
+            .state
+            .store
+            .borrow()
+            .messages_after(conversation_id, checkpoint)
+        {
+            Ok(messages) => messages,
+            Err(err) => {
+                tracing::warn!("memory: could not read messages: {err:#}");
+                return;
+            }
+        };
+        let Some(upto_id) = messages.last().map(|message| message.id) else {
+            return;
+        };
+
+        let num_ctx = self.state.settings.borrow().num_ctx.max(1);
+        let transcript_budget = ((num_ctx as f64 * MEMORY_TRANSCRIPT_RATIO) as u32).max(256);
+        let transcript = memory::build_transcript(&messages, transcript_budget);
+        if transcript.trim().is_empty() {
+            let _ = self
+                .state
+                .store
+                .borrow()
+                .set_conversation_memory_checkpoint(conversation_id, upto_id);
+            return;
+        }
+
+        let max_chars = self.state.settings.borrow().memory_summary_chars.max(200) as usize;
+        let job = MemoryJob {
+            conversation_id,
+            upto_id,
+            pool,
+            model: model.to_string(),
+            embedding_model,
+            transcript,
+            max_chars,
+            num_ctx,
+            epoch: self.memory_epoch.get(),
+        };
+        self.memory_busy.set(true);
+
+        let client = self.state.client.borrow().clone();
+        let (tx, rx) = async_channel::bounded(1);
+        self.state.runtime.spawn(async move {
+            let result = run_memory_job(client, job).await;
+            let _ = tx.send(result).await;
+        });
+
+        let win = self.clone();
+        glib::spawn_future_local(async move {
+            let result = rx.recv().await;
+            win.finish_memory_job(result);
+        });
+    }
+
+    fn finish_memory_job(
+        self: &Rc<Self>,
+        result: Result<anyhow::Result<MemoryJobResult>, async_channel::RecvError>,
+    ) {
+        self.memory_busy.set(false);
+
+        match result {
+            Ok(Ok(result)) => {
+                if result.epoch == self.memory_epoch.get() {
+                    let enabled = {
+                        let settings = self.state.settings.borrow();
+                        match result.pool {
+                            MemoryPool::Local => settings.memory_local_enabled,
+                            MemoryPool::Cloud => settings.memory_cloud_enabled,
+                        }
+                    };
+                    if enabled {
+                        self.store_memory_result(&result);
+                    } else {
+                        tracing::debug!("memory: pool disabled while a note was being extracted");
+                    }
+                } else {
+                    tracing::debug!("memory: discarded a note from before memory was cleared");
+                }
+                let _ = self
+                    .state
+                    .store
+                    .borrow()
+                    .set_conversation_memory_checkpoint(result.conversation_id, result.upto_id);
+            }
+            Ok(Err(err)) => {
+                self.memory_warning(&format!("Could not update long-term memory: {err:#}"));
+            }
+            Err(_) => {}
+        }
+
+        let pending = self.memory_pending.borrow_mut().take();
+        if let Some((next_conversation, next_model)) = pending {
+            self.enqueue_memory(next_conversation, &next_model);
+        }
+    }
+
+    fn store_memory_result(&self, result: &MemoryJobResult) {
+        let Some(text) = result.text.as_deref() else {
+            return;
+        };
+        let Some(vector) = result.vector.as_deref() else {
+            return;
+        };
+
+        let entries = match self
+            .state
+            .store
+            .borrow()
+            .memory_entries(result.pool, &result.embedding_model)
+        {
+            Ok(entries) => entries,
+            Err(err) => {
+                tracing::warn!("memory: could not load notes for dedup: {err:#}");
+                Vec::new()
+            }
+        };
+        let similarity = memory::max_similarity(&entries, vector);
+        if similarity >= memory::MEMORY_DUPLICATE_SCORE {
+            tracing::debug!(
+                "memory: skipped a near-duplicate note ({:.3} similarity)",
+                similarity
+            );
+            return;
+        }
+
+        match self.state.store.borrow().add_memory(
+            result.pool,
+            &result.embedding_model,
+            &result.model,
+            Some(result.conversation_id),
+            text,
+            vector,
+        ) {
+            Ok(true) => tracing::info!(
+                "memory: saved a {} note from {} ({} chars)",
+                result.pool.as_str(),
+                result.model,
+                text.chars().count()
+            ),
+            Ok(false) => tracing::debug!("memory: note already stored"),
+            Err(err) => tracing::warn!("memory: could not save note: {err:#}"),
+        }
+    }
+
+    fn clear_memory_pool(self: &Rc<Self>, pool: Option<MemoryPool>, row: &adw::ActionRow) {
+        self.memory_epoch
+            .set(self.memory_epoch.get().wrapping_add(1));
+        match self.state.store.borrow().clear_memories(pool) {
+            Ok(count) => {
+                self.update_memory_counts_row(row);
+                let message = match pool {
+                    Some(MemoryPool::Local) => {
+                        format!("Cleared {count} local long-term memories.")
+                    }
+                    Some(MemoryPool::Cloud) => {
+                        format!("Cleared {count} cloud long-term memories.")
+                    }
+                    None => format!("Cleared {count} long-term memories."),
+                };
+                self.toast(&message);
+            }
+            Err(err) => self.toast(&format!("Could not clear long-term memory: {err:#}")),
+        }
+    }
+
+    fn update_memory_counts_row(&self, row: &adw::ActionRow) {
+        let (local, cloud) = self.state.store.borrow().memory_counts().unwrap_or((0, 0));
+        row.set_subtitle(&format!(
+            "{} local note{}, {} cloud note{}",
+            local,
+            if local == 1 { "" } else { "s" },
+            cloud,
+            if cloud == 1 { "" } else { "s" }
+        ));
+    }
+
+    fn show_clear_memory_dialog(self: &Rc<Self>, row: &adw::ActionRow) {
+        let (local, cloud) = self.state.store.borrow().memory_counts().unwrap_or((0, 0));
+        if local == 0 && cloud == 0 {
+            self.toast("Long-term memory is already empty.");
+            return;
+        }
+
+        let dialog = gtk::Window::builder()
+            .title("Clear long-term memory")
+            .modal(true)
+            .default_width(420)
+            .build();
+        dialog.set_transient_for(Some(&self.window));
+
+        let header = gtk::HeaderBar::new();
+        dialog.set_titlebar(Some(&header));
+
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        content.set_margin_top(18);
+        content.set_margin_bottom(18);
+        content.set_margin_start(18);
+        content.set_margin_end(18);
+
+        let label = gtk::Label::new(Some("This permanently deletes the selected memory notes."));
+        label.set_wrap(true);
+        label.set_xalign(0.0);
+        content.append(&label);
+
+        let buttons = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        content.append(&buttons);
+
+        let add_clear_button = |label: &str, pool: Option<MemoryPool>| {
+            let button = gtk::Button::with_label(label);
+            button.add_css_class("destructive-action");
+            let win = self.clone();
+            let row = row.clone();
+            let dialog = dialog.clone();
+            button.connect_clicked(move |_| {
+                win.clear_memory_pool(pool, &row);
+                dialog.close();
+            });
+            buttons.append(&button);
+        };
+
+        if local > 0 && cloud > 0 {
+            add_clear_button("Clear all", None);
+        }
+        if cloud > 0 {
+            add_clear_button(&format!("Clear cloud ({cloud})"), Some(MemoryPool::Cloud));
+        }
+        if local > 0 {
+            add_clear_button(&format!("Clear local ({local})"), Some(MemoryPool::Local));
+        }
+
+        let cancel = gtk::Button::with_label("Cancel");
+        cancel.connect_clicked({
+            let dialog = dialog.clone();
+            move |_| dialog.close()
+        });
+        buttons.append(&cancel);
+
+        let controller = gtk::EventControllerKey::new();
+        let dialog_for_key = dialog.clone();
+        controller.connect_key_pressed(move |_, key, _, _| {
+            if key == gdk::Key::Escape {
+                dialog_for_key.close();
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        dialog.add_controller(controller);
+
+        dialog.set_child(Some(&content));
+        dialog.present();
+        cancel.grab_focus();
     }
 
     // ----- Settings / theme / misc ----------------------------------------
@@ -3905,6 +4520,9 @@ impl ChatWindow {
 
     fn show_settings(self: &Rc<Self>) {
         let page = adw::PreferencesPage::new();
+        let prefs_dialog = adw::PreferencesDialog::builder()
+            .title("Preferences")
+            .build();
 
         let connection = adw::PreferencesGroup::new();
         connection.set_title("Connection");
@@ -3978,6 +4596,162 @@ impl ChatWindow {
         generation.add(&context_row);
 
         page.add(&generation);
+
+        let memory_group = adw::PreferencesGroup::new();
+        memory_group.set_title("Long-term memory");
+        memory_group.set_description(Some(
+            "Stored locally in the chat database. Local and cloud models use separate pools.",
+        ));
+
+        let memory_local_row = adw::SwitchRow::new();
+        memory_local_row.set_title("Use memory with local models");
+        memory_local_row.set_subtitle("Read and write long-term memory with local models");
+        memory_local_row.set_active(self.state.settings.borrow().memory_local_enabled);
+        memory_group.add(&memory_local_row);
+
+        let memory_cloud_row = adw::SwitchRow::new();
+        memory_cloud_row.set_title("Use memory with cloud models");
+        memory_cloud_row.set_subtitle("Read and write long-term memory with cloud models");
+        memory_cloud_row.set_active(self.state.settings.borrow().memory_cloud_enabled);
+        memory_group.add(&memory_cloud_row);
+
+        let mut embedding_names: Vec<String> = self
+            .state
+            .models
+            .borrow()
+            .iter()
+            .filter(|model| {
+                model
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "embedding")
+            })
+            .map(|model| model.name.clone())
+            .collect();
+        embedding_names.sort();
+        embedding_names.dedup();
+        let configured_embedding = self.state.settings.borrow().memory_embedding_model.clone();
+        if let Some(name) = embedding_names
+            .iter()
+            .find(|name| memory::model_names_match(name, &configured_embedding))
+            .cloned()
+        {
+            if name != configured_embedding {
+                self.state.settings.borrow_mut().memory_embedding_model = name;
+                self.save_settings();
+            }
+        } else if !configured_embedding.is_empty() {
+            embedding_names.insert(0, configured_embedding);
+        }
+
+        let memory_embedding_row = adw::ComboRow::new();
+        memory_embedding_row.set_title("Embedding model");
+        memory_embedding_row.set_subtitle(if embedding_names.is_empty() {
+            "No embedding model installed. Pull one with `ollama pull all-minilm`."
+        } else {
+            "Installed embedding-capable model used for memory text. Changing it hides notes from the previous model."
+        });
+        let embedding_refs: Vec<&str> = embedding_names.iter().map(String::as_str).collect();
+        let embedding_list = gtk::StringList::new(&embedding_refs);
+        memory_embedding_row.set_model(Some(&embedding_list));
+        if let Some(index) = embedding_names
+            .iter()
+            .position(|name| memory::model_names_match(name, &self.embedding_model()))
+        {
+            memory_embedding_row.set_selected(index as u32);
+        }
+        memory_group.add(&memory_embedding_row);
+
+        let memory_top_row = adw::SpinRow::new(
+            Some(&gtk::Adjustment::new(
+                self.state.settings.borrow().memory_retrieve_top_k as f64,
+                1.0,
+                20.0,
+                1.0,
+                4.0,
+                0.0,
+            )),
+            1.0,
+            0,
+        );
+        memory_top_row.set_title("Retrieved memories");
+        memory_top_row.set_subtitle("Maximum relevant notes included in each request");
+        memory_group.add(&memory_top_row);
+
+        let memory_length_row = adw::SpinRow::new(
+            Some(&gtk::Adjustment::new(
+                self.state.settings.borrow().memory_summary_chars as f64,
+                200.0,
+                10_000.0,
+                100.0,
+                500.0,
+                0.0,
+            )),
+            100.0,
+            0,
+        );
+        memory_length_row.set_title("Maximum note length");
+        memory_length_row.set_subtitle("Characters retained in one memory note");
+        memory_group.add(&memory_length_row);
+
+        let memory_clear_row = adw::ActionRow::new();
+        memory_clear_row.set_title("Clear long-term memory");
+        self.update_memory_counts_row(&memory_clear_row);
+        let memory_clear_button = gtk::Button::with_label("Clear…");
+        memory_clear_button.add_css_class("flat");
+        memory_clear_button.set_valign(gtk::Align::Center);
+        memory_clear_row.add_suffix(&memory_clear_button);
+        memory_group.add(&memory_clear_row);
+
+        page.add(&memory_group);
+
+        {
+            let win = self.clone();
+            memory_local_row.connect_active_notify(move |row| {
+                win.state.settings.borrow_mut().memory_local_enabled = row.is_active();
+                win.save_settings();
+            });
+        }
+        {
+            let win = self.clone();
+            memory_cloud_row.connect_active_notify(move |row| {
+                win.state.settings.borrow_mut().memory_cloud_enabled = row.is_active();
+                win.save_settings();
+            });
+        }
+        {
+            let win = self.clone();
+            let names = embedding_names.clone();
+            memory_embedding_row.connect_selected_notify(move |row| {
+                let index = row.selected() as usize;
+                if let Some(name) = names.get(index) {
+                    win.state.settings.borrow_mut().memory_embedding_model = name.clone();
+                    win.save_settings();
+                }
+            });
+        }
+        {
+            let win = self.clone();
+            memory_top_row.connect_value_notify(move |row| {
+                win.state.settings.borrow_mut().memory_retrieve_top_k = row.value().max(1.0) as u32;
+                win.save_settings();
+            });
+        }
+        {
+            let win = self.clone();
+            memory_length_row.connect_value_notify(move |row| {
+                win.state.settings.borrow_mut().memory_summary_chars =
+                    row.value().max(200.0) as u32;
+                win.save_settings();
+            });
+        }
+        {
+            let win = self.clone();
+            let row = memory_clear_row.clone();
+            memory_clear_button.connect_clicked(move |_| {
+                win.show_clear_memory_dialog(&row);
+            });
+        }
 
         let speech = adw::PreferencesGroup::new();
         speech.set_title("Speech");
@@ -4557,11 +5331,8 @@ impl ChatWindow {
             });
         }
 
-        let dialog = adw::PreferencesDialog::builder()
-            .title("Preferences")
-            .build();
-        dialog.add(&page);
-        dialog.present(Some(&self.window));
+        prefs_dialog.add(&page);
+        prefs_dialog.present(Some(&self.window));
     }
 
     fn show_about(&self) {
@@ -5028,10 +5799,16 @@ fn context_needs_compression(used: u32, num_ctx: u32) -> bool {
 
 fn estimate_request_tokens(
     system_prompt: &str,
+    memory_context: Option<&str>,
     summary: Option<&StoredSummary>,
     messages: &[&StoredMessage],
 ) -> u32 {
     let mut total = estimate_tokens(system_prompt);
+    if let Some(memory_context) = memory_context {
+        total = total
+            .saturating_add(estimate_tokens(memory_context))
+            .saturating_add(4);
+    }
     if let Some(summary) = summary {
         total = total
             .saturating_add(estimate_tokens(&summary.text))
@@ -5106,6 +5883,7 @@ fn summary_chunk_budget(num_ctx: u32, summary_budget: u32) -> u32 {
 
 fn build_request_messages(
     system_prompt: &str,
+    memory_context: Option<&str>,
     summary: Option<&StoredSummary>,
     history: &[StoredMessage],
     num_ctx: u32,
@@ -5127,7 +5905,7 @@ fn build_request_messages(
         .unwrap_or_else(|| kept.len().saturating_sub(1));
     let mut start = 0;
     while start < min_start
-        && estimate_request_tokens(system_prompt, summary, &kept[start..]) > budget
+        && estimate_request_tokens(system_prompt, memory_context, summary, &kept[start..]) > budget
     {
         start += 1;
         while start < min_start && kept[start].role != "user" {
@@ -5139,6 +5917,9 @@ fn build_request_messages(
     let mut messages = Vec::new();
     if !system_prompt.trim().is_empty() {
         messages.push(ChatMessage::new("system", system_prompt));
+    }
+    if let Some(memory_context) = memory_context.filter(|context| !context.trim().is_empty()) {
+        messages.push(ChatMessage::new("system", memory_context));
     }
     if let Some(summary) = summary {
         messages.push(ChatMessage::new(
@@ -5157,6 +5938,7 @@ fn build_compression_plan(
     model: String,
     num_ctx: u32,
     system_prompt: &str,
+    memory_context: Option<&str>,
     messages: &[StoredMessage],
     summary: Option<&StoredSummary>,
     used: Option<u32>,
@@ -5182,7 +5964,7 @@ fn build_compression_plan(
             .collect(),
         None => messages.iter().collect(),
     };
-    let estimated = estimate_request_tokens(system_prompt, summary, &relevant);
+    let estimated = estimate_request_tokens(system_prompt, memory_context, summary, &relevant);
     let used = used.map_or(estimated, |used| used.max(estimated));
     if !context_needs_compression(used, num_ctx) {
         return None;
@@ -5201,6 +5983,58 @@ fn build_compression_plan(
         upto_id: older.last().map(|message| message.id)?,
         chunks,
     })
+}
+
+async fn run_memory_job(client: OllamaClient, job: MemoryJob) -> anyhow::Result<MemoryJobResult> {
+    // Memory extraction wants the notes, not the model's reasoning. Ask
+    // thinking models for the cheapest mode; leave non-thinking models alone.
+    let think = match client.model_thinking(&job.model).await {
+        Ok(Some(control)) if control.is_level_only() => control
+            .lowest_level()
+            .map(|level| ThinkSetting::Level(level.to_string())),
+        Ok(Some(_)) => Some(ThinkSetting::Bool(false)),
+        _ => None,
+    };
+
+    let request = ChatRequest {
+        model: job.model.clone(),
+        messages: vec![
+            ChatMessage::new("system", memory::summary_prompt(job.max_chars)),
+            ChatMessage::new("user", format!("Transcript:\n{}", job.transcript)),
+        ],
+        stream: false,
+        options: Some(ChatOptions {
+            temperature: Some(MEMORY_TEMPERATURE),
+            num_ctx: Some(job.num_ctx),
+            // Keep the output inside the context window on small `num_ctx`
+            // settings while allowing the configured note length otherwise.
+            num_predict: Some(
+                ((job.max_chars / 3).max(64) as u32).min((job.num_ctx / 4).max(64)) as i64,
+            ),
+            ..Default::default()
+        }),
+        keep_alive: Some("5m".to_string()),
+        think,
+    };
+
+    let reply = client.chat_once(&request).await?;
+    let text = memory::sanitize_note(reply.content.trim(), job.max_chars);
+    let mut result = job.empty_result();
+    if text.chars().count() < memory::MEMORY_MIN_SUMMARY_CHARS {
+        return Ok(result);
+    }
+
+    let mut vectors = client
+        .embed(&job.embedding_model, std::slice::from_ref(&text))
+        .await?;
+    let vector = vectors.pop().filter(|vector| !vector.is_empty());
+    if vector.is_none() {
+        anyhow::bail!("embedding response was empty");
+    }
+
+    result.text = Some(text);
+    result.vector = vector;
+    Ok(result)
 }
 
 async fn run_compression(
@@ -5692,7 +6526,7 @@ mod tests {
             tokens: 8,
         };
 
-        let request = build_request_messages("Be concise.", Some(&summary), &history, 8192);
+        let request = build_request_messages("Be concise.", None, Some(&summary), &history, 8192);
         assert_eq!(request.len(), 4);
         assert_eq!(request[0].role, "system");
         assert_eq!(request[0].content, "Be concise.");
@@ -5700,6 +6534,23 @@ mod tests {
         assert!(request[1].content.contains("old things"));
         assert_eq!(request[2].content, "new question");
         assert_eq!(request[3].content, "new answer");
+    }
+
+    #[test]
+    fn builds_a_request_with_memory_context() {
+        let history = vec![stored_message(1, "user", "new question")];
+        let request = build_request_messages(
+            "Be concise.",
+            Some("Relevant long-term memory:\n- likes dark mode"),
+            None,
+            &history,
+            8192,
+        );
+        assert_eq!(request.len(), 3);
+        assert_eq!(request[0].content, "Be concise.");
+        assert_eq!(request[1].role, "system");
+        assert!(request[1].content.contains("dark mode"));
+        assert_eq!(request[2].content, "new question");
     }
 
     #[test]
@@ -5728,7 +6579,7 @@ mod tests {
             })
             .collect();
 
-        let request = build_request_messages("", None, &history, 512);
+        let request = build_request_messages("", None, None, &history, 512);
         assert_eq!(request.iter().filter(|m| m.role == "user").count(), 1);
         assert_eq!(request.last().map(|m| m.role.as_str()), Some("assistant"));
     }
@@ -5749,15 +6600,22 @@ mod tests {
             ));
         }
 
-        let plan = build_compression_plan("model".into(), 8192, "", &messages, None, Some(8_500))
-            .expect("compression plan");
+        let plan =
+            build_compression_plan("model".into(), 8192, "", None, &messages, None, Some(8_500))
+                .expect("compression plan");
         assert_eq!(plan.upto_id, 4);
         assert!(!plan.chunks.is_empty());
 
-        assert!(
-            build_compression_plan("model".into(), 8192, "", &messages, None, Some(6_000))
-                .is_none()
-        );
+        assert!(build_compression_plan(
+            "model".into(),
+            8192,
+            "",
+            None,
+            &messages,
+            None,
+            Some(6_000)
+        )
+        .is_none());
 
         let summary = StoredSummary {
             text: "old".into(),
@@ -5768,6 +6626,7 @@ mod tests {
             "model".into(),
             8192,
             "",
+            None,
             &messages,
             Some(&summary),
             Some(9_000),
@@ -5776,7 +6635,8 @@ mod tests {
 
         let short = &messages[..8];
         assert!(
-            build_compression_plan("model".into(), 8192, "", short, None, Some(9_000)).is_none()
+            build_compression_plan("model".into(), 8192, "", None, short, None, Some(9_000))
+                .is_none()
         );
     }
 

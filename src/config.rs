@@ -21,6 +21,16 @@ pub struct Settings {
     pub sidebar_visible: bool,
     /// Keep the app running in the system tray when the window is closed
     pub run_in_background: bool,
+    /// Read and write long-term memory with local models
+    pub memory_local_enabled: bool,
+    /// Read and write long-term memory with cloud models
+    pub memory_cloud_enabled: bool,
+    /// Ollama embedding model used for long-term memory
+    pub memory_embedding_model: String,
+    /// Maximum number of relevant memories included in a request
+    pub memory_retrieve_top_k: u32,
+    /// Maximum characters retained in one memory note
+    pub memory_summary_chars: u32,
     /// "auto", "paradee" or "builtin"
     pub tts_backend: String,
     /// Language code such as "en-us" or "es"
@@ -59,6 +69,11 @@ impl Default for Settings {
             theme: "system".to_string(),
             sidebar_visible: true,
             run_in_background: false,
+            memory_local_enabled: true,
+            memory_cloud_enabled: false,
+            memory_embedding_model: "all-minilm".to_string(),
+            memory_retrieve_top_k: 4,
+            memory_summary_chars: 1200,
             tts_backend: "auto".to_string(),
             tts_language: "en-us".to_string(),
             tts_voice: "af_heart".to_string(),

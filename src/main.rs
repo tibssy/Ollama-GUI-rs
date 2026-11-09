@@ -1,5 +1,6 @@
 mod api;
 mod config;
+mod memory;
 mod paradee;
 mod parakeet;
 mod store;

@@ -26,6 +26,8 @@ The MVP is working:
 - Collapsible sidebar with a header toggle, menu item, and Ctrl+B shortcut
 - Optional background mode with a system tray icon, live-state indicator, and
   tray actions for window visibility, live conversation, and quit
+- Optional long-term memory with separate local and cloud pools, an embedding
+  model, and a clear action
 - Automatic context compression: at 85% usage, older turns are summarized while
   the last five turns stay verbatim
 - Optional thinking mode for reasoning models, with on/off or low/medium/high
@@ -37,8 +39,8 @@ The MVP is working:
 - Capability badges for the selected model (completion, vision, tools, thinking,
   audio, speech)
 - Settings for server URL, API key, system prompt, temperature, context size,
-  thinking, theme, text-to-speech, auto-read, speech language, voice, dictation,
-  and VAD timings
+  thinking, long-term memory, theme, text-to-speech, auto-read, speech language,
+  voice, dictation, and VAD timings
 - Native markdown rendering: headings, bold/italic/strikethrough, lists, quotes,
   tables, links, inline code, and fenced code blocks with copy buttons
 - Code blocks use GtkSourceView and syntax highlighting when language specs are installed
@@ -178,6 +180,34 @@ An **Earlier messages summarized** row above the conversation opens the current
 summary. If summarization fails, the next request falls back to the most recent
 turns within the context budget.
 
+## Long-term memory
+
+Long-term memory is optional and split into two independent pools:
+
+- **Local models** read and write the local pool. Enabled by default.
+- **Cloud models** read and write the cloud pool. Disabled by default.
+
+A model is treated as cloud when Ollama reports a `remote_host` for it, when its
+name ends in `:cloud` or `-cloud`, or when the server URL is not a loopback
+address. Keep both switches off to disable memory entirely.
+
+After each reply the app asks the conversation model for compact notes about
+durable facts and explicit preferences. The notes are embedded with the
+configured **Embedding model** (default `all-minilm`; pull it with
+`ollama pull all-minilm`) and stored in SQLite. Notes are deduplicated by text
+and cosine similarity. Before each request the user's message is embedded, the
+most relevant notes from the matching pool are retrieved, and a small system
+message is added. The memory block is capped at about 8% of the context window.
+
+Only the user's messages are used for extraction, so the assistant's suggestions
+and advice are not stored as user preferences. Changing the **Embedding model**
+keeps existing notes but hides them from retrieval until you switch back or
+clear memory. **Clear long-term memory** offers per-pool actions and shows the
+current note counts.
+
+If no embedding model is installed, memory is skipped with a one-time warning
+and chat continues normally.
+
 ## Sidebar
 
 Use the sidebar button in the header, **Toggle Sidebar** in the main menu, or
@@ -291,7 +321,8 @@ src/
   config.rs          JSON settings in the XDG config dir
   api/mod.rs         thin Ollama client + streaming worker
   api/stream.rs      incremental NDJSON parser (unit tested)
-  store/mod.rs       SQLite schema, migrations, conversation CRUD
+  store/mod.rs       SQLite schema, migrations, conversation and memory CRUD
+  memory.rs          long-term note extraction, vector search, cloud detection
   paradee.rs         Paradee download, eSpeak G2P conversion, ONNX inference
   whistle.rs         Whistle pack parser, mel frontend, engram cache,
                      ONNX encoder/decoder inference
