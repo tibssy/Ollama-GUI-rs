@@ -764,6 +764,7 @@ struct ChatWindow {
     title_widget: adw::WindowTitle,
     main_stack: gtk::Stack,
     messages_box: gtk::Box,
+    messages_clamp: adw::Clamp,
     messages_scroll: gtk::ScrolledWindow,
     input: gtk::TextView,
     send_button: gtk::Button,
@@ -776,6 +777,10 @@ struct ChatWindow {
     menu_button: gtk::MenuButton,
     split_view: adw::OverlaySplitView,
     sidebar_button: gtk::Button,
+    sidebar_animating: Cell<bool>,
+    sidebar_animation_token: Cell<u64>,
+    last_split_width: Cell<i32>,
+    sidebar_width_stale: Cell<bool>,
 
     current_id: RefCell<Option<i64>>,
     active: RefCell<Option<ActiveStream>>,
@@ -889,7 +894,7 @@ impl ChatWindow {
 
         let clamp = adw::Clamp::builder()
             .maximum_size(900)
-            .tightening_threshold(600)
+            .tightening_threshold(900)
             .child(&messages_box)
             .build();
 
@@ -1030,6 +1035,7 @@ impl ChatWindow {
             title_widget,
             main_stack,
             messages_box,
+            messages_clamp: clamp,
             messages_scroll,
             input,
             send_button,
@@ -1042,6 +1048,10 @@ impl ChatWindow {
             menu_button,
             split_view: split,
             sidebar_button,
+            sidebar_animating: Cell::new(false),
+            sidebar_animation_token: Cell::new(0),
+            last_split_width: Cell::new(0),
+            sidebar_width_stale: Cell::new(false),
             current_id: RefCell::new(None),
             active: RefCell::new(None),
             speech_buttons: RefCell::new(Vec::new()),
@@ -1068,6 +1078,13 @@ impl ChatWindow {
 
     fn wire(self: &Rc<Self>) {
         self.sync_sidebar_visibility(self.split_view.shows_sidebar());
+        {
+            let win = self.clone();
+            glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
+                win.update_message_width();
+                glib::ControlFlow::Continue
+            });
+        }
         {
             let win = self.clone();
             self.sidebar_button
@@ -3222,12 +3239,112 @@ impl ChatWindow {
         }
     }
 
-    fn toggle_sidebar(&self) {
-        self.split_view
-            .set_show_sidebar(!self.split_view.shows_sidebar());
+    fn toggle_sidebar(self: &Rc<Self>) {
+        let showing = !self.split_view.shows_sidebar();
+        tracing::debug!(
+            "sidebar: showing={showing} total={} clamp={} scroll={} messages={}",
+            self.split_view.width(),
+            self.messages_clamp.maximum_size(),
+            self.messages_scroll.width(),
+            self.messages_box.width()
+        );
+
+        if !showing {
+            // Lock the message column to its current width before the sidebar
+            // animates away, so hiding does not re-wrap every message.
+            let width = self.message_column_width();
+            if width > 0 {
+                let limit = width.clamp(320, 900);
+                self.messages_clamp.set_maximum_size(limit);
+                self.messages_clamp.set_tightening_threshold(limit);
+            }
+        }
+
+        self.sidebar_animating.set(true);
+        self.split_view.set_show_sidebar(showing);
+
+        let token = self.sidebar_animation_token.get().wrapping_add(1);
+        self.sidebar_animation_token.set(token);
+        let win = self.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(1000), move || {
+            if win.sidebar_animation_token.get() != token {
+                return;
+            }
+            win.sidebar_animating.set(false);
+            win.update_message_width();
+        });
+    }
+
+    /// Keep the chat column at the width it has when the sidebar is visible, so
+    /// toggling the sidebar does not re-wrap every message while it animates.
+    fn update_message_width(&self) {
+        if self.sidebar_animating.get() {
+            return;
+        }
+
+        let total = self.split_view.width();
+        if total <= 0 {
+            return;
+        }
+        let previous_total = self.last_split_width.replace(total);
+        let resized = previous_total != 0 && previous_total != total;
+
+        if !self.split_view.shows_sidebar() {
+            if resized {
+                // The hidden width will be recalculated the next time the
+                // sidebar is shown.
+                self.sidebar_width_stale.set(true);
+            }
+            if self.messages_clamp.maximum_size() == 900 {
+                // The app started with the sidebar hidden. Estimate the width
+                // the content area will have once it is shown.
+                let fraction = self.split_view.sidebar_width_fraction();
+                let min = self.split_view.min_sidebar_width();
+                let max = self.split_view.max_sidebar_width();
+                let sidebar = (total as f64 * fraction).clamp(min, max);
+                let estimate = (total as f64 - sidebar - 40.0).clamp(320.0, 900.0) as i32;
+                self.messages_clamp.set_maximum_size(estimate);
+                self.messages_clamp.set_tightening_threshold(estimate);
+            }
+            return;
+        }
+
+        if resized || self.sidebar_width_stale.replace(false) {
+            // Let the clamp use the new available width; the next tick locks it
+            // to the actual content width.
+            self.messages_clamp.set_maximum_size(900);
+            self.messages_clamp.set_tightening_threshold(900);
+            return;
+        }
+
+        let width = self.message_column_width();
+        if width <= 0 {
+            return;
+        }
+
+        let limit = width.clamp(320, 900);
+        if self.messages_clamp.maximum_size() != limit {
+            tracing::debug!(
+                "sidebar: clamp {limit} (box width={} total={})",
+                self.messages_box.width(),
+                total
+            );
+            self.messages_clamp.set_maximum_size(limit);
+            self.messages_clamp.set_tightening_threshold(limit);
+        }
+    }
+
+    fn message_column_width(&self) -> i32 {
+        let width = self.messages_box.width();
+        if width <= 0 {
+            return 0;
+        }
+        let margins = self.messages_box.margin_start() + self.messages_box.margin_end();
+        width + margins
     }
 
     fn sync_sidebar_visibility(&self, visible: bool) {
+        tracing::debug!("sidebar: visibility changed to {visible}");
         self.sidebar_button.set_tooltip_text(Some(if visible {
             "Hide sidebar (Ctrl+B)"
         } else {

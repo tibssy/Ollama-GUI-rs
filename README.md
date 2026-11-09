@@ -176,7 +176,8 @@ turns within the context budget.
 
 Use the sidebar button in the header, **Toggle Sidebar** in the main menu, or
 Ctrl+B to hide or show the conversation list. The choice is remembered between
-sessions.
+sessions. The chat column keeps its width when the sidebar is hidden, so
+toggling the sidebar does not re-wrap long conversations.
 
 ## Live voice conversation
 
