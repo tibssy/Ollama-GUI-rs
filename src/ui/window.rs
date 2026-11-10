@@ -982,6 +982,8 @@ struct ChatWindow {
     current_id: RefCell<Option<i64>>,
     active: RefCell<Option<ActiveStream>>,
     speech_buttons: RefCell<Vec<gtk::Button>>,
+    message_pictures: RefCell<Vec<glib::WeakRef<gtk::Picture>>>,
+    last_image_column: Cell<i32>,
     speech_player: RefCell<Option<async_channel::Sender<PlaybackChunk>>>,
     speech_active: Cell<bool>,
     speech_generation: Arc<AtomicU64>,
@@ -1343,6 +1345,8 @@ impl ChatWindow {
             current_id: RefCell::new(None),
             active: RefCell::new(None),
             speech_buttons: RefCell::new(Vec::new()),
+            message_pictures: RefCell::new(Vec::new()),
+            last_image_column: Cell::new(0),
             speech_player: RefCell::new(None),
             speech_active: Cell::new(false),
             speech_generation: Arc::new(AtomicU64::new(0)),
@@ -2110,6 +2114,7 @@ impl ChatWindow {
         }
         *self.summary_notice.borrow_mut() = None;
         self.speech_buttons.borrow_mut().clear();
+        self.message_pictures.borrow_mut().clear();
     }
 
     fn add_message_widget(
@@ -2174,14 +2179,27 @@ impl ChatWindow {
         });
 
         if !images.is_empty() {
+            let column = if self.message_column_width() > 0 {
+                self.message_column_width()
+            } else {
+                900
+            };
             for image in images {
-                let picture = image::message_picture(image, self.window.upcast_ref());
-                let frame = gtk::AspectFrame::new(0.5, 0.5, 4.0 / 3.0, false);
-                frame.set_child(Some(&picture));
-                frame.set_hexpand(true);
-                frame.set_halign(gtk::Align::Fill);
-                frame.set_valign(gtk::Align::Start);
-                bubble.append(&frame);
+                let widget = image::message_picture(image, self.window.upcast_ref());
+                widget.set_halign(gtk::Align::Fill);
+                widget.set_valign(gtk::Align::Start);
+                bubble.append(&widget);
+
+                let Some(picture) = widget.downcast_ref::<gtk::Picture>() else {
+                    continue;
+                };
+                fit_message_picture(picture, column);
+                self.message_pictures.borrow_mut().push(picture.downgrade());
+
+                // Once the row is allocated, match the card exactly to the
+                // bubble width instead of the estimate.
+                let picture = picture.clone();
+                glib::idle_add_local_once(move || fit_message_picture(&picture, column));
             }
         }
 
@@ -4868,6 +4886,20 @@ impl ChatWindow {
             self.messages_clamp.set_maximum_size(limit);
             self.messages_clamp.set_tightening_threshold(limit);
         }
+        if self.last_image_column.replace(limit) != limit {
+            // Fit after the new width has been allocated, otherwise the
+            // pictures still report the previous card width.
+            let pictures: Vec<gtk::Picture> = {
+                let mut refs = self.message_pictures.borrow_mut();
+                refs.retain(|weak| weak.upgrade().is_some());
+                refs.iter().filter_map(|weak| weak.upgrade()).collect()
+            };
+            glib::idle_add_local_once(move || {
+                for picture in pictures {
+                    fit_message_picture(&picture, limit);
+                }
+            });
+        }
     }
 
     fn message_column_width(&self) -> i32 {
@@ -6330,6 +6362,17 @@ fn title_from(text: &str) -> String {
     } else {
         title
     }
+}
+
+/// Size a message image to a 4:3 card that matches its bubble width.
+fn fit_message_picture(picture: &gtk::Picture, column: i32) {
+    let width = if picture.width() > 0 {
+        picture.width()
+    } else {
+        (column / 2 - 28).max(80)
+    };
+    let height = ((width as f64) * 0.75).round() as i32;
+    picture.set_size_request(-1, height.max(60));
 }
 
 fn group_digits(value: u32) -> String {
