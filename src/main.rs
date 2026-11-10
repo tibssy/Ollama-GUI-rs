@@ -1,5 +1,6 @@
 mod api;
 mod config;
+mod feedback;
 mod memory;
 mod paradee;
 mod parakeet;
@@ -7,6 +8,7 @@ mod store;
 mod stt;
 mod tray;
 mod ui;
+mod wake;
 mod whistle;
 
 use gtk::gio;

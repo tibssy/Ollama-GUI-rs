@@ -53,6 +53,14 @@ pub struct Settings {
     pub stt_end_silence_ms: u32,
     /// Send the transcript to the model automatically
     pub stt_autosend: bool,
+    /// Listen for a wake word that starts live conversation
+    pub wake_enabled: bool,
+    /// Wake word phrase from the bundled WakeHuBERT catalog
+    pub wake_word: String,
+    /// Detection threshold; 0 uses the word's calibrated default
+    pub wake_threshold: f32,
+    /// Seconds a wake-triggered session waits for speech before stopping
+    pub wake_listen_timeout_secs: u32,
 }
 
 impl Default for Settings {
@@ -85,6 +93,10 @@ impl Default for Settings {
             stt_start_timeout_secs: 5,
             stt_end_silence_ms: 1000,
             stt_autosend: false,
+            wake_enabled: false,
+            wake_word: "hey jarvis".to_string(),
+            wake_threshold: 0.0,
+            wake_listen_timeout_secs: 30,
         }
     }
 }

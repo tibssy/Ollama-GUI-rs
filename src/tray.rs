@@ -5,6 +5,7 @@ use async_channel::Sender;
 pub enum TrayCommand {
     ToggleWindow(Option<String>),
     ToggleLive,
+    ToggleWake,
     Quit,
 }
 
@@ -12,6 +13,11 @@ pub struct StatusTray {
     pub commands: Sender<TrayCommand>,
     pub live: bool,
     pub live_available: bool,
+    /// True when wake word detection was enabled in settings.
+    pub wake_visible: bool,
+    /// True while the microphone is listening for the wake word.
+    pub wake_listening: bool,
+    pub wake_word: String,
 }
 
 /// The activation token may arrive a moment after the tray event.
@@ -38,6 +44,8 @@ impl ksni::Tray for StatusTray {
     fn icon_name(&self) -> String {
         if self.live {
             "io.github.ltux.OllamaGui-live".to_string()
+        } else if self.wake_listening {
+            "io.github.ltux.OllamaGui-wake".to_string()
         } else {
             "io.github.ltux.OllamaGui".to_string()
         }
@@ -48,6 +56,8 @@ impl ksni::Tray for StatusTray {
             title: "Ollama GUI".to_string(),
             description: if self.live {
                 "Live voice conversation is active".to_string()
+            } else if self.wake_visible {
+                format!("Listening for \u{201c}{}\u{201d}", self.wake_word)
             } else {
                 "Ready".to_string()
             },
@@ -61,7 +71,7 @@ impl ksni::Tray for StatusTray {
     }
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
-        use ksni::menu::{MenuItem, StandardItem};
+        use ksni::menu::{CheckmarkItem, MenuItem, StandardItem};
 
         vec![
             StandardItem {
@@ -82,6 +92,17 @@ impl ksni::Tray for StatusTray {
                 enabled: self.live || self.live_available,
                 activate: Box::new(|tray: &mut StatusTray| {
                     let _ = tray.commands.try_send(TrayCommand::ToggleLive);
+                }),
+                ..Default::default()
+            }
+            .into(),
+            CheckmarkItem {
+                label: format!("Wake word: {}", self.wake_word),
+                visible: self.wake_visible,
+                enabled: self.wake_visible && !self.live,
+                checked: self.wake_listening,
+                activate: Box::new(|tray: &mut StatusTray| {
+                    let _ = tray.commands.try_send(TrayCommand::ToggleWake);
                 }),
                 ..Default::default()
             }
