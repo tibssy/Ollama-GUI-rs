@@ -2054,15 +2054,23 @@ impl ChatWindow {
     ) {
         let bubble = gtk::Box::new(gtk::Orientation::Vertical, 6);
         bubble.add_css_class("user-bubble");
-        bubble.set_halign(gtk::Align::End);
+        bubble.set_valign(gtk::Align::Start);
+        bubble.set_halign(if images.is_empty() {
+            gtk::Align::End
+        } else {
+            gtk::Align::Fill
+        });
 
         if !images.is_empty() {
-            let image_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
-            image_box.set_halign(gtk::Align::End);
             for image in images {
-                image_box.append(&image::message_widget(image, self.window.upcast_ref()));
+                let picture = image::message_picture(image, self.window.upcast_ref());
+                let frame = gtk::AspectFrame::new(0.5, 0.5, 4.0 / 3.0, false);
+                frame.set_child(Some(&picture));
+                frame.set_hexpand(true);
+                frame.set_halign(gtk::Align::Fill);
+                frame.set_valign(gtk::Align::Start);
+                bubble.append(&frame);
             }
-            bubble.append(&image_box);
         }
 
         if !text.is_empty() {
@@ -2075,10 +2083,26 @@ impl ChatWindow {
             bubble.append(&label);
         }
 
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        row.set_halign(gtk::Align::End);
-        row.append(&bubble);
-        self.messages_box.append(&row);
+        if images.is_empty() {
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            row.set_halign(gtk::Align::End);
+            row.append(&bubble);
+            self.messages_box.append(&row);
+        } else {
+            // Two homogeneous columns keep the media bubble at 50% of the
+            // message column, independent of the source image dimensions.
+            let grid = gtk::Grid::new();
+            grid.set_column_homogeneous(true);
+            grid.set_hexpand(true);
+            grid.set_halign(gtk::Align::Fill);
+            grid.set_valign(gtk::Align::Start);
+            let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            spacer.set_hexpand(true);
+            grid.attach(&spacer, 0, 0, 1, 1);
+            bubble.set_hexpand(true);
+            grid.attach(&bubble, 1, 0, 1, 1);
+            self.messages_box.append(&grid);
+        }
 
         self.attach_message_actions(conversation_id, &bubble, "user", text, images, message_id);
     }

@@ -230,8 +230,9 @@ most 1024 px on the longest edge and about one megapixel, then re-encoded. If th
 encoded payload is still larger than 1.5 MB, it is scaled down further. This
 keeps a single image from overwhelming a vision model or the Ollama session.
 Re-encoding also drops most embedded metadata. The processed bytes live in SQLite
-with the message and are deleted when the turn is removed. Every preview uses
-the same frame in the chat, so the layout does not jump between images.
+with the message and are deleted when the turn is removed. Message images are
+right-aligned in a card about half the width of the chat column, regardless of
+the source dimensions, so the layout does not jump between images.
 
 Images are sent only to the selected vision model. They are not included in
 long-term memory extraction, context summaries, or embedding requests. The

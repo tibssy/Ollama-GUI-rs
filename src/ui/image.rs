@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use gtk::prelude::*;
-use gtk::{gdk, glib};
+use gtk::{gdk, gio, glib};
 
 use crate::store::StoredImage;
 
@@ -20,9 +20,10 @@ const MAX_ENCODED_BYTES: usize = 1_500_000;
 const MIN_ENCODED_DIM: i32 = 256;
 /// Longest edge of the composer thumbnail.
 const PREVIEW_DIM: i32 = 72;
-/// Fixed frame used for every image inside a chat bubble.
-const MESSAGE_IMAGE_WIDTH: i32 = 320;
-const MESSAGE_IMAGE_HEIGHT: i32 = 240;
+/// Reference texture for message images. The chat bubble itself is laid out at
+/// half of the message column, and the picture keeps this 4:3 aspect ratio.
+const MESSAGE_IMAGE_WIDTH: i32 = 400;
+const MESSAGE_IMAGE_HEIGHT: i32 = 300;
 
 pub struct ProcessedImage {
     pub mime: String,
@@ -164,9 +165,69 @@ pub fn texture(data: &[u8]) -> Option<gdk::Texture> {
     gdk::Texture::from_bytes(&bytes).ok()
 }
 
+fn frame_dimensions(width: u32, height: u32, frame_width: i32, frame_height: i32) -> (i32, i32) {
+    if width == 0 || height == 0 {
+        return (1, 1);
+    }
+    let width = width as f64;
+    let height = height as f64;
+    let scale = (frame_width as f64 / width).min(frame_height as f64 / height);
+    (
+        (width * scale).round().max(1.0) as i32,
+        (height * scale).round().max(1.0) as i32,
+    )
+}
+
+/// Compose an image into a fixed-size transparent frame. This forces the widget
+/// to keep the same dimensions instead of expanding to the texture's natural
+/// size, which made some chat images much wider than others.
+fn framed_texture(data: &[u8], frame_width: i32, frame_height: i32) -> Option<gdk::Texture> {
+    let bytes = glib::Bytes::from(data);
+    let stream = gio::MemoryInputStream::from_bytes(&bytes);
+    let pixbuf = gdk_pixbuf::Pixbuf::from_stream(&stream, None::<&gio::Cancellable>).ok()?;
+
+    let (width, height) = frame_dimensions(
+        pixbuf.width() as u32,
+        pixbuf.height() as u32,
+        frame_width,
+        frame_height,
+    );
+    let scaled = if width == pixbuf.width() && height == pixbuf.height() {
+        pixbuf
+    } else {
+        pixbuf.scale_simple(width, height, gdk_pixbuf::InterpType::Bilinear)?
+    };
+    let scaled = if scaled.has_alpha() {
+        scaled
+    } else {
+        scaled.add_alpha(false, 0, 0, 0).ok()?
+    };
+
+    let frame = gdk_pixbuf::Pixbuf::new(
+        gdk_pixbuf::Colorspace::Rgb,
+        true,
+        8,
+        frame_width,
+        frame_height,
+    )?;
+    frame.fill(0x00000000);
+    scaled.copy_area(
+        0,
+        0,
+        width,
+        height,
+        &frame,
+        (frame_width - width) / 2,
+        (frame_height - height) / 2,
+    );
+
+    let png = frame.save_to_bufferv("png", &[]).ok()?;
+    gdk::Texture::from_bytes(&glib::Bytes::from(&png)).ok()
+}
+
 /// Fixed-size composer thumbnail, independent of the source aspect ratio.
 pub fn preview_widget(data: &[u8]) -> gtk::Widget {
-    let Some(texture) = texture(data) else {
+    let Some(texture) = framed_texture(data, PREVIEW_DIM, PREVIEW_DIM) else {
         return gtk::Label::new(Some("Image")).upcast();
     };
 
@@ -178,21 +239,21 @@ pub fn preview_widget(data: &[u8]) -> gtk::Widget {
     picture.upcast()
 }
 
-/// Build the image shown inside a user bubble. Every image uses the same frame,
-/// so the chat layout stays stable regardless of the source dimensions.
+/// Build the image shown inside a user bubble. The picture expands to the size
+/// of its aspect frame, so every message image fills the same right-half card.
 /// Clicking opens a larger view.
-pub fn message_widget(image: &StoredImage, parent: &gtk::Window) -> gtk::Widget {
-    let Some(texture) = texture(&image.data) else {
+pub fn message_picture(image: &StoredImage, parent: &gtk::Window) -> gtk::Widget {
+    let Some(texture) = framed_texture(&image.data, MESSAGE_IMAGE_WIDTH, MESSAGE_IMAGE_HEIGHT)
+    else {
         let label = gtk::Label::new(Some("Image unavailable"));
         label.add_css_class("dim-label");
         return label.upcast();
     };
 
     let picture = gtk::Picture::for_paintable(&texture);
-    picture.set_size_request(MESSAGE_IMAGE_WIDTH, MESSAGE_IMAGE_HEIGHT);
     picture.set_content_fit(gtk::ContentFit::Contain);
     picture.set_can_shrink(true);
-    picture.set_halign(gtk::Align::End);
+    picture.set_hexpand(true);
     picture.add_css_class("message-image");
     picture.set_tooltip_text(Some(&format!(
         "Open image ({}×{})",
@@ -232,7 +293,7 @@ fn open_dialog(parent: &gtk::Window, data: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use super::fit_dimensions;
+    use super::{fit_dimensions, frame_dimensions};
 
     #[test]
     fn fits_images_inside_the_model_budget() {
@@ -247,6 +308,14 @@ mod tests {
     fn fits_previews_into_the_thumbnail_box() {
         assert_eq!(fit_dimensions(1000, 500, 72, 72 * 72), (72, 36));
         assert_eq!(fit_dimensions(100, 100, 72, 72 * 72), (72, 72));
+    }
+
+    #[test]
+    fn frames_images_into_a_consistent_box() {
+        assert_eq!(frame_dimensions(100, 50, 400, 300), (400, 200));
+        assert_eq!(frame_dimensions(1024, 768, 400, 300), (400, 300));
+        assert_eq!(frame_dimensions(1024, 1024, 400, 300), (300, 300));
+        assert_eq!(frame_dimensions(0, 0, 400, 300), (1, 1));
     }
 
     #[test]
