@@ -21,6 +21,7 @@ use crate::store::{Store, StoredImage, StoredMessage, StoredSummary};
 use crate::stt::{self, PreparedBackend, SttEvent};
 use crate::tray::{StatusTray, TrayCommand};
 use crate::ui::image;
+use crate::wake::{self, WakeEvent};
 
 /// Seconds without speech activity before local TTS/STT models are released.
 const SPEECH_IDLE_UNLOAD_SECS: u32 = 60;
@@ -973,11 +974,15 @@ struct ChatWindow {
     tray: RefCell<Option<ksni::Handle<StatusTray>>>,
     tray_live: Cell<bool>,
     tray_live_available: Cell<bool>,
+    tray_wake_visible: Cell<bool>,
+    tray_wake_listening: Cell<bool>,
+    tray_wake_word: RefCell<String>,
 
     current_id: RefCell<Option<i64>>,
     active: RefCell<Option<ActiveStream>>,
     speech_buttons: RefCell<Vec<gtk::Button>>,
     speech_player: RefCell<Option<async_channel::Sender<PlaybackChunk>>>,
+    speech_active: Cell<bool>,
     speech_generation: Arc<AtomicU64>,
     speech_stream_tx: RefCell<Option<async_channel::Sender<String>>>,
     speech_text: RefCell<SpeechTextBuffer>,
@@ -997,8 +1002,17 @@ struct ChatWindow {
     stt_preparing: Cell<bool>,
     stt_generation: Cell<u64>,
     stt_idle_token: Arc<AtomicU64>,
+    stt_keep_alive: RefCell<Option<Arc<std::sync::atomic::AtomicBool>>>,
     live_mode: Cell<bool>,
     live_pending: Cell<bool>,
+    wake_session: RefCell<Option<wake::WakeSession>>,
+    wake_generation: Cell<u64>,
+    wake_preparing: Cell<bool>,
+    wake_listening: Cell<bool>,
+    wake_paused: Cell<bool>,
+    wake_pending: Cell<bool>,
+    wake_tx: async_channel::Sender<()>,
+    wake_rx: RefCell<Option<async_channel::Receiver<()>>>,
     suppress_autoread: Cell<bool>,
     suppress_model_change: Cell<bool>,
 }
@@ -1020,6 +1034,8 @@ pub fn build(app: &adw::Application) -> anyhow::Result<adw::ApplicationWindow> {
 
 impl ChatWindow {
     fn new(window: &adw::ApplicationWindow, state: Rc<AppState>) -> Rc<Self> {
+        let (wake_tx, wake_rx) = async_channel::unbounded();
+
         // ----- Sidebar -----------------------------------------------------
         let chat_list = gtk::ListBox::new();
         chat_list.add_css_class("navigation-sidebar");
@@ -1319,10 +1335,14 @@ impl ChatWindow {
             tray: RefCell::new(None),
             tray_live: Cell::new(false),
             tray_live_available: Cell::new(false),
+            tray_wake_visible: Cell::new(false),
+            tray_wake_listening: Cell::new(false),
+            tray_wake_word: RefCell::new(String::new()),
             current_id: RefCell::new(None),
             active: RefCell::new(None),
             speech_buttons: RefCell::new(Vec::new()),
             speech_player: RefCell::new(None),
+            speech_active: Cell::new(false),
             speech_generation: Arc::new(AtomicU64::new(0)),
             speech_stream_tx: RefCell::new(None),
             speech_text: RefCell::new(SpeechTextBuffer::default()),
@@ -1342,8 +1362,17 @@ impl ChatWindow {
             stt_preparing: Cell::new(false),
             stt_generation: Cell::new(0),
             stt_idle_token: Arc::new(AtomicU64::new(0)),
+            stt_keep_alive: RefCell::new(None),
             live_mode: Cell::new(false),
             live_pending: Cell::new(false),
+            wake_session: RefCell::new(None),
+            wake_generation: Cell::new(0),
+            wake_preparing: Cell::new(false),
+            wake_listening: Cell::new(false),
+            wake_paused: Cell::new(false),
+            wake_pending: Cell::new(false),
+            wake_tx,
+            wake_rx: RefCell::new(Some(wake_rx)),
             suppress_autoread: Cell::new(false),
             suppress_model_change: Cell::new(false),
         })
@@ -1625,6 +1654,16 @@ impl ChatWindow {
         self.input.grab_focus();
         self.update_stt_ui();
         self.apply_background_startup();
+
+        if let Some(rx) = self.wake_rx.borrow_mut().take() {
+            let win = self.clone();
+            glib::spawn_future_local(async move {
+                while rx.recv().await.is_ok() {
+                    win.refresh_wake();
+                }
+            });
+        }
+        self.refresh_wake();
     }
 
     // ----- Models ----------------------------------------------------------
@@ -1777,6 +1816,7 @@ impl ChatWindow {
             self.title_widget.set_subtitle(&model);
         }
         self.update_capabilities();
+        self.update_stt_ui();
     }
 
     fn on_model_changed(self: &Rc<Self>) {
@@ -2612,6 +2652,9 @@ impl ChatWindow {
             while let Ok(event) = rx.recv().await {
                 match event {
                     SpeechEvent::Playing => {
+                        win.speech_active.set(true);
+                        win.set_stt_keep_alive(true);
+                        win.refresh_wake();
                         if announce {
                             win.toast("Speaking…");
                         }
@@ -2619,14 +2662,23 @@ impl ChatWindow {
                     SpeechEvent::AudioUnavailable => {
                         win.toast("Audio output is unavailable");
                         *win.speech_player.borrow_mut() = None;
+                        win.speech_active.set(false);
+                        win.set_stt_keep_alive(false);
+                        win.refresh_wake();
                     }
                     SpeechEvent::Error(message) => {
                         win.toast(&format!("Speech failed: {message}"));
+                        win.speech_active.set(false);
+                        win.set_stt_keep_alive(false);
+                        win.refresh_wake();
                     }
                     SpeechEvent::Finished => {
                         if let Some(button) = button.as_ref() {
                             button.set_sensitive(true);
                         }
+                        win.speech_active.set(false);
+                        win.set_stt_keep_alive(false);
+                        win.refresh_wake();
                         win.schedule_tts_idle_unload();
                         break;
                     }
@@ -2805,6 +2857,9 @@ impl ChatWindow {
         self.end_streaming_speech();
         self.speech_text.borrow_mut().clear();
         self.speech_generation.fetch_add(1, Ordering::SeqCst);
+        self.speech_active.set(false);
+        self.set_stt_keep_alive(false);
+        let _ = self.wake_tx.try_send(());
     }
 
     /// Drop the local TTS engine. When a timer token is supplied, the unload is
@@ -2953,6 +3008,10 @@ impl ChatWindow {
             self.live_button
                 .set_tooltip_text(Some("Start live voice conversation"));
         }
+
+        // Wake-word availability depends on dictation, TTS and the model list,
+        // so re-evaluate it whenever the speech UI changes.
+        let _ = self.wake_tx.try_send(());
     }
 
     fn toggle_stt(self: &Rc<Self>) {
@@ -2974,16 +3033,29 @@ impl ChatWindow {
     }
 
     fn start_stt(self: &Rc<Self>, live: bool) {
+        self.start_stt_inner(live);
+        // If the session could not start (missing TTS voice, disabled
+        // dictation, …), hand the microphone back to the wake detector.
+        if !self.stt_listening.get() && !self.stt_preparing.get() {
+            self.wake_pending.set(false);
+            self.refresh_wake();
+        }
+    }
+
+    fn start_stt_inner(self: &Rc<Self>, live: bool) {
         if self.stt_listening.get() || self.stt_preparing.get() {
             return;
         }
+        // The wake detector owns the microphone; release it before dictation.
+        self.stop_wake();
         self.cancel_stt_idle_unload();
         if live && self.resolve_tts().is_none() {
             self.toast("Live conversation needs an available text-to-speech voice.");
             return;
         }
 
-        let (enabled, provider, language, start_secs, end_ms) = {
+        let wake_started = live && self.wake_pending.get();
+        let (enabled, provider, language, start_secs, end_ms, wake_timeout) = {
             let settings = self.state.settings.borrow();
             (
                 settings.stt_enabled,
@@ -2991,6 +3063,7 @@ impl ChatWindow {
                 settings.stt_language.clone(),
                 settings.stt_start_timeout_secs,
                 settings.stt_end_silence_ms,
+                settings.wake_listen_timeout_secs,
             )
         };
         if !enabled {
@@ -3037,6 +3110,10 @@ impl ChatWindow {
 
         let start_timeout = std::time::Duration::from_secs(start_secs.max(1) as u64);
         let end_silence = std::time::Duration::from_millis(end_ms.max(200) as u64);
+        // Wake-triggered sessions stop themselves after this much silence so
+        // the detector can take the microphone back.
+        let idle_timeout =
+            wake_started.then(|| std::time::Duration::from_secs(wake_timeout.max(5) as u64));
         tracing::info!(
             "STT: using {} for language {:?}{}",
             match choice {
@@ -3058,6 +3135,7 @@ impl ChatWindow {
                     start_timeout,
                     end_silence,
                     live,
+                    idle_timeout,
                 );
                 return;
             }
@@ -3101,6 +3179,7 @@ impl ChatWindow {
                             start_timeout,
                             end_silence,
                             live,
+                            idle_timeout,
                         );
                     }
                     Ok(Err(error)) => {
@@ -3143,6 +3222,7 @@ impl ChatWindow {
                     start_timeout,
                     end_silence,
                     live,
+                    idle_timeout,
                 );
                 return;
             }
@@ -3186,6 +3266,7 @@ impl ChatWindow {
                             start_timeout,
                             end_silence,
                             live,
+                            idle_timeout,
                         );
                     }
                     Ok(Err(error)) => {
@@ -3220,7 +3301,14 @@ impl ChatWindow {
             client: self.state.client.borrow().clone(),
             model,
         };
-        self.begin_listening(backend, language, start_timeout, end_silence, live);
+        self.begin_listening(
+            backend,
+            language,
+            start_timeout,
+            end_silence,
+            live,
+            idle_timeout,
+        );
     }
 
     fn begin_listening(
@@ -3230,12 +3318,15 @@ impl ChatWindow {
         start_timeout: std::time::Duration,
         end_silence: std::time::Duration,
         live: bool,
+        idle_timeout: Option<std::time::Duration>,
     ) {
         if !self.state.settings.borrow().stt_enabled {
             return;
         }
 
-        self.stop_stt();
+        // Internal stop: refresh_wake() reopens the microphone, and we are
+        // about to take it for dictation.
+        self.stop_stt_session();
         self.cancel_stt_idle_unload();
         if live {
             self.input.buffer().set_text("");
@@ -3247,18 +3338,26 @@ impl ChatWindow {
                 .to_string();
         }
 
+        let keep_alive = idle_timeout.map(|_| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        *self.stt_keep_alive.borrow_mut() = keep_alive.clone();
+
         match stt::start_listening(
             &self.state.runtime,
             backend,
-            language,
-            start_timeout,
-            end_silence,
-            live,
+            stt::ListenConfig {
+                language,
+                start_timeout,
+                end_silence,
+                continuous: live,
+                idle_timeout,
+                keep_alive,
+            },
         ) {
             Ok((session, events)) => {
                 *self.stt_session.borrow_mut() = Some(session);
                 self.live_mode.set(live);
                 self.live_pending.set(false);
+                self.wake_pending.set(false);
                 self.stt_listening.set(true);
                 self.stt_preparing.set(false);
                 self.update_stt_ui();
@@ -3295,7 +3394,12 @@ impl ChatWindow {
                                     }
                                     win.send_message();
                                 }
-                                SttEvent::Timeout => {}
+                                SttEvent::Timeout => {
+                                    win.toast("Live conversation ended");
+                                    win.stop_stt();
+                                    finished = true;
+                                    break;
+                                }
                                 SttEvent::Error(error) => {
                                     win.toast(&format!("Speech recognition failed: {error}"));
                                     win.stop_stt();
@@ -3383,6 +3487,12 @@ impl ChatWindow {
     }
 
     fn stop_stt(self: &Rc<Self>) {
+        self.stop_stt_session();
+        self.wake_pending.set(false);
+        self.refresh_wake();
+    }
+
+    fn stop_stt_session(self: &Rc<Self>) {
         self.stt_generation
             .set(self.stt_generation.get().saturating_add(1));
         if let Some(session) = self.stt_session.borrow_mut().take() {
@@ -3392,8 +3502,16 @@ impl ChatWindow {
         self.stt_preparing.set(false);
         self.live_mode.set(false);
         self.live_pending.set(false);
+        *self.stt_keep_alive.borrow_mut() = None;
         self.update_stt_ui();
         self.schedule_stt_idle_unload();
+    }
+
+    /// Tell the idle timer that a reply or its speech is still in progress.
+    fn set_stt_keep_alive(&self, busy: bool) {
+        if let Some(flag) = self.stt_keep_alive.borrow().as_ref() {
+            flag.store(busy, Ordering::Relaxed);
+        }
     }
 
     fn near_bottom(&self) -> bool {
@@ -4788,6 +4906,140 @@ impl ChatWindow {
         enabled && self.resolve_tts().is_some()
     }
 
+    // ----- Wake word -------------------------------------------------------
+
+    fn wake_should_run(&self) -> bool {
+        if !self.state.settings.borrow().wake_enabled || self.wake_paused.get() {
+            return false;
+        }
+        if self.live_mode.get() || self.live_pending.get() {
+            return false;
+        }
+        if self.stt_listening.get() || self.stt_preparing.get() {
+            return false;
+        }
+        if self.speech_active.get() {
+            return false;
+        }
+        self.live_available()
+    }
+
+    /// Start or stop wake-word detection to match the current app state.
+    fn refresh_wake(self: &Rc<Self>) {
+        if self.wake_should_run() {
+            if self.wake_session.borrow().is_none() && !self.wake_preparing.get() {
+                self.start_wake();
+            }
+        } else {
+            self.stop_wake();
+        }
+        self.update_tray_state();
+    }
+
+    fn start_wake(self: &Rc<Self>) {
+        if self.wake_preparing.get() || self.wake_session.borrow().is_some() {
+            return;
+        }
+        self.wake_preparing.set(true);
+        let generation = self.wake_generation.get().saturating_add(1);
+        self.wake_generation.set(generation);
+
+        let (word, threshold) = {
+            let settings = self.state.settings.borrow();
+            (settings.wake_word.clone(), settings.wake_threshold)
+        };
+        tracing::info!("wake word: preparing {word:?}");
+
+        let (tx, rx) = async_channel::bounded(1);
+        self.state.runtime.spawn(async move {
+            let result = wake::prepare(&word, threshold).await;
+            let _ = tx.send(result).await;
+        });
+
+        let win = self.clone();
+        glib::spawn_future_local(async move {
+            let Ok(result) = rx.recv().await else {
+                return;
+            };
+            if win.wake_generation.get() != generation {
+                return;
+            }
+            win.wake_preparing.set(false);
+            match result {
+                Ok(detector) => win.begin_wake(detector),
+                Err(error) => {
+                    tracing::warn!("wake word: {error:#}");
+                    win.toast(&format!("Wake word unavailable: {error}"));
+                    win.update_tray_state();
+                }
+            }
+        });
+    }
+
+    fn begin_wake(self: &Rc<Self>, detector: wake::WakeDetector) {
+        if !self.wake_should_run() {
+            return;
+        }
+
+        let (tx, rx) = async_channel::unbounded();
+        match wake::start(detector, tx) {
+            Ok(session) => {
+                *self.wake_session.borrow_mut() = Some(session);
+                self.wake_listening.set(true);
+                tracing::info!("wake word: listening");
+
+                let id = self.wake_generation.get();
+                let win = self.clone();
+                glib::spawn_future_local(async move {
+                    let Ok(event) = rx.recv().await else {
+                        return;
+                    };
+                    if win.wake_generation.get() != id {
+                        return;
+                    }
+                    match event {
+                        WakeEvent::Detected(score) => {
+                            tracing::debug!("wake word: score {score:.3}");
+                            win.on_wake_detected();
+                        }
+                        WakeEvent::Error(error) => {
+                            win.toast(&format!("Wake word failed: {error}"));
+                            win.stop_wake();
+                        }
+                    }
+                });
+                self.update_tray_state();
+            }
+            Err(error) => {
+                self.toast(&format!("Could not listen for the wake word: {error:#}"));
+                self.update_tray_state();
+            }
+        }
+    }
+
+    fn on_wake_detected(self: &Rc<Self>) {
+        if !self.wake_should_run() {
+            return;
+        }
+        // Release the microphone before the dictation path opens it again.
+        self.stop_wake();
+        self.wake_pending.set(true);
+        self.start_stt(true);
+    }
+
+    fn stop_wake(&self) {
+        self.wake_generation
+            .set(self.wake_generation.get().saturating_add(1));
+        if let Some(session) = self.wake_session.borrow_mut().take() {
+            session.stop();
+        }
+        if self.wake_listening.replace(false) {
+            tracing::info!("wake word: stopped listening");
+        }
+        self.wake_preparing.set(false);
+        self.update_tray_state();
+    }
+
     fn start_tray(self: &Rc<Self>, row: Option<adw::SwitchRow>) {
         if let Some(handle) = self.tray.borrow().as_ref() {
             if !handle.is_closed() {
@@ -4800,12 +5052,22 @@ impl ChatWindow {
         let (commands_tx, commands_rx) = async_channel::unbounded();
         let live = self.live_mode.get() || self.live_pending.get();
         let live_available = self.live_available();
+        let (wake_visible, wake_word) = {
+            let settings = self.state.settings.borrow();
+            (settings.wake_enabled, settings.wake_word.clone())
+        };
         self.tray_live.set(live);
         self.tray_live_available.set(live_available);
+        self.tray_wake_visible.set(wake_visible);
+        self.tray_wake_listening.set(self.wake_listening.get());
+        *self.tray_wake_word.borrow_mut() = wake_word.clone();
         let tray = StatusTray {
             commands: commands_tx,
             live,
             live_available,
+            wake_visible,
+            wake_listening: self.wake_listening.get(),
+            wake_word,
         };
         let (result_tx, result_rx) = async_channel::bounded(1);
         self.state.runtime.spawn(async move {
@@ -4837,6 +5099,10 @@ impl ChatWindow {
                                     win.toggle_window_from_tray(token);
                                 }
                                 TrayCommand::ToggleLive => win.toggle_live(),
+                                TrayCommand::ToggleWake => {
+                                    win.wake_paused.set(win.wake_listening.get());
+                                    win.refresh_wake();
+                                }
                                 TrayCommand::Quit => win.quit_from_tray(),
                             }
                         }
@@ -4872,11 +5138,25 @@ impl ChatWindow {
     fn update_tray_state(&self) {
         let live = self.live_mode.get() || self.live_pending.get();
         let live_available = self.live_available();
-        if self.tray_live.get() == live && self.tray_live_available.get() == live_available {
+        let (wake_visible, wake_word) = {
+            let settings = self.state.settings.borrow();
+            (settings.wake_enabled, settings.wake_word.clone())
+        };
+        let wake_listening = self.wake_listening.get();
+
+        if self.tray_live.get() == live
+            && self.tray_live_available.get() == live_available
+            && self.tray_wake_visible.get() == wake_visible
+            && self.tray_wake_listening.get() == wake_listening
+            && *self.tray_wake_word.borrow() == wake_word
+        {
             return;
         }
         self.tray_live.set(live);
         self.tray_live_available.set(live_available);
+        self.tray_wake_visible.set(wake_visible);
+        self.tray_wake_listening.set(wake_listening);
+        *self.tray_wake_word.borrow_mut() = wake_word.clone();
 
         let Some(handle) = self.tray.borrow().clone() else {
             return;
@@ -4886,6 +5166,9 @@ impl ChatWindow {
                 .update(move |tray| {
                     tray.live = live;
                     tray.live_available = live_available;
+                    tray.wake_visible = wake_visible;
+                    tray.wake_listening = wake_listening;
+                    tray.wake_word = wake_word.clone();
                 })
                 .await;
         });
@@ -5407,6 +5690,190 @@ impl ChatWindow {
         stt.add(&whistle_row);
 
         page.add(&stt);
+
+        let wake = adw::PreferencesGroup::new();
+        wake.set_title("Wake word");
+        wake.set_description(Some(
+            "Listen for a phrase and start a live voice conversation when it is heard",
+        ));
+
+        let wake_enable_row = adw::SwitchRow::new();
+        wake_enable_row.set_title("Listen for a wake word");
+        wake_enable_row.set_subtitle("Requires dictation and an available text-to-speech voice");
+        wake_enable_row.set_active(self.state.settings.borrow().wake_enabled);
+        wake.add(&wake_enable_row);
+
+        let current_word = self.state.settings.borrow().wake_word.clone();
+        let word_labels: Vec<String> = crate::wake::WORDS
+            .iter()
+            .map(|(word, language)| {
+                let name = crate::wake::display_name(word);
+                if *language == "en" {
+                    name
+                } else {
+                    format!("{name} ({language})")
+                }
+            })
+            .collect();
+        let word_refs: Vec<&str> = word_labels.iter().map(String::as_str).collect();
+        let word_list = gtk::StringList::new(&word_refs);
+
+        let wake_word_row = adw::ComboRow::new();
+        wake_word_row.set_title("Wake word");
+        wake_word_row.set_subtitle("Phrase that starts the conversation");
+        wake_word_row.set_model(Some(&word_list));
+        wake_word_row.set_selected(
+            crate::wake::WORDS
+                .iter()
+                .position(|(word, _)| *word == current_word)
+                .unwrap_or(1) as u32,
+        );
+        wake.add(&wake_word_row);
+
+        let wake_timeout_row = adw::ComboRow::new();
+        wake_timeout_row.set_title("Listening timeout");
+        wake_timeout_row.set_subtitle("Stop listening after this much silence");
+        let timeout_list = gtk::StringList::new(&["15 seconds", "30 seconds", "60 seconds"]);
+        wake_timeout_row.set_model(Some(&timeout_list));
+        wake_timeout_row.set_selected(
+            match self.state.settings.borrow().wake_listen_timeout_secs {
+                15 => 0,
+                60 => 2,
+                _ => 1,
+            },
+        );
+        wake.add(&wake_timeout_row);
+
+        let wake_threshold_row = adw::SpinRow::new(
+            Some(&gtk::Adjustment::new(
+                self.state.settings.borrow().wake_threshold as f64,
+                0.0,
+                0.99,
+                0.01,
+                0.05,
+                0.0,
+            )),
+            0.01,
+            2,
+        );
+        wake_threshold_row.set_title("Detection threshold");
+        wake_threshold_row.set_subtitle("0 uses the value calibrated for the selected word");
+        wake.add(&wake_threshold_row);
+
+        let wake_model_row = adw::ActionRow::new();
+        wake_model_row.set_title("Wake word model");
+        let wake_downloaded = crate::wake::is_downloaded(&current_word);
+        wake_model_row.set_subtitle(if wake_downloaded {
+            "Downloaded · ~2 MB · Apache-2.0"
+        } else {
+            "Not downloaded · ~2 MB · Apache-2.0"
+        });
+        let wake_model_button = gtk::Button::with_label(if wake_downloaded {
+            "Downloaded"
+        } else {
+            "Download"
+        });
+        wake_model_button.add_css_class("flat");
+        wake_model_button.set_valign(gtk::Align::Center);
+        wake_model_button.set_sensitive(!wake_downloaded);
+        wake_model_row.add_suffix(&wake_model_button);
+
+        let wake_model_row = adw::ActionRow::new();
+        wake_model_row.set_title("Wake word model");
+        let wake_downloaded = crate::wake::is_downloaded(&current_word);
+        wake_model_row.set_subtitle(if wake_downloaded {
+            "Downloaded · ~2 MB · Apache-2.0"
+        } else {
+            "Not downloaded · ~2 MB · Apache-2.0"
+        });
+        let wake_model_button = gtk::Button::with_label(if wake_downloaded {
+            "Downloaded"
+        } else {
+            "Download"
+        });
+        wake_model_button.add_css_class("flat");
+        wake_model_button.set_valign(gtk::Align::Center);
+        wake_model_button.set_sensitive(!wake_downloaded);
+        wake_model_row.add_suffix(&wake_model_button);
+        wake.add(&wake_model_row);
+
+        page.add(&wake);
+
+        {
+            let win = self.clone();
+            wake_enable_row.connect_active_notify(move |row| {
+                win.state.settings.borrow_mut().wake_enabled = row.is_active();
+                win.save_settings();
+                win.wake_paused.set(false);
+                win.refresh_wake();
+                win.update_tray_state();
+            });
+        }
+        {
+            let win = self.clone();
+            wake_word_row.connect_selected_notify(move |row| {
+                let index = row.selected() as usize;
+                let Some((word, _)) = crate::wake::WORDS.get(index) else {
+                    return;
+                };
+                if win.state.settings.borrow().wake_word == *word {
+                    return;
+                }
+                win.state.settings.borrow_mut().wake_word = (*word).to_string();
+                win.save_settings();
+                win.wake_paused.set(false);
+                win.stop_wake();
+                win.refresh_wake();
+            });
+        }
+        {
+            let win = self.clone();
+            wake_timeout_row.connect_selected_notify(move |row| {
+                let seconds = match row.selected() {
+                    0 => 15,
+                    2 => 60,
+                    _ => 30,
+                };
+                win.state.settings.borrow_mut().wake_listen_timeout_secs = seconds;
+                win.save_settings();
+            });
+        }
+        {
+            let win = self.clone();
+            wake_threshold_row.connect_value_notify(move |row| {
+                win.state.settings.borrow_mut().wake_threshold = row.value() as f32;
+                win.save_settings();
+                if win.wake_listening.get() {
+                    win.stop_wake();
+                    win.refresh_wake();
+                }
+            });
+        }
+        {
+            let win = self.clone();
+            let row = wake_model_row.clone();
+            let button = wake_model_button.clone();
+            wake_model_button.connect_clicked(move |_| {
+                button.set_sensitive(false);
+                button.set_label("Downloading…");
+                row.set_subtitle("Downloading the wake word model…");
+                win.refresh_wake();
+
+                let row = row.clone();
+                let button = button.clone();
+                let win = win.clone();
+                glib::timeout_add_local_once(std::time::Duration::from_secs(2), move || {
+                    if crate::wake::is_downloaded(&win.state.settings.borrow().wake_word) {
+                        row.set_subtitle("Downloaded · ~2 MB · Apache-2.0");
+                        button.set_label("Downloaded");
+                    } else {
+                        row.set_subtitle("Not downloaded · ~2 MB · Apache-2.0");
+                        button.set_label("Download");
+                        button.set_sensitive(true);
+                    }
+                });
+            });
+        }
 
         let appearance = adw::PreferencesGroup::new();
         appearance.set_title("Appearance");

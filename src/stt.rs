@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-const TARGET_RATE: u32 = 16_000;
+pub(crate) const TARGET_RATE: u32 = 16_000;
 const VAD_FRAME: usize = 512;
 const SPEECH_START_THRESHOLD: f32 = 0.5;
 const SPEECH_CONTINUE_THRESHOLD: f32 = 0.35;
@@ -44,6 +44,12 @@ struct WorkerConfig {
     start_timeout: Duration,
     end_silence: Duration,
     continuous: bool,
+    /// End the session after this much silence between utterances. Used by
+    /// wake-word sessions so the microphone is released until the next wake.
+    idle_timeout: Option<Duration>,
+    /// While this flag is set the idle timer keeps being pushed back, so a
+    /// wake-triggered session is not cut off while a reply is being spoken.
+    keep_alive: Option<Arc<AtomicBool>>,
 }
 
 impl SttSession {
@@ -88,86 +94,35 @@ pub async fn prepare_parakeet(engine: Arc<Mutex<Option<Parakeet>>>) -> Result<()
     Ok(())
 }
 
+/// Timing and lifetime knobs for one dictation or live session.
+pub struct ListenConfig {
+    pub language: Option<String>,
+    pub start_timeout: Duration,
+    pub end_silence: Duration,
+    pub continuous: bool,
+    /// End the session after this much silence. Used by wake-word sessions.
+    pub idle_timeout: Option<Duration>,
+    /// While set, the idle timer keeps being pushed back.
+    pub keep_alive: Option<Arc<AtomicBool>>,
+}
+
 pub fn start_listening(
     runtime: &tokio::runtime::Runtime,
     backend: PreparedBackend,
-    language: Option<String>,
-    start_timeout: Duration,
-    end_silence: Duration,
-    continuous: bool,
+    config: ListenConfig,
 ) -> Result<(SttSession, async_channel::Receiver<SttEvent>)> {
-    let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .context("no microphone was found")?;
-    let supported = device
-        .default_input_config()
-        .context("no default microphone configuration")?;
-    let sample_rate = supported.sample_rate().0;
-    let channels = supported.channels() as usize;
-    let sample_format = supported.sample_format();
-    let config = supported.config();
-
-    let (audio_tx, audio_rx) = async_channel::unbounded::<Vec<f32>>();
     let (event_tx, event_rx) = async_channel::unbounded::<SttEvent>();
-    let stop = Arc::new(AtomicBool::new(false));
 
     let error_events = event_tx.clone();
-    let error_callback = move |error: cpal::StreamError| {
-        tracing::warn!("microphone error: {error}");
-        let message = format!("microphone error: {error}");
+    let capture = start_capture(move |message| {
         let events = error_events.clone();
         glib::MainContext::default().invoke(move || {
-            let _ = events.try_send(SttEvent::Error(message));
+            let _ = events.try_send(SttEvent::Error(format!("microphone error: {message}")));
         });
-    };
-
-    let stream = match sample_format {
-        cpal::SampleFormat::F32 => {
-            let sender = audio_tx.clone();
-            device.build_input_stream(
-                &config,
-                move |data: &[f32], _| {
-                    let _ = sender.try_send(mix_f32(data, channels));
-                },
-                error_callback,
-                None,
-            )?
-        }
-        cpal::SampleFormat::I16 => {
-            let sender = audio_tx.clone();
-            device.build_input_stream(
-                &config,
-                move |data: &[i16], _| {
-                    let samples: Vec<f32> = data
-                        .iter()
-                        .map(|sample| *sample as f32 / 32_768.0)
-                        .collect();
-                    let _ = sender.try_send(mix_f32(&samples, channels));
-                },
-                error_callback,
-                None,
-            )?
-        }
-        cpal::SampleFormat::U16 => {
-            let sender = audio_tx.clone();
-            device.build_input_stream(
-                &config,
-                move |data: &[u16], _| {
-                    let samples: Vec<f32> = data
-                        .iter()
-                        .map(|sample| (*sample as f32 - 32_768.0) / 32_768.0)
-                        .collect();
-                    let _ = sender.try_send(mix_f32(&samples, channels));
-                },
-                error_callback,
-                None,
-            )?
-        }
-        other => bail!("unsupported microphone sample format: {other:?}"),
-    };
-
-    stream.play().context("starting microphone")?;
+    })?;
+    let sample_rate = capture.sample_rate;
+    let audio_rx = capture.audio;
+    let stop = Arc::new(AtomicBool::new(false));
 
     let worker_stop = Arc::clone(&stop);
     runtime.spawn(async move {
@@ -176,10 +131,12 @@ pub fn start_listening(
             backend,
             WorkerConfig {
                 source_rate: sample_rate,
-                language,
-                start_timeout,
-                end_silence,
-                continuous,
+                language: config.language,
+                start_timeout: config.start_timeout,
+                end_silence: config.end_silence,
+                continuous: config.continuous,
+                idle_timeout: config.idle_timeout,
+                keep_alive: config.keep_alive,
             },
             event_tx.clone(),
             worker_stop,
@@ -196,11 +153,92 @@ pub fn start_listening(
 
     Ok((
         SttSession {
-            _stream: stream,
+            _stream: capture.stream,
             stop,
         },
         event_rx,
     ))
+}
+
+/// A live microphone stream that delivers mono `f32` chunks at the device rate.
+pub struct AudioCapture {
+    pub stream: cpal::Stream,
+    pub sample_rate: u32,
+    pub audio: async_channel::Receiver<Vec<f32>>,
+}
+
+/// Open the default microphone and start streaming mixed-down samples.
+pub fn start_capture(on_error: impl Fn(String) + Send + Sync + 'static) -> Result<AudioCapture> {
+    let host = cpal::default_host();
+    let device = host
+        .default_input_device()
+        .context("no microphone was found")?;
+    let supported = device
+        .default_input_config()
+        .context("no default microphone configuration")?;
+    let sample_rate = supported.sample_rate().0;
+    let channels = supported.channels() as usize;
+    let sample_format = supported.sample_format();
+    let config = supported.config();
+
+    let (audio_tx, audio_rx) = async_channel::unbounded::<Vec<f32>>();
+    let on_error = Arc::new(on_error);
+
+    let stream = match sample_format {
+        cpal::SampleFormat::F32 => {
+            let sender = audio_tx.clone();
+            let on_error = Arc::clone(&on_error);
+            device.build_input_stream(
+                &config,
+                move |data: &[f32], _| {
+                    let _ = sender.try_send(mix_f32(data, channels));
+                },
+                move |error| on_error(error.to_string()),
+                None,
+            )?
+        }
+        cpal::SampleFormat::I16 => {
+            let sender = audio_tx.clone();
+            let on_error = Arc::clone(&on_error);
+            device.build_input_stream(
+                &config,
+                move |data: &[i16], _| {
+                    let samples: Vec<f32> = data
+                        .iter()
+                        .map(|sample| *sample as f32 / 32_768.0)
+                        .collect();
+                    let _ = sender.try_send(mix_f32(&samples, channels));
+                },
+                move |error| on_error(error.to_string()),
+                None,
+            )?
+        }
+        cpal::SampleFormat::U16 => {
+            let sender = audio_tx.clone();
+            let on_error = Arc::clone(&on_error);
+            device.build_input_stream(
+                &config,
+                move |data: &[u16], _| {
+                    let samples: Vec<f32> = data
+                        .iter()
+                        .map(|sample| (*sample as f32 - 32_768.0) / 32_768.0)
+                        .collect();
+                    let _ = sender.try_send(mix_f32(&samples, channels));
+                },
+                move |error| on_error(error.to_string()),
+                None,
+            )?
+        }
+        other => bail!("unsupported microphone sample format: {other:?}"),
+    };
+
+    stream.play().context("starting microphone")?;
+
+    Ok(AudioCapture {
+        stream,
+        sample_rate,
+        audio: audio_rx,
+    })
 }
 
 fn mix_f32(data: &[f32], channels: usize) -> Vec<f32> {
@@ -212,14 +250,14 @@ fn mix_f32(data: &[f32], channels: usize) -> Vec<f32> {
         .collect()
 }
 
-struct LinearResampler {
+pub(crate) struct LinearResampler {
     step: f64,
     position: f64,
     tail: Vec<f32>,
 }
 
 impl LinearResampler {
-    fn new(source_rate: u32) -> Self {
+    pub(crate) fn new(source_rate: u32) -> Self {
         Self {
             step: source_rate as f64 / TARGET_RATE as f64,
             position: 0.0,
@@ -227,7 +265,7 @@ impl LinearResampler {
         }
     }
 
-    fn push(&mut self, input: &[f32]) -> Vec<f32> {
+    pub(crate) fn push(&mut self, input: &[f32]) -> Vec<f32> {
         self.tail.extend_from_slice(input);
         let mut output = Vec::new();
 
@@ -262,6 +300,8 @@ async fn run_worker(
         start_timeout,
         end_silence,
         continuous,
+        idle_timeout,
+        keep_alive,
     } = config;
     let mut vad = silero::Session::bundled().context("loading Silero VAD")?;
     let mut vad_state = silero::StreamState::new(silero::SampleRate::Rate16k);
@@ -275,6 +315,7 @@ async fn run_worker(
     let mut last_partial = 0usize;
     let mut terminal = false;
     let started = std::time::Instant::now();
+    let mut last_activity = started;
 
     let start_timeout_samples = (start_timeout.as_secs_f64() * TARGET_RATE as f64) as usize;
     let end_silence_samples = (end_silence.as_secs_f64() * TARGET_RATE as f64) as usize;
@@ -283,12 +324,24 @@ async fn run_worker(
         if stop.load(Ordering::SeqCst) {
             break;
         }
+        if keep_alive
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            last_activity = std::time::Instant::now();
+        }
 
         let chunk = match tokio::time::timeout(Duration::from_millis(100), audio_rx.recv()).await {
             Ok(Ok(chunk)) => chunk,
             Ok(Err(_)) => break,
             Err(_) => {
-                if !continuous && !speaking && started.elapsed() >= start_timeout {
+                let idle_due =
+                    idle_timeout.is_some_and(|idle| !speaking && last_activity.elapsed() >= idle);
+                let start_due = idle_timeout.is_none()
+                    && !continuous
+                    && !speaking
+                    && started.elapsed() >= start_timeout;
+                if idle_due || start_due {
                     let _ = events.send(SttEvent::Timeout).await;
                     terminal = true;
                     break;
@@ -323,11 +376,18 @@ async fn run_worker(
                     speech.extend(pre_roll.drain(..));
                     silence_samples = 0;
                     last_partial = speech.len();
+                    last_activity = std::time::Instant::now();
                     let _ = events.send(SttEvent::SpeechStarted).await;
-                } else if !continuous && total_samples >= start_timeout_samples {
-                    let _ = events.send(SttEvent::Timeout).await;
-                    terminal = true;
-                    break;
+                } else {
+                    let timed_out = match idle_timeout {
+                        Some(idle) => last_activity.elapsed() >= idle,
+                        None => !continuous && total_samples >= start_timeout_samples,
+                    };
+                    if timed_out {
+                        let _ = events.send(SttEvent::Timeout).await;
+                        terminal = true;
+                        break;
+                    }
                 }
                 continue;
             }
@@ -375,6 +435,7 @@ async fn run_worker(
                     silence_samples = 0;
                     last_partial = 0;
                     pre_roll.clear();
+                    last_activity = std::time::Instant::now();
                 } else {
                     terminal = true;
                     break;
@@ -527,6 +588,8 @@ mod tests {
                     start_timeout: Duration::from_secs(5),
                     end_silence: Duration::from_millis(700),
                     continuous: false,
+                    idle_timeout: None,
+                    keep_alive: None,
                 },
                 events_tx,
                 Arc::new(AtomicBool::new(false)),
@@ -580,6 +643,8 @@ mod tests {
                     start_timeout: Duration::from_secs(5),
                     end_silence: Duration::from_millis(700),
                     continuous: false,
+                    idle_timeout: None,
+                    keep_alive: None,
                 },
                 events_tx,
                 Arc::new(AtomicBool::new(false)),
@@ -633,6 +698,8 @@ mod tests {
                     start_timeout: Duration::from_secs(5),
                     end_silence: Duration::from_millis(700),
                     continuous: true,
+                    idle_timeout: None,
+                    keep_alive: None,
                 },
                 events_tx,
                 Arc::new(AtomicBool::new(false)),
@@ -686,6 +753,8 @@ mod tests {
                     start_timeout: Duration::from_secs(5),
                     end_silence: Duration::from_millis(700),
                     continuous: false,
+                    idle_timeout: None,
+                    keep_alive: None,
                 },
                 events_tx,
                 Arc::new(AtomicBool::new(false)),

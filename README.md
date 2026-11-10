@@ -26,6 +26,8 @@ The MVP is working:
 - Collapsible sidebar with a header toggle, menu item, and Ctrl+B shortcut
 - Optional background mode with a system tray icon, live-state indicator, and
   tray actions for window visibility, live conversation, and quit
+- Optional wake word: say one of 28 calibrated phrases to start a live voice
+  conversation, with a settings picker, a listening timeout, and a tray toggle
 - Optional long-term memory with separate local and cloud pools, an embedding
   model, and a clear action
 - Automatic context compression: at 85% usage, older turns are summarized while
@@ -42,7 +44,7 @@ The MVP is working:
   or by pasting with Ctrl+V, with thumbnails, local storage, and click-to-enlarge
 - Settings for server URL, API key, system prompt, temperature, context size,
   thinking, long-term memory, theme, text-to-speech, auto-read, speech language,
-  voice, dictation, and VAD timings
+  voice, dictation, VAD timings, and wake word
 - Native markdown rendering: headings, bold/italic/strikethrough, lists, quotes,
   tables, links, inline code, and fenced code blocks with copy buttons
 - Code blocks use GtkSourceView and syntax highlighting when language specs are installed
@@ -337,6 +339,7 @@ working ALSA/PipeWire input are required.
 | Silero VAD (bundled) | 2.3 MB |
 | Whistle ONNX export (encoder + decoder + pack) | ~156 MB |
 | Parakeet Redux ONNX (preprocessor + encoder + decoder + vocab) | ~420 MB |
+| Wake word featurizer (int8) + one word head | 1.4 MB + 0.5 MB |
 | Built-in TTS/STT | the selected Ollama model, e.g. 1.7 GB for `lfm3-audio` |
 
 Models are loaded lazily. Repeated speech requests do not grow the process
@@ -348,6 +351,46 @@ use reloads the engine lazily. Measured warm RSS is about 230 MB for Paradee,
 315 MB for Whistle, 580 MB for Parakeet Redux loaded (about 600 MB after a
 transcription), or about 385 MB for Paradee and Whistle together. Unloading
 Parakeet Redux and trimming the heap returns the process to about 50 MB.
+
+## Wake word
+
+Settings → Speech → **Wake word** can listen for a phrase and start a live
+voice conversation when it is heard. It requires **Enable dictation** and an
+available text-to-speech voice, because the wake word opens the same live
+session as the composer button.
+
+The detector uses the pre-trained
+[OpenVoiceOS/wakehubert-wakewords](https://huggingface.co/OpenVoiceOS/wakehubert-wakewords)
+models. A tiny int8 HuBERT featurizer turns a 1.5 s window into
+`[1, 75, 128]` features and a per-word GRU head returns one calibrated score.
+The last 1.5 s is scored every 80 ms, and a detection must clear the word's
+calibrated threshold. The first enable downloads the featurizer (1.4 MB) and
+the selected head (0.5 MB) into `~/.local/share/ollama-gui/wake`; the catalog
+is cached there too, and switching words downloads another head on demand.
+
+The 28 shipped words are `jarvis`, `hey jarvis`, `alexa`, `hey marvin`,
+`marvin`, `hey mycroft`, `home assistant`, `okay nabu`, `hello nabu`,
+`hey chatterbox`, `hey floyd`, `hey rhasspy`, `hey robin`, `sheila`, `stop`,
+`android`, `hey computer`, `computer`, `hey k9`, `hey scout`, `hey ziggy`,
+`hey potato`, `hey stemcom`, `wake up`, plus `despierta` (Spanish),
+`aufwachen` (German), `wakker worden` (Dutch), and `sveglia` (Italian).
+Custom phrases are not supported by these models: each head is trained for one
+fixed phrase, so a new phrase needs a separately trained head.
+
+Behaviour:
+
+- Detection runs only while idle. It stops as soon as live conversation,
+  dictation, speech playback, or the wake-triggered session starts, so the
+  microphone is never opened twice.
+- A detection stops the detector and opens a live session. The session ends
+  after the configured **Listening timeout** (15, 30, or 60 seconds) without
+  speech, then the detector re-arms. The timeout counts from the end of the
+  last utterance and is paused while a reply is being spoken.
+- The tray menu shows a checked **Wake word** item when the feature is enabled
+  in settings. Toggling it pauses or resumes detection for the current session
+  without changing the setting.
+- **Detection threshold** `0` uses the value calibrated for the selected word;
+  raise it if the detector fires too easily, lower it if it misses.
 
 ## Architecture
 
@@ -366,6 +409,8 @@ src/
                      encoder/decoder and greedy TDT decoding
   stt.rs             microphone capture, resampling, Silero VAD and the
                      streaming transcription worker
+  wake.rs            WakeHuBERT catalog, model download and the 80 ms
+                     wake-word scoring thread
   tray.rs            StatusNotifierItem tray, icon state and menu actions
   ui/window.rs       split-view shell, chat controller, settings dialog,
                      sentence queuing and background speech playback

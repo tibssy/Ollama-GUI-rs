@@ -7,6 +7,7 @@ mod store;
 mod stt;
 mod tray;
 mod ui;
+mod wake;
 mod whistle;
 
 use gtk::gio;
