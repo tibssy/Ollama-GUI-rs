@@ -96,6 +96,7 @@ install -Dm644 data/io.github.ltux.OllamaGui.desktop ~/.local/share/applications
 install -Dm644 data/io.github.ltux.OllamaGui.metainfo.xml ~/.local/share/metainfo/io.github.ltux.OllamaGui.metainfo.xml
 install -Dm644 data/icons/io.github.ltux.OllamaGui.svg ~/.local/share/icons/hicolor/scalable/apps/io.github.ltux.OllamaGui.svg
 install -Dm644 data/icons/io.github.ltux.OllamaGui-live.svg ~/.local/share/icons/hicolor/scalable/apps/io.github.ltux.OllamaGui-live.svg
+install -Dm644 data/icons/io.github.ltux.OllamaGui-wake.svg ~/.local/share/icons/hicolor/scalable/apps/io.github.ltux.OllamaGui-wake.svg
 update-desktop-database ~/.local/share/applications 2>/dev/null || true
 gtk-update-icon-cache -f -t ~/.local/share/icons/hicolor 2>/dev/null || true
 ```
@@ -379,6 +380,11 @@ fixed phrase, so a new phrase needs a separately trained head.
 
 Behaviour:
 
+- Enabling the feature only adds a **Wake word** toggle to the tray menu. It
+  never starts listening on its own, including after restarting the app; the
+  toggle is the only way to arm it.
+- While listening, the tray icon switches to a blue listening badge, and the
+  menu item is checked. Turning the toggle off stops the microphone.
 - Detection runs only while idle. It stops as soon as live conversation,
   dictation, speech playback, or the wake-triggered session starts, so the
   microphone is never opened twice.
@@ -386,11 +392,14 @@ Behaviour:
   after the configured **Listening timeout** (15, 30, or 60 seconds) without
   speech, then the detector re-arms. The timeout counts from the end of the
   last utterance and is paused while a reply is being spoken.
-- The tray menu shows a checked **Wake word** item when the feature is enabled
-  in settings. Toggling it pauses or resumes detection for the current session
-  without changing the setting.
 - **Detection threshold** `0` uses the value calibrated for the selected word;
   raise it if the detector fires too easily, lower it if it misses.
+
+Listening is cheap. The microphone is opened as mono 48 kHz so the audio
+server does not resample every block, and an RMS gate keeps the featurizer
+idle while the room is quiet. Scoring runs only while the gate is open, which
+costs about 0.2% of one CPU core in silence instead of a constant model pass
+every 80 ms.
 
 ## Architecture
 

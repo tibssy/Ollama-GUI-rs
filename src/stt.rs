@@ -167,15 +167,38 @@ pub struct AudioCapture {
     pub audio: async_channel::Receiver<Vec<f32>>,
 }
 
+/// Prefer 48 kHz so the audio server does not resample every block. The
+/// channel count stays at the device default, which keeps the capture format
+/// compatible with the graph and avoids needless mixing.
+fn capture_config(device: &cpal::Device) -> Result<cpal::SupportedStreamConfig, anyhow::Error> {
+    let default = device
+        .default_input_config()
+        .context("no default microphone configuration")?;
+    if default.sample_rate().0 == 48_000 {
+        return Ok(default);
+    }
+    if let Ok(configs) = device.supported_input_configs() {
+        for config in configs {
+            if config.channels() != default.channels()
+                || config.sample_format() != default.sample_format()
+                || config.min_sample_rate().0 > 48_000
+                || config.max_sample_rate().0 < 48_000
+            {
+                continue;
+            }
+            return Ok(config.with_sample_rate(cpal::SampleRate(48_000)));
+        }
+    }
+    Ok(default)
+}
+
 /// Open the default microphone and start streaming mixed-down samples.
 pub fn start_capture(on_error: impl Fn(String) + Send + Sync + 'static) -> Result<AudioCapture> {
     let host = cpal::default_host();
     let device = host
         .default_input_device()
         .context("no microphone was found")?;
-    let supported = device
-        .default_input_config()
-        .context("no default microphone configuration")?;
+    let supported = capture_config(&device)?;
     let sample_rate = supported.sample_rate().0;
     let channels = supported.channels() as usize;
     let sample_format = supported.sample_format();

@@ -44,6 +44,8 @@ impl ksni::Tray for StatusTray {
     fn icon_name(&self) -> String {
         if self.live {
             "io.github.ltux.OllamaGui-live".to_string()
+        } else if self.wake_listening {
+            "io.github.ltux.OllamaGui-wake".to_string()
         } else {
             "io.github.ltux.OllamaGui".to_string()
         }

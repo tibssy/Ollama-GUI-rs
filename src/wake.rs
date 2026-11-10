@@ -26,6 +26,14 @@ pub const WINDOW_SAMPLES: usize = 24_000;
 pub const HOP_SAMPLES: usize = 1_280;
 /// Ignore repeated hits for this long after a detection.
 const COOLDOWN: Duration = Duration::from_secs(2);
+/// Silero VAD frame at 16 kHz.
+const VAD_FRAME: usize = 512;
+/// RMS that opens the scoring gate in a quiet room.
+const GATE_RMS: f32 = 0.004;
+/// Ceiling for the tracked noise floor.
+const GATE_FLOOR_MAX: f32 = 0.02;
+/// How long the gate stays open after the last loud frame.
+const GATE_HANGOVER: Duration = Duration::from_millis(1_500);
 
 const CATALOG_URL: &str =
     "https://huggingface.co/OpenVoiceOS/wakehubert-wakewords/raw/main/models.json";
@@ -300,6 +308,7 @@ pub fn start(
     })?;
 
     let mut resampler = stt::LinearResampler::new(capture.sample_rate);
+    let mut gate = SpeechGate::new();
     let audio = capture.audio;
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
@@ -308,6 +317,7 @@ pub fn start(
         .name("ollama-gui-wake".to_string())
         .spawn(move || {
             let mut detector = detector;
+            let mut pending: Vec<f32> = Vec::new();
             while !thread_stop.load(Ordering::SeqCst) {
                 let Ok(chunk) = audio.recv_blocking() else {
                     break;
@@ -316,16 +326,33 @@ pub fn start(
                 if pcm.is_empty() {
                     continue;
                 }
-                match detector.push(&pcm) {
-                    Ok(Some(score)) => {
-                        tracing::info!("wake word: detected (score {score:.3})");
-                        if events.try_send(WakeEvent::Detected(score)).is_err() {
+                pending.extend_from_slice(&pcm);
+
+                let mut offset = 0;
+                let mut fired = None;
+                while pending.len() - offset >= VAD_FRAME {
+                    let frame = &pending[offset..offset + VAD_FRAME];
+                    let score = gate.update(frame);
+                    let result = detector.push(frame, score);
+                    offset += VAD_FRAME;
+                    match result {
+                        Ok(Some(score)) => {
+                            fired = Some(score);
                             break;
                         }
+                        Ok(None) => {}
+                        Err(error) => {
+                            let _ = events.try_send(WakeEvent::Error(format!("{error:#}")));
+                            return;
+                        }
                     }
-                    Ok(None) => {}
-                    Err(error) => {
-                        let _ = events.try_send(WakeEvent::Error(format!("{error:#}")));
+                }
+                if offset > 0 {
+                    pending.drain(..offset);
+                }
+                if let Some(score) = fired {
+                    tracing::info!("wake word: detected (score {score:.3})");
+                    if events.try_send(WakeEvent::Detected(score)).is_err() {
                         break;
                     }
                 }
@@ -390,7 +417,11 @@ impl WakeDetector {
     }
 
     /// Feed 16 kHz mono samples. Returns the score when a word is detected.
-    pub fn push(&mut self, samples: &[f32]) -> Result<Option<f32>> {
+    ///
+    /// `score` comes from the speech gate: the window is always updated, but
+    /// inference is skipped while the audio is quiet, which is where almost
+    /// all of the CPU savings come from.
+    pub fn push(&mut self, samples: &[f32], score: bool) -> Result<Option<f32>> {
         for sample in samples {
             self.hop.push(*sample);
             if self.hop.len() < HOP_SAMPLES {
@@ -403,7 +434,7 @@ impl WakeDetector {
             if excess > 0 {
                 self.window.drain(..excess);
             }
-            if self.window.len() < WINDOW_SAMPLES {
+            if self.window.len() < WINDOW_SAMPLES || !score {
                 continue;
             }
 
@@ -457,12 +488,60 @@ impl WakeDetector {
 }
 
 fn session(path: &Path, label: &str) -> Result<Session> {
-    Session::builder()
-        .map_err(|error| anyhow::anyhow!("creating the {label} session: {error}"))?
+    let builder = Session::builder()
+        .map_err(|error| anyhow::anyhow!("creating the {label} session: {error}"))?;
+    let builder = builder
         .with_intra_threads(1)
-        .map_err(|error| anyhow::anyhow!("configuring the {label} session: {error}"))?
+        .map_err(|error| anyhow::anyhow!("configuring the {label} session: {error}"))?;
+    // Detection is infrequent, so spin-waiting between runs would burn CPU
+    // for no benefit.
+    let builder = builder
+        .with_inter_op_spinning(false)
+        .map_err(|error| anyhow::anyhow!("configuring the {label} session: {error}"))?;
+    let mut builder = builder
+        .with_intra_op_spinning(false)
+        .map_err(|error| anyhow::anyhow!("configuring the {label} session: {error}"))?;
+    builder
         .commit_from_file(path)
         .with_context(|| format!("loading {}", path.display()))
+}
+
+/// Energy gate that keeps the expensive featurizer idle while the room is
+/// quiet. It never decides *whether* a word was spoken, only whether it is
+/// worth running the model, so a false open costs CPU and nothing else.
+struct SpeechGate {
+    floor: f32,
+    active_until: Option<Instant>,
+}
+
+impl SpeechGate {
+    fn new() -> Self {
+        Self {
+            floor: 0.001,
+            active_until: None,
+        }
+    }
+
+    fn update(&mut self, frame: &[f32]) -> bool {
+        let energy = frame.iter().map(|sample| sample * sample).sum::<f32>();
+        let rms = (energy / frame.len().max(1) as f32).sqrt();
+        let now = Instant::now();
+        let was_open = self.active_until.is_some_and(|until| now < until);
+        let threshold = (self.floor * 2.5).max(GATE_RMS);
+        if rms >= threshold {
+            self.active_until = Some(now + GATE_HANGOVER);
+        } else {
+            self.floor = (self.floor * 0.98 + rms * 0.02).min(GATE_FLOOR_MAX);
+        }
+        let open = self.active_until.is_some_and(|until| now < until);
+        if open != was_open {
+            tracing::debug!(
+                "wake word: gate {} (rms {rms:.4})",
+                if open { "open" } else { "closed" }
+            );
+        }
+        open
+    }
 }
 
 #[cfg(test)]
@@ -495,6 +574,24 @@ mod tests {
             entry("wakehubert_jarvis", None).head_file(),
             std::path::PathBuf::from("wakehubert_jarvis.onnx")
         );
+    }
+
+    #[test]
+    fn energy_gate_stays_closed_in_silence() {
+        let mut gate = super::SpeechGate::new();
+        let silence = vec![0.0f32; super::VAD_FRAME];
+        for _ in 0..20 {
+            assert!(!gate.update(&silence));
+        }
+    }
+
+    #[test]
+    fn energy_gate_opens_on_speech() {
+        let mut gate = super::SpeechGate::new();
+        let silence = vec![0.0f32; super::VAD_FRAME];
+        gate.update(&silence);
+        let speech = vec![0.1f32; super::VAD_FRAME];
+        assert!(gate.update(&speech));
     }
 
     #[test]
@@ -554,11 +651,12 @@ mod tests {
     #[ignore = "requires downloaded wake word models and WAKE_TEST_WAV"]
     fn detects_spoken_wake_word() {
         let path = std::env::var("WAKE_TEST_WAV").expect("set WAKE_TEST_WAV");
+        let target = std::env::var("WAKE_TEST_WORD").unwrap_or_else(|_| "hey jarvis".to_string());
         let words = super::read_catalog().expect("catalog");
         let word = words
             .iter()
-            .find(|word| word.word == "hey jarvis")
-            .expect("hey jarvis head");
+            .find(|word| word.word == target)
+            .unwrap_or_else(|| panic!("{target} head"));
         let mut detector = super::WakeDetector::load(word, 0.0).expect("load detector");
 
         let mut samples = vec![0.0f32; 16_000];
@@ -567,7 +665,7 @@ mod tests {
         let mut detected = None;
         let mut best = 0.0f32;
         for chunk in samples.chunks(1_280) {
-            if let Some(score) = detector.push(chunk).expect("score") {
+            if let Some(score) = detector.push(chunk, true).expect("score") {
                 detected = Some(score);
                 break;
             }
@@ -582,11 +680,12 @@ mod tests {
     #[ignore = "requires downloaded wake word models and WAKE_TEST_NEGATIVE_WAV"]
     fn ignores_other_speech() {
         let path = std::env::var("WAKE_TEST_NEGATIVE_WAV").expect("set WAKE_TEST_NEGATIVE_WAV");
+        let target = std::env::var("WAKE_TEST_WORD").unwrap_or_else(|_| "hey jarvis".to_string());
         let words = super::read_catalog().expect("catalog");
         let word = words
             .iter()
-            .find(|word| word.word == "hey jarvis")
-            .expect("hey jarvis head");
+            .find(|word| word.word == target)
+            .unwrap_or_else(|| panic!("{target} head"));
         let mut detector = super::WakeDetector::load(word, 0.0).expect("load detector");
 
         let mut samples = vec![0.0f32; 16_000];
@@ -595,7 +694,7 @@ mod tests {
 
         let mut best = 0.0f32;
         for chunk in samples.chunks(1_280) {
-            detector.push(chunk).expect("score");
+            detector.push(chunk, true).expect("score");
             best = best.max(detector.last_score());
         }
         println!("negative best={best:.3}");

@@ -1009,7 +1009,8 @@ struct ChatWindow {
     wake_generation: Cell<u64>,
     wake_preparing: Cell<bool>,
     wake_listening: Cell<bool>,
-    wake_paused: Cell<bool>,
+    /// Session-only armed state. Wake detection never starts by itself.
+    wake_active: Cell<bool>,
     wake_pending: Cell<bool>,
     wake_tx: async_channel::Sender<()>,
     wake_rx: RefCell<Option<async_channel::Receiver<()>>>,
@@ -1369,7 +1370,7 @@ impl ChatWindow {
             wake_generation: Cell::new(0),
             wake_preparing: Cell::new(false),
             wake_listening: Cell::new(false),
-            wake_paused: Cell::new(false),
+            wake_active: Cell::new(false),
             wake_pending: Cell::new(false),
             wake_tx,
             wake_rx: RefCell::new(Some(wake_rx)),
@@ -4909,7 +4910,7 @@ impl ChatWindow {
     // ----- Wake word -------------------------------------------------------
 
     fn wake_should_run(&self) -> bool {
-        if !self.state.settings.borrow().wake_enabled || self.wake_paused.get() {
+        if !self.state.settings.borrow().wake_enabled || !self.wake_active.get() {
             return false;
         }
         if self.live_mode.get() || self.live_pending.get() {
@@ -5100,8 +5101,10 @@ impl ChatWindow {
                                 }
                                 TrayCommand::ToggleLive => win.toggle_live(),
                                 TrayCommand::ToggleWake => {
-                                    win.wake_paused.set(win.wake_listening.get());
+                                    let active = !win.wake_active.get();
+                                    win.wake_active.set(active);
                                     win.refresh_wake();
+                                    win.update_tray_state();
                                 }
                                 TrayCommand::Quit => win.quit_from_tray(),
                             }
@@ -5694,12 +5697,13 @@ impl ChatWindow {
         let wake = adw::PreferencesGroup::new();
         wake.set_title("Wake word");
         wake.set_description(Some(
-            "Listen for a phrase and start a live voice conversation when it is heard",
+            "Start live conversation with a phrase. Use the tray menu to start and stop listening.",
         ));
 
         let wake_enable_row = adw::SwitchRow::new();
-        wake_enable_row.set_title("Listen for a wake word");
-        wake_enable_row.set_subtitle("Requires dictation and an available text-to-speech voice");
+        wake_enable_row.set_title("Enable wake word");
+        wake_enable_row
+            .set_subtitle("Adds a Wake word toggle to the tray; listening never starts on its own");
         wake_enable_row.set_active(self.state.settings.borrow().wake_enabled);
         wake.add(&wake_enable_row);
 
@@ -5804,7 +5808,10 @@ impl ChatWindow {
             wake_enable_row.connect_active_notify(move |row| {
                 win.state.settings.borrow_mut().wake_enabled = row.is_active();
                 win.save_settings();
-                win.wake_paused.set(false);
+                if !row.is_active() {
+                    win.wake_active.set(false);
+                }
+                win.stop_wake();
                 win.refresh_wake();
                 win.update_tray_state();
             });
@@ -5821,7 +5828,6 @@ impl ChatWindow {
                 }
                 win.state.settings.borrow_mut().wake_word = (*word).to_string();
                 win.save_settings();
-                win.wake_paused.set(false);
                 win.stop_wake();
                 win.refresh_wake();
             });
