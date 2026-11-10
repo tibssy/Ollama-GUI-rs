@@ -16,6 +16,7 @@ use crate::api::{
     StreamStats, ThinkSetting, ThinkingControl,
 };
 use crate::config::Settings;
+use crate::feedback::{self, Cue};
 use crate::memory::{self, MemoryPool};
 use crate::store::{Store, StoredImage, StoredMessage, StoredSummary};
 use crate::stt::{self, PreparedBackend, SttEvent};
@@ -3396,6 +3397,7 @@ impl ChatWindow {
                                     win.send_message();
                                 }
                                 SttEvent::Timeout => {
+                                    feedback::play(Cue::Timeout);
                                     win.toast("Live conversation ended");
                                     win.stop_stt();
                                     finished = true;
@@ -5025,7 +5027,16 @@ impl ChatWindow {
         // Release the microphone before the dictation path opens it again.
         self.stop_wake();
         self.wake_pending.set(true);
-        self.start_stt(true);
+        feedback::play(Cue::Wake);
+
+        // Let the cue finish first, otherwise the live session picks it up
+        // through the speakers and transcribes it as speech.
+        let win = self.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(260), move || {
+            if win.wake_pending.get() {
+                win.start_stt(true);
+            }
+        });
     }
 
     fn stop_wake(&self) {

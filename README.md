@@ -392,6 +392,10 @@ Behaviour:
   after the configured **Listening timeout** (15, 30, or 60 seconds) without
   speech, then the detector re-arms. The timeout counts from the end of the
   last utterance and is paused while a reply is being spoken.
+- Two short synthesized cues confirm the transitions: a rising pair when the
+  word is detected, and a falling pair when the listening window times out.
+  They are generated in-process, so no sound theme or audio files are needed.
+  Live listening starts a moment after the cue so it is not transcribed.
 - **Detection threshold** `0` uses the value calibrated for the selected word;
   raise it if the detector fires too easily, lower it if it misses.
 
