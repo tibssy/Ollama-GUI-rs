@@ -239,9 +239,9 @@ pub fn preview_widget(data: &[u8]) -> gtk::Widget {
     picture.upcast()
 }
 
-/// Build the image shown inside a user bubble. The picture expands to the size
-/// of its aspect frame, so every message image fills the same right-half card.
-/// Clicking opens a larger view.
+/// Build the image shown inside a user bubble. The caller fixes the card
+/// height to a 4:3 ratio, so every message image fills the same right-half
+/// card. Clicking opens a larger view.
 pub fn message_picture(image: &StoredImage, parent: &gtk::Window) -> gtk::Widget {
     let Some(texture) = framed_texture(&image.data, MESSAGE_IMAGE_WIDTH, MESSAGE_IMAGE_HEIGHT)
     else {
