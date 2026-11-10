@@ -1125,12 +1125,12 @@ impl ChatWindow {
         input.set_left_margin(6);
         input.set_right_margin(6);
         input.set_tooltip_text(Some(
-            "Enter to send, Shift+Enter for a new line, Ctrl+L to focus",
+            "Enter to send, Shift+Enter for a new line, Ctrl+L to focus, Ctrl+V to paste an image",
         ));
 
         let attach_button = gtk::Button::from_icon_name("insert-image-symbolic");
         attach_button.add_css_class("flat");
-        attach_button.set_tooltip_text(Some("Attach images (Ctrl+Shift+A)"));
+        attach_button.set_tooltip_text(Some("Attach images (Ctrl+Shift+A or Ctrl+V)"));
         attach_button.set_visible(false);
 
         let send_button = gtk::Button::from_icon_name("go-up-symbolic");
@@ -1392,6 +1392,76 @@ impl ChatWindow {
                 true
             });
             self.input.add_controller(drop_target);
+        }
+        {
+            let win = self.clone();
+            let bypass = Rc::new(Cell::new(false));
+            let bypass_in = Rc::clone(&bypass);
+            self.input.connect_paste_clipboard(move |view| {
+                if bypass_in.replace(false) {
+                    // Re-entry from the file-list fallback below.
+                    return;
+                }
+
+                let clipboard = view.clipboard();
+                let formats = clipboard.formats();
+
+                if formats_have_image(&formats) {
+                    // The clipboard holds an image, not text. Keep the default
+                    // handler from inserting the accompanying text/html.
+                    glib::signal_stop_emission_by_name(view, "paste-clipboard");
+                    if !win.selected_model_supports("vision") {
+                        win.toast("The selected model does not support images.");
+                        return;
+                    }
+
+                    let win = win.clone();
+                    glib::spawn_future_local(async move {
+                        match clipboard.read_texture_future().await {
+                            Ok(Some(texture)) => {
+                                let png = texture.save_to_png_bytes();
+                                win.add_attachment_bytes("Pasted image", png.to_vec());
+                            }
+                            Ok(None) => win.toast("The clipboard does not contain an image."),
+                            Err(err) => win.toast(&format!("Could not read the clipboard: {err}")),
+                        }
+                    });
+                    return;
+                }
+
+                // File managers expose copied images as a file list instead.
+                // Attach image files; if there are none, replay the paste so
+                // non-image clipboard content keeps its normal behavior.
+                if formats.contain_mime_type("text/uri-list") {
+                    glib::signal_stop_emission_by_name(view, "paste-clipboard");
+                    let view = view.clone();
+                    let win = win.clone();
+                    let bypass = Rc::clone(&bypass);
+                    glib::spawn_future_local(async move {
+                        let mut has_image = false;
+                        if let Ok(value) = clipboard
+                            .read_value_future(
+                                gdk::FileList::static_type(),
+                                glib::Priority::DEFAULT,
+                            )
+                            .await
+                        {
+                            if let Ok(files) = value.get::<gdk::FileList>() {
+                                for file in files.files() {
+                                    if file_is_image(&file) {
+                                        has_image = true;
+                                        win.load_attachment(file);
+                                    }
+                                }
+                            }
+                        }
+                        if !has_image {
+                            bypass.set(true);
+                            view.emit_paste_clipboard();
+                        }
+                    });
+                }
+            });
         }
         {
             let win = self.clone();
@@ -3388,14 +3458,6 @@ impl ChatWindow {
     }
 
     fn load_attachment(self: &Rc<Self>, file: gio::File) {
-        if self.attachments.borrow().len() >= image::MAX_ATTACHMENTS {
-            self.toast(&format!(
-                "You can attach at most {} images.",
-                image::MAX_ATTACHMENTS
-            ));
-            return;
-        }
-
         let name = file
             .basename()
             .map(|path| path.to_string_lossy().to_string())
@@ -3408,6 +3470,14 @@ impl ChatWindow {
     }
 
     fn add_attachment_bytes(self: &Rc<Self>, name: &str, data: Vec<u8>) {
+        if self.attachments.borrow().len() >= image::MAX_ATTACHMENTS {
+            self.toast(&format!(
+                "You can attach at most {} images.",
+                image::MAX_ATTACHMENTS
+            ));
+            return;
+        }
+
         tracing::debug!("image: processing {name} ({} bytes)", data.len());
         if data.len() > image::MAX_FILE_BYTES {
             self.toast(&format!(
@@ -5720,6 +5790,51 @@ fn trim_heap() {
     }
 }
 
+/// True when the clipboard advertises image data we can decode.
+fn formats_have_image(formats: &gdk::ContentFormats) -> bool {
+    formats.contains_type(gdk::Texture::static_type())
+        || [
+            "image/png",
+            "image/jpeg",
+            "image/webp",
+            "image/gif",
+            "image/bmp",
+            "image/tiff",
+        ]
+        .iter()
+        .any(|mime| formats.contain_mime_type(mime))
+}
+
+/// Filter file-manager clipboard entries down to images before reading them.
+fn file_is_image(file: &gio::File) -> bool {
+    if let Ok(info) = file.query_info(
+        "standard::content-type",
+        gio::FileQueryInfoFlags::NONE,
+        None::<&gio::Cancellable>,
+    ) {
+        if info
+            .content_type()
+            .is_some_and(|content_type| content_type.starts_with("image/"))
+        {
+            return true;
+        }
+    }
+
+    let extension = file
+        .basename()
+        .and_then(|name| {
+            std::path::Path::new(&name)
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.to_ascii_lowercase())
+        })
+        .unwrap_or_default();
+    matches!(
+        extension.as_str(),
+        "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tif" | "tiff"
+    )
+}
+
 fn title_from(text: &str) -> String {
     let first_line = text.lines().next().unwrap_or("New Chat").trim();
     let mut title: String = first_line.chars().take(48).collect();
@@ -6660,11 +6775,13 @@ fn capability_description(capability: &str) -> Option<&'static str> {
 mod tests {
     use super::{
         build_compression_plan, build_request_messages, chunk_messages, clamp_summary,
-        context_needs_compression, decode_wav, estimate_tokens, format_percent, group_digits,
-        kept_turn_start, plain_text_for_speech, sentences_for_speech, split_sentences,
-        take_complete_sentences, tts_language, voice_options_for_backend, SpeechTextBuffer,
+        context_needs_compression, decode_wav, estimate_tokens, file_is_image, format_percent,
+        formats_have_image, group_digits, kept_turn_start, plain_text_for_speech,
+        sentences_for_speech, split_sentences, take_complete_sentences, tts_language,
+        voice_options_for_backend, SpeechTextBuffer,
     };
     use crate::store::{StoredImage, StoredMessage, StoredSummary};
+    use gtk::{gdk, gio};
     use std::collections::HashMap;
 
     #[test]
@@ -6673,6 +6790,31 @@ mod tests {
         assert_eq!(group_digits(999), "999");
         assert_eq!(group_digits(8_192), "8,192");
         assert_eq!(group_digits(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn detects_image_clipboard_formats() {
+        assert!(formats_have_image(&gdk::ContentFormats::new(&[
+            "image/png"
+        ])));
+        assert!(formats_have_image(&gdk::ContentFormats::new(&[
+            "image/jpeg"
+        ])));
+        assert!(!formats_have_image(&gdk::ContentFormats::new(&[
+            "text/plain",
+            "text/html"
+        ])));
+        assert!(!formats_have_image(&gdk::ContentFormats::new(&[
+            "text/uri-list"
+        ])));
+    }
+
+    #[test]
+    fn detects_image_files_from_a_file_list() {
+        assert!(file_is_image(&gio::File::for_path("/tmp/photo.PNG")));
+        assert!(file_is_image(&gio::File::for_path("/tmp/photo.webp")));
+        assert!(!file_is_image(&gio::File::for_path("/tmp/notes.txt")));
+        assert!(!file_is_image(&gio::File::for_path("/tmp/archive")));
     }
 
     #[test]
