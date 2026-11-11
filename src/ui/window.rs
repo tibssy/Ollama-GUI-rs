@@ -877,24 +877,6 @@ fn fill_stt_language_row(
     code
 }
 
-fn stt_provider_from_index(index: u32) -> &'static str {
-    match index {
-        1 => "parakeet",
-        2 => "whistle",
-        3 => "builtin",
-        _ => "auto",
-    }
-}
-
-fn stt_provider_index(provider: &str) -> u32 {
-    match provider {
-        "parakeet" => 1,
-        "whistle" => 2,
-        "builtin" => 3,
-        _ => 0,
-    }
-}
-
 fn fill_voice_row(
     row: &adw::ComboRow,
     backend: &str,
@@ -946,6 +928,167 @@ enum ManagedModel {
 }
 
 type ParakeetBadges = Rc<RefCell<Vec<(crate::parakeet::ParakeetModel, gtk::Label)>>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SttProviderChoice {
+    Auto,
+    Parakeet(crate::parakeet::ParakeetModel),
+    Whistle,
+    Builtin,
+}
+
+impl SttProviderChoice {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Automatic",
+            Self::Parakeet(crate::parakeet::ParakeetModel::Redux) => "Parakeet Redux",
+            Self::Parakeet(crate::parakeet::ParakeetModel::Ultra) => "Parakeet Ultra",
+            Self::Whistle => "Whistle",
+            Self::Builtin => "Ollama model (built-in)",
+        }
+    }
+
+    fn provider(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Parakeet(_) => "parakeet",
+            Self::Whistle => "whistle",
+            Self::Builtin => "builtin",
+        }
+    }
+
+    fn parakeet_model(self) -> Option<crate::parakeet::ParakeetModel> {
+        match self {
+            Self::Parakeet(model) => Some(model),
+            _ => None,
+        }
+    }
+
+    fn from_settings(provider: &str, model: crate::parakeet::ParakeetModel) -> Self {
+        match provider {
+            "parakeet" => Self::Parakeet(model),
+            "whistle" => Self::Whistle,
+            "builtin" => Self::Builtin,
+            _ => Self::Auto,
+        }
+    }
+
+    fn downloaded(self) -> bool {
+        match self {
+            Self::Auto | Self::Builtin => true,
+            Self::Parakeet(model) => crate::parakeet::is_downloaded(model),
+            Self::Whistle => crate::whistle::is_downloaded(),
+        }
+    }
+}
+
+fn build_stt_provider_choices(
+    parakeet_available: impl Fn(crate::parakeet::ParakeetModel) -> bool,
+    whistle_available: impl Fn() -> bool,
+) -> Vec<SttProviderChoice> {
+    let mut choices = vec![SttProviderChoice::Auto];
+    for model in [
+        crate::parakeet::ParakeetModel::Redux,
+        crate::parakeet::ParakeetModel::Ultra,
+    ] {
+        if parakeet_available(model) {
+            choices.push(SttProviderChoice::Parakeet(model));
+        }
+    }
+    if whistle_available() {
+        choices.push(SttProviderChoice::Whistle);
+    }
+    choices.push(SttProviderChoice::Builtin);
+    choices
+}
+
+struct SttProviderRowState {
+    row: adw::ComboRow,
+    choices: Rc<RefCell<Vec<SttProviderChoice>>>,
+    suppress: Rc<Cell<bool>>,
+    language_row: adw::ComboRow,
+    language_choices: Rc<RefCell<Vec<SttLanguage>>>,
+    language_suppress: Rc<Cell<bool>>,
+    badges: ParakeetBadges,
+}
+
+impl SttProviderRowState {
+    fn update_badges(&self, win: &Rc<ChatWindow>, selected: SttProviderChoice) {
+        let show = matches!(
+            selected,
+            SttProviderChoice::Auto | SttProviderChoice::Parakeet(_)
+        );
+        let model = win.parakeet_model();
+        for (variant, label) in self.badges.borrow().iter() {
+            label.set_visible(show && *variant == model);
+        }
+    }
+
+    fn refresh(&self, win: &Rc<ChatWindow>) {
+        let (provider, model) = {
+            let settings = win.state.settings.borrow();
+            (
+                settings.stt_provider.clone(),
+                crate::parakeet::ParakeetModel::from_setting(&settings.stt_parakeet_model),
+            )
+        };
+
+        let choices = build_stt_provider_choices(
+            crate::parakeet::is_downloaded,
+            crate::whistle::is_downloaded,
+        );
+
+        let mut selected = SttProviderChoice::from_settings(&provider, model);
+        if !choices.contains(&selected) || !selected.downloaded() {
+            selected = SttProviderChoice::Auto;
+            win.state.settings.borrow_mut().stt_provider = "auto".to_string();
+            win.save_settings();
+        }
+
+        if let Some(model) = selected.parakeet_model() {
+            let changed = {
+                let mut settings = win.state.settings.borrow_mut();
+                if settings.stt_parakeet_model != model.as_str() {
+                    settings.stt_parakeet_model = model.as_str().to_string();
+                    true
+                } else {
+                    false
+                }
+            };
+            if changed {
+                win.save_settings();
+            }
+        }
+
+        let labels: Vec<&str> = choices.iter().map(|choice| choice.label()).collect();
+        let list = gtk::StringList::new(&labels);
+        let index = choices
+            .iter()
+            .position(|choice| *choice == selected)
+            .unwrap_or(0) as u32;
+
+        *self.choices.borrow_mut() = choices;
+        self.suppress.set(true);
+        self.row.set_model(Some(&list));
+        self.row.set_selected(index);
+        self.suppress.set(false);
+
+        let current = win.state.settings.borrow().stt_language.clone();
+        let selected_language = fill_stt_language_row(
+            &self.language_row,
+            selected.provider(),
+            &current,
+            &self.language_choices,
+            &self.language_suppress,
+        );
+        if win.state.settings.borrow().stt_language != selected_language {
+            win.state.settings.borrow_mut().stt_language = selected_language;
+            win.save_settings();
+        }
+
+        self.update_badges(win, selected);
+    }
+}
 
 impl ManagedModel {
     fn display_name(self) -> &'static str {
@@ -5180,10 +5323,6 @@ impl ChatWindow {
         )
     }
 
-    fn sync_parakeet_model_row(&self, provider: &str, row: &adw::ComboRow) {
-        row.set_visible(provider == "parakeet");
-    }
-
     fn update_managed_model_row(
         &self,
         model: ManagedModel,
@@ -5203,8 +5342,7 @@ impl ChatWindow {
             model.approx_size(),
             model.license()
         ));
-        download.set_label(if downloaded { "Downloaded" } else { "Download" });
-        download.set_sensitive(!downloaded);
+        download.set_visible(!downloaded);
         delete.set_visible(downloaded);
     }
 
@@ -5219,19 +5357,26 @@ impl ChatWindow {
             let selected = gtk::Label::new(Some("Selected"));
             selected.add_css_class("model-selected");
             selected.set_valign(gtk::Align::Center);
-            selected.set_visible(self.parakeet_model() == variant);
+            let provider = self.state.settings.borrow().stt_provider.clone();
+            let show = matches!(provider.as_str(), "auto" | "parakeet");
+            selected.set_visible(show && self.parakeet_model() == variant);
             row.add_suffix(&selected);
             badges.borrow_mut().push((variant, selected));
         }
 
-        let spinner = gtk::Spinner::new();
-        spinner.set_valign(gtk::Align::Center);
-        spinner.set_visible(false);
-        row.add_suffix(&spinner);
+        let progress = gtk::ProgressBar::new();
+        progress.set_valign(gtk::Align::Center);
+        progress.set_size_request(96, 4);
+        progress.set_show_text(false);
+        progress.set_pulse_step(0.12);
+        progress.add_css_class("download-line");
+        progress.set_visible(false);
+        row.add_suffix(&progress);
 
-        let download = gtk::Button::new();
+        let download = gtk::Button::from_icon_name("folder-download-symbolic");
         download.add_css_class("flat");
         download.set_valign(gtk::Align::Center);
+        download.set_tooltip_text(Some("Download model"));
         row.add_suffix(&download);
 
         let delete = gtk::Button::from_icon_name("user-trash-symbolic");
@@ -5245,18 +5390,33 @@ impl ChatWindow {
         {
             let win = self.clone();
             let row = row.clone();
-            let spinner = spinner.clone();
+            let progress = progress.clone();
             let download_button = download.clone();
             let delete_button = delete.clone();
             download.connect_clicked(move |_| {
                 if model.is_downloaded() {
                     return;
                 }
-                spinner.set_visible(true);
-                spinner.start();
-                download_button.set_sensitive(false);
+                progress.set_visible(true);
+                progress.pulse();
+                download_button.set_visible(false);
                 delete_button.set_visible(false);
                 row.set_subtitle(&format!("Downloading {}…", model.display_name()));
+
+                let pulsing = Rc::new(Cell::new(true));
+                {
+                    let pulsing = Rc::clone(&pulsing);
+                    let progress = progress.clone();
+                    glib::timeout_add_local(std::time::Duration::from_millis(90), move || {
+                        if !pulsing.get() {
+                            progress.set_visible(false);
+                            return glib::ControlFlow::Break;
+                        }
+                        progress.pulse();
+                        glib::ControlFlow::Continue
+                    });
+                }
+
                 let (tx, rx) = async_channel::bounded(1);
                 win.state.runtime.spawn(async move {
                     let result = model.download().await;
@@ -5265,14 +5425,14 @@ impl ChatWindow {
 
                 let win = win.clone();
                 let row = row.clone();
-                let spinner = spinner.clone();
+                let progress = progress.clone();
                 let download_button = download_button.clone();
                 let delete_button = delete_button.clone();
                 glib::spawn_future_local(async move {
                     match rx.recv().await {
                         Ok(Ok(())) => {
-                            spinner.stop();
-                            spinner.set_visible(false);
+                            pulsing.set(false);
+                            progress.set_visible(false);
                             win.update_managed_model_row(
                                 model,
                                 &row,
@@ -5282,8 +5442,8 @@ impl ChatWindow {
                             win.toast(&format!("{} model downloaded", model.display_name()));
                         }
                         Ok(Err(err)) => {
-                            spinner.stop();
-                            spinner.set_visible(false);
+                            pulsing.set(false);
+                            progress.set_visible(false);
                             win.update_managed_model_row(
                                 model,
                                 &row,
@@ -5296,8 +5456,8 @@ impl ChatWindow {
                             ));
                         }
                         Err(_) => {
-                            spinner.stop();
-                            spinner.set_visible(false);
+                            pulsing.set(false);
+                            progress.set_visible(false);
                         }
                     }
                 });
@@ -6167,35 +6327,9 @@ impl ChatWindow {
         let stt_provider_row = adw::ComboRow::new();
         stt_provider_row.set_title("Preferred STT");
         stt_provider_row.set_subtitle(
-            "Automatic prefers the selected Parakeet model, then Whistle, then an audio-capable Ollama model",
+            "Only downloaded local models are listed; Automatic prefers Parakeet, then Whistle",
         );
-        let stt_providers = gtk::StringList::new(&[
-            "Automatic",
-            "Parakeet (local ONNX)",
-            "Whistle (local ONNX)",
-            "Ollama model (built-in)",
-        ]);
-        stt_provider_row.set_model(Some(&stt_providers));
-        stt_provider_row.set_selected(stt_provider_index(
-            &self.state.settings.borrow().stt_provider,
-        ));
         stt.add(&stt_provider_row);
-
-        let parakeet_model_row = adw::ComboRow::new();
-        parakeet_model_row.set_title("Parakeet model");
-        parakeet_model_row
-            .set_subtitle("Redux is faster on CPU; Ultra is more accurate but larger");
-        let parakeet_models =
-            gtk::StringList::new(&["Redux — fast · ~420 MB", "Ultra — accurate · ~720 MB"]);
-        parakeet_model_row.set_model(Some(&parakeet_models));
-        parakeet_model_row.set_selected(
-            if self.parakeet_model() == crate::parakeet::ParakeetModel::Ultra {
-                1
-            } else {
-                0
-            },
-        );
-        stt.add(&parakeet_model_row);
 
         let stt_language_row = adw::ComboRow::new();
         stt_language_row.set_title("Language");
@@ -6204,22 +6338,64 @@ impl ChatWindow {
         );
         let stt_choices: Rc<RefCell<Vec<SttLanguage>>> = Rc::new(RefCell::new(Vec::new()));
         let suppress_stt_language = Rc::new(Cell::new(false));
-        {
-            let settings = self.state.settings.borrow();
-            let selected = fill_stt_language_row(
-                &stt_language_row,
-                &settings.stt_provider,
-                &settings.stt_language,
-                &stt_choices,
-                &suppress_stt_language,
-            );
-            drop(settings);
-            if self.state.settings.borrow().stt_language != selected {
-                self.state.settings.borrow_mut().stt_language = selected;
-                self.save_settings();
-            }
-        }
         stt.add(&stt_language_row);
+
+        let stt_provider_state = Rc::new(SttProviderRowState {
+            row: stt_provider_row.clone(),
+            choices: Rc::new(RefCell::new(Vec::new())),
+            suppress: Rc::new(Cell::new(false)),
+            language_row: stt_language_row.clone(),
+            language_choices: Rc::clone(&stt_choices),
+            language_suppress: Rc::clone(&suppress_stt_language),
+            badges: Rc::clone(&parakeet_badges),
+        });
+        stt_provider_state.refresh(self);
+
+        {
+            let win = self.clone();
+            let state = Rc::clone(&stt_provider_state);
+            stt_provider_row.connect_selected_notify(move |combo| {
+                if state.suppress.get() {
+                    return;
+                }
+                let index = combo.selected() as usize;
+                let Some(choice) = state.choices.borrow().get(index).copied() else {
+                    return;
+                };
+                {
+                    let mut settings = win.state.settings.borrow_mut();
+                    settings.stt_provider = choice.provider().to_string();
+                    if let Some(model) = choice.parakeet_model() {
+                        settings.stt_parakeet_model = model.as_str().to_string();
+                    }
+                }
+                win.save_settings();
+
+                let current = win.state.settings.borrow().stt_language.clone();
+                let selected = fill_stt_language_row(
+                    &state.language_row,
+                    choice.provider(),
+                    &current,
+                    &state.language_choices,
+                    &state.language_suppress,
+                );
+                let language_changed = {
+                    let mut settings = win.state.settings.borrow_mut();
+                    if settings.stt_language != selected {
+                        settings.stt_language = selected;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if language_changed {
+                    win.save_settings();
+                }
+
+                state.update_badges(&win, choice);
+                win.stop_stt();
+            });
+        }
 
         let stt_start_row = adw::SpinRow::new(
             Some(&gtk::Adjustment::new(
@@ -6258,9 +6434,6 @@ impl ChatWindow {
         stt_autosend_row.set_subtitle("Send the transcript when speech ends");
         stt_autosend_row.set_active(self.state.settings.borrow().stt_autosend);
         stt.add(&stt_autosend_row);
-
-        let stt_provider = self.state.settings.borrow().stt_provider.clone();
-        self.sync_parakeet_model_row(&stt_provider, &parakeet_model_row);
 
         general_page.add(&stt);
 
@@ -6484,24 +6657,6 @@ impl ChatWindow {
         }
         {
             let win = self.clone();
-            let language_row = stt_language_row.clone();
-            let choices = Rc::clone(&stt_choices);
-            let suppress = Rc::clone(&suppress_stt_language);
-            let parakeet_model_row = parakeet_model_row.clone();
-            stt_provider_row.connect_selected_notify(move |row| {
-                let provider = stt_provider_from_index(row.selected());
-                win.state.settings.borrow_mut().stt_provider = provider.to_string();
-                win.sync_parakeet_model_row(provider, &parakeet_model_row);
-                let current = win.state.settings.borrow().stt_language.clone();
-                let selected =
-                    fill_stt_language_row(&language_row, provider, &current, &choices, &suppress);
-                win.state.settings.borrow_mut().stt_language = selected;
-                win.save_settings();
-                win.stop_stt();
-            });
-        }
-        {
-            let win = self.clone();
             let choices = Rc::clone(&stt_choices);
             let suppress = Rc::clone(&suppress_stt_language);
             stt_language_row.connect_selected_notify(move |row| {
@@ -6539,27 +6694,6 @@ impl ChatWindow {
                 win.save_settings();
             });
         }
-        {
-            let win = self.clone();
-            let badges = Rc::clone(&parakeet_badges);
-            parakeet_model_row.connect_selected_notify(move |combo| {
-                let model = if combo.selected() == 1 {
-                    crate::parakeet::ParakeetModel::Ultra
-                } else {
-                    crate::parakeet::ParakeetModel::Redux
-                };
-                win.state.settings.borrow_mut().stt_parakeet_model = model.as_str().to_string();
-                win.save_settings();
-                if win.stt_listening.get() || win.stt_preparing.get() {
-                    win.stop_stt();
-                }
-                win.unload_stt_engine(None);
-                for (variant, label) in badges.borrow().iter() {
-                    label.set_visible(*variant == model);
-                }
-            });
-        }
-
         let appearance = adw::PreferencesGroup::new();
         appearance.set_title("Appearance");
 
@@ -6740,6 +6874,15 @@ impl ChatWindow {
         stack.add_titled(&general_page, Some("general"), "General");
         stack.add_titled(&models_page, Some("models"), "Models");
         stack.set_visible_child_name("general");
+        {
+            let win = self.clone();
+            let provider_state = Rc::clone(&stt_provider_state);
+            stack.connect_visible_child_name_notify(move |stack| {
+                if stack.visible_child_name().as_deref() == Some("general") {
+                    provider_state.refresh(&win);
+                }
+            });
+        }
 
         let switcher = adw::ViewSwitcher::new();
         switcher.set_policy(adw::ViewSwitcherPolicy::Wide);
@@ -7918,12 +8061,14 @@ fn capability_description(capability: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    use super::build_stt_provider_choices;
     use super::{
         build_compression_plan, build_request_messages, chunk_messages, clamp_summary,
         context_needs_compression, decode_wav, estimate_tokens, file_is_image, format_percent,
         formats_have_image, group_digits, is_sleep_command, kept_turn_start, plain_text_for_speech,
         sentences_for_speech, should_start_new_voice_chat, split_sentences,
         take_complete_sentences, tts_language, voice_options_for_backend, SpeechTextBuffer,
+        SttProviderChoice,
     };
     use crate::store::{StoredImage, StoredMessage, StoredSummary};
     use gtk::{gdk, gio};
@@ -7971,6 +8116,57 @@ mod tests {
         assert!(!should_start_new_voice_chat(true, true, false));
         assert!(!should_start_new_voice_chat(true, false, true));
         assert!(!should_start_new_voice_chat(false, true, true));
+    }
+
+    #[test]
+    fn stt_provider_choices_map_to_settings() {
+        use crate::parakeet::ParakeetModel;
+        assert_eq!(SttProviderChoice::Auto.provider(), "auto");
+        assert_eq!(
+            SttProviderChoice::Parakeet(ParakeetModel::Redux).provider(),
+            "parakeet"
+        );
+        assert_eq!(
+            SttProviderChoice::Parakeet(ParakeetModel::Ultra).parakeet_model(),
+            Some(ParakeetModel::Ultra)
+        );
+        assert_eq!(SttProviderChoice::Whistle.provider(), "whistle");
+        assert_eq!(SttProviderChoice::Builtin.provider(), "builtin");
+        assert_eq!(
+            SttProviderChoice::from_settings("parakeet", ParakeetModel::Ultra),
+            SttProviderChoice::Parakeet(ParakeetModel::Ultra)
+        );
+        assert_eq!(
+            SttProviderChoice::from_settings("whistle", ParakeetModel::Redux),
+            SttProviderChoice::Whistle
+        );
+    }
+
+    #[test]
+    fn stt_provider_options_only_include_downloaded_models() {
+        use crate::parakeet::ParakeetModel;
+        assert_eq!(
+            build_stt_provider_choices(|_| false, || false),
+            vec![SttProviderChoice::Auto, SttProviderChoice::Builtin]
+        );
+        assert_eq!(
+            build_stt_provider_choices(|model| model == ParakeetModel::Ultra, || false),
+            vec![
+                SttProviderChoice::Auto,
+                SttProviderChoice::Parakeet(ParakeetModel::Ultra),
+                SttProviderChoice::Builtin
+            ]
+        );
+        assert_eq!(
+            build_stt_provider_choices(|_| true, || true),
+            vec![
+                SttProviderChoice::Auto,
+                SttProviderChoice::Parakeet(ParakeetModel::Redux),
+                SttProviderChoice::Parakeet(ParakeetModel::Ultra),
+                SttProviderChoice::Whistle,
+                SttProviderChoice::Builtin
+            ]
+        );
     }
 
     #[test]

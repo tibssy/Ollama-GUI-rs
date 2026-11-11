@@ -161,15 +161,14 @@ symbols/emoji are stripped so only speakable text is sent to the engine.
 
 General → Speech to Text enables the microphone button in the composer.
 
-- **Preferred STT** — *Automatic* prefers the selected Parakeet model when its
-  files are downloaded, then Whistle when its model is downloaded and the
-  language is supported, then the selected Ollama model when it supports audio
-  input, and otherwise Whistle. Parakeet, Whistle, and the built-in model can
-  also be forced explicitly.
-- **Parakeet model** — *Redux* is the small, CPU-friendly export (~420 MB).
-  *Ultra* is the larger, more accurate export (~720 MB) and is slower on CPU.
-  The selector is shown when Parakeet is the chosen provider. Download and
-  delete files in the **Models** tab.
+- **Preferred STT** — only installed local models are listed. The options are
+  *Automatic*, *Parakeet Redux*, *Parakeet Ultra* (when installed), *Whistle*
+  (when installed), and the built-in Ollama audio model. *Automatic* prefers
+  the configured Parakeet variant, then Whistle, then the Ollama model.
+- **Parakeet Redux / Ultra** — Redux is the small, CPU-friendly export
+  (~420 MB). Ultra is the larger, more accurate export (~720 MB) and is slower
+  on CPU. Install or remove them in the **Models** tab; once installed they
+  appear directly in the Preferred STT list.
 - **Language** — Parakeet detects the language automatically. Whistle supports
   English, German, French, Spanish, Italian, Dutch and Polish. Built-in
   languages depend on the selected model (`lfm3-audio` supports 19 languages).
@@ -409,13 +408,14 @@ active provider:
 - **Text to Speech** — Paradee
 
 Each row shows whether the model is downloaded, its approximate size, and its
-license. A **Download** button is shown when the files are missing; a spinner
-and “Downloading …” subtitle appear while work is in progress. Downloaded
-models have a trash button that stops any active session, unloads the engine,
-and removes the files.
+license. A download icon button is shown when the files are missing; a
+horizontal pulsing line and a “Downloading …” subtitle appear while work is in
+progress. Downloaded models have a trash button that stops any active session,
+unloads the engine, and removes the files.
 
-The Parakeet variant used by the app is marked **Selected** in this tab. Choose
-it under General → Speech to Text → **Parakeet model**.
+The Parakeet variant used by the app is marked **Selected** in this tab while
+Parakeet or Automatic is the active provider. Choose a variant directly from
+**General → Speech to Text → Preferred STT** when installed.
 
 ## Wake word
 

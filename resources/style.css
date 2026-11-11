@@ -133,6 +133,20 @@
   font-size: 0.78em;
 }
 
+.download-line {
+  min-height: 4px;
+}
+
+.download-line > trough {
+  min-height: 4px;
+  border-radius: 999px;
+}
+
+.download-line > trough > progress {
+  min-height: 4px;
+  border-radius: 999px;
+}
+
 .message-action {
   min-width: 24px;
   min-height: 24px;
