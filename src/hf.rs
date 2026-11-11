@@ -62,6 +62,9 @@ pub fn normalize_repo(input: &str) -> Result<(String, Option<String>)> {
         bail!("expected owner/repository, e.g. AtomicChat/LFM3-1.7B-Uncensored-GGUF");
     }
     for part in &parts {
+        if *part == "." || *part == ".." {
+            bail!("repository names may not be '.' or '..'");
+        }
         if !part
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
@@ -292,6 +295,8 @@ mod tests {
         assert!(normalize_repo("").is_err());
         assert!(normalize_repo("not-a-repo").is_err());
         assert!(normalize_repo("owner/repo/extra").is_err());
+        assert!(normalize_repo("../repo").is_err());
+        assert!(normalize_repo("owner/..").is_err());
     }
 
     #[test]
