@@ -116,9 +116,16 @@ use).
 The server URL defaults to `http://localhost:11434`. For a remote or Ollama
 Cloud endpoint, set the URL and, if needed, an API key under Preferences.
 
+## Preferences
+
+Preferences is a wider, tabbed dialog. **General** contains the connection,
+application, generation, long-term memory, speech, speech-to-text, wake-word,
+and appearance options. **Models** manages the downloaded local model files.
+A future **Tools** tab can be added without changing the other pages.
+
 ## Speech
 
-Preferences → Speech has the following choices:
+General → Speech has the following choices:
 
 - **Enable text-to-speech** — show the read-aloud buttons on assistant replies
 - **Preferred TTS**
@@ -138,13 +145,12 @@ Preferences → Speech has the following choices:
   disabled.
 
 Paradee 8M v1.2 is a small English-only model distilled from Kokoro-82M with
-four voices. The int8 ONNX file is downloaded on first use (or from the
-**Paradee model → Download** button) from
+four voices. The int8 ONNX file is downloaded on first use (or from
+**Preferences → Models**) from
 [huggingface.co/sahilmahendrakar/Paradee-8M-v1.2](https://huggingface.co/sahilmahendrakar/Paradee-8M-v1.2)
 and runs locally through ONNX Runtime. British voices use British eSpeak
-phonemes. The model is Apache-2.0; see its model card for details. Only the
-backend selected in **Preferred TTS** shows its download button; the Paradee
-row remains visible for status and can be removed with its trash button.
+phonemes. The model is Apache-2.0; see its model card for details. Model files
+are managed in the **Models** tab.
 
 Speech is synthesized one sentence at a time and queued for background playback,
 so the first sentence starts before the rest of the reply is generated. Before
@@ -153,7 +159,7 @@ symbols/emoji are stripped so only speakable text is sent to the engine.
 
 ## Speech to Text
 
-Preferences → Speech to Text enables the microphone button in the composer.
+General → Speech to Text enables the microphone button in the composer.
 
 - **Preferred STT** — *Automatic* prefers the selected Parakeet model when its
   files are downloaded, then Whistle when its model is downloaded and the
@@ -162,16 +168,12 @@ Preferences → Speech to Text enables the microphone button in the composer.
   also be forced explicitly.
 - **Parakeet model** — *Redux* is the small, CPU-friendly export (~420 MB).
   *Ultra* is the larger, more accurate export (~720 MB) and is slower on CPU.
-  Select the model here and download it from the row below. The selector is
-  shown when Parakeet is the selected provider.
+  The selector is shown when Parakeet is the chosen provider. Download and
+  delete files in the **Models** tab.
 - **Language** — Parakeet detects the language automatically. Whistle supports
   English, German, French, Spanish, Italian, Dutch and Polish. Built-in
   languages depend on the selected model (`lfm3-audio` supports 19 languages).
   "Auto detect" is available.
-- Only the active provider shows its download button; **Automatic** shows both
-  local candidates. Downloaded Parakeet and Whistle rows stay visible for
-  status, and both have a trash button that unloads the engine and removes the
-  model files.
 - **Wait for speech** — if no voice is detected within this many seconds,
   listening stops and the microphone becomes clickable again.
 - **End of speech silence** — seconds of silence after which the utterance is
@@ -397,6 +399,23 @@ use reloads the engine lazily. Measured warm RSS is about 230 MB for Paradee,
 transcription), or about 385 MB for Paradee and Whistle together. Parakeet
 Ultra is larger still; unloading the Parakeet engine and trimming the heap
 returns the process to about 50 MB.
+
+## Models
+
+Preferences → Models lists all local speech model files regardless of the
+active provider:
+
+- **Speech to Text** — Parakeet Redux, Parakeet Ultra, Whistle
+- **Text to Speech** — Paradee
+
+Each row shows whether the model is downloaded, its approximate size, and its
+license. A **Download** button is shown when the files are missing; a spinner
+and “Downloading …” subtitle appear while work is in progress. Downloaded
+models have a trash button that stops any active session, unloads the engine,
+and removes the files.
+
+The Parakeet variant used by the app is marked **Selected** in this tab. Choose
+it under General → Speech to Text → **Parakeet model**.
 
 ## Wake word
 

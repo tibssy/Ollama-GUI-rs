@@ -937,6 +937,78 @@ enum SttChoice {
     Builtin,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ManagedModel {
+    Paradee,
+    ParakeetRedux,
+    ParakeetUltra,
+    Whistle,
+}
+
+type ParakeetBadges = Rc<RefCell<Vec<(crate::parakeet::ParakeetModel, gtk::Label)>>>;
+
+impl ManagedModel {
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::Paradee => "Paradee",
+            Self::ParakeetRedux => "Parakeet Redux",
+            Self::ParakeetUltra => "Parakeet Ultra",
+            Self::Whistle => "Whistle",
+        }
+    }
+
+    fn approx_size(self) -> &'static str {
+        match self {
+            Self::Paradee => "8.5 MB",
+            Self::ParakeetRedux => "~420 MB",
+            Self::ParakeetUltra => "~720 MB",
+            Self::Whistle => "~160 MB",
+        }
+    }
+
+    fn license(self) -> &'static str {
+        match self {
+            Self::Paradee | Self::Whistle => "Apache-2.0",
+            Self::ParakeetRedux | Self::ParakeetUltra => "CC-BY-4.0",
+        }
+    }
+
+    fn is_downloaded(self) -> bool {
+        match self {
+            Self::Paradee => crate::paradee::is_downloaded(),
+            Self::ParakeetRedux => {
+                crate::parakeet::is_downloaded(crate::parakeet::ParakeetModel::Redux)
+            }
+            Self::ParakeetUltra => {
+                crate::parakeet::is_downloaded(crate::parakeet::ParakeetModel::Ultra)
+            }
+            Self::Whistle => crate::whistle::is_downloaded(),
+        }
+    }
+
+    async fn download(self) -> anyhow::Result<()> {
+        match self {
+            Self::Paradee => crate::paradee::ensure_downloaded().await,
+            Self::ParakeetRedux => {
+                crate::parakeet::ensure_downloaded(crate::parakeet::ParakeetModel::Redux).await
+            }
+            Self::ParakeetUltra => {
+                crate::parakeet::ensure_downloaded(crate::parakeet::ParakeetModel::Ultra).await
+            }
+            Self::Whistle => crate::whistle::ensure_downloaded().await,
+        }
+    }
+
+    fn delete(self) -> anyhow::Result<()> {
+        match self {
+            Self::Paradee => crate::paradee::delete(),
+            Self::ParakeetRedux => crate::parakeet::delete(crate::parakeet::ParakeetModel::Redux),
+            Self::ParakeetUltra => crate::parakeet::delete(crate::parakeet::ParakeetModel::Ultra),
+            Self::Whistle => crate::whistle::delete(),
+        }
+    }
+}
+
 struct ChatWindow {
     window: adw::ApplicationWindow,
     state: Rc<AppState>,
@@ -5108,77 +5180,249 @@ impl ChatWindow {
         )
     }
 
-    fn update_parakeet_model_row(
+    fn sync_parakeet_model_row(&self, provider: &str, row: &adw::ComboRow) {
+        row.set_visible(provider == "parakeet");
+    }
+
+    fn update_managed_model_row(
         &self,
+        model: ManagedModel,
         row: &adw::ActionRow,
         download: &gtk::Button,
         delete: &gtk::Button,
     ) {
-        let model = self.parakeet_model();
-        let downloaded = crate::parakeet::is_downloaded(model);
+        let downloaded = model.is_downloaded();
         row.set_title(&format!("{} model", model.display_name()));
         row.set_subtitle(&format!(
-            "{} · {} · CC-BY-4.0",
+            "{} · {} · {}",
             if downloaded {
                 "Downloaded"
             } else {
                 "Not downloaded"
             },
-            model.approx_size()
+            model.approx_size(),
+            model.license()
         ));
         download.set_label(if downloaded { "Downloaded" } else { "Download" });
         download.set_sensitive(!downloaded);
         delete.set_visible(downloaded);
     }
 
-    fn update_paradee_model_row(
-        &self,
-        row: &adw::ActionRow,
-        download: &gtk::Button,
-        delete: &gtk::Button,
-    ) {
-        let downloaded = crate::paradee::is_downloaded();
-        row.set_subtitle(if downloaded {
-            "Downloaded · 8.5 MB · Apache-2.0"
-        } else {
-            "Not downloaded · 8.5 MB · Apache-2.0"
-        });
-        download.set_label(if downloaded { "Downloaded" } else { "Download" });
-        download.set_sensitive(!downloaded);
-        delete.set_visible(downloaded);
+    fn build_model_row(
+        self: &Rc<Self>,
+        model: ManagedModel,
+        badge: Option<(ParakeetBadges, crate::parakeet::ParakeetModel)>,
+    ) -> adw::ActionRow {
+        let row = adw::ActionRow::new();
+
+        if let Some((badges, variant)) = badge {
+            let selected = gtk::Label::new(Some("Selected"));
+            selected.add_css_class("model-selected");
+            selected.set_valign(gtk::Align::Center);
+            selected.set_visible(self.parakeet_model() == variant);
+            row.add_suffix(&selected);
+            badges.borrow_mut().push((variant, selected));
+        }
+
+        let spinner = gtk::Spinner::new();
+        spinner.set_valign(gtk::Align::Center);
+        spinner.set_visible(false);
+        row.add_suffix(&spinner);
+
+        let download = gtk::Button::new();
+        download.add_css_class("flat");
+        download.set_valign(gtk::Align::Center);
+        row.add_suffix(&download);
+
+        let delete = gtk::Button::from_icon_name("user-trash-symbolic");
+        delete.add_css_class("flat");
+        delete.set_valign(gtk::Align::Center);
+        delete.set_tooltip_text(Some("Delete model"));
+        row.add_suffix(&delete);
+
+        self.update_managed_model_row(model, &row, &download, &delete);
+
+        {
+            let win = self.clone();
+            let row = row.clone();
+            let spinner = spinner.clone();
+            let download_button = download.clone();
+            let delete_button = delete.clone();
+            download.connect_clicked(move |_| {
+                if model.is_downloaded() {
+                    return;
+                }
+                spinner.set_visible(true);
+                spinner.start();
+                download_button.set_sensitive(false);
+                delete_button.set_visible(false);
+                row.set_subtitle(&format!("Downloading {}…", model.display_name()));
+                let (tx, rx) = async_channel::bounded(1);
+                win.state.runtime.spawn(async move {
+                    let result = model.download().await;
+                    let _ = tx.send(result).await;
+                });
+
+                let win = win.clone();
+                let row = row.clone();
+                let spinner = spinner.clone();
+                let download_button = download_button.clone();
+                let delete_button = delete_button.clone();
+                glib::spawn_future_local(async move {
+                    match rx.recv().await {
+                        Ok(Ok(())) => {
+                            spinner.stop();
+                            spinner.set_visible(false);
+                            win.update_managed_model_row(
+                                model,
+                                &row,
+                                &download_button,
+                                &delete_button,
+                            );
+                            win.toast(&format!("{} model downloaded", model.display_name()));
+                        }
+                        Ok(Err(err)) => {
+                            spinner.stop();
+                            spinner.set_visible(false);
+                            win.update_managed_model_row(
+                                model,
+                                &row,
+                                &download_button,
+                                &delete_button,
+                            );
+                            win.toast(&format!(
+                                "Could not download {}: {err:#}",
+                                model.display_name()
+                            ));
+                        }
+                        Err(_) => {
+                            spinner.stop();
+                            spinner.set_visible(false);
+                        }
+                    }
+                });
+            });
+        }
+        {
+            let win = self.clone();
+            let row = row.clone();
+            let download_button = download.clone();
+            let delete_button = delete.clone();
+            delete.connect_clicked(move |_| {
+                if !model.is_downloaded() {
+                    return;
+                }
+                match model {
+                    ManagedModel::Paradee => win.stop_speech(),
+                    _ => {
+                        if win.stt_listening.get() || win.stt_preparing.get() {
+                            win.stop_stt();
+                        }
+                    }
+                }
+
+                let paradee = Arc::clone(&win.state.paradee);
+                let parakeet = Arc::clone(&win.state.parakeet);
+                let whistle = Arc::clone(&win.state.whistle);
+                let (tx, rx) = async_channel::bounded(1);
+                win.state.runtime.spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        match model {
+                            ManagedModel::Paradee => {
+                                if let Ok(mut guard) = paradee.lock() {
+                                    *guard = None;
+                                }
+                            }
+                            ManagedModel::ParakeetRedux => {
+                                if let Ok(mut guard) = parakeet.lock() {
+                                    if guard.as_ref().is_some_and(|(loaded, _)| {
+                                        *loaded == crate::parakeet::ParakeetModel::Redux
+                                    }) {
+                                        *guard = None;
+                                    }
+                                }
+                            }
+                            ManagedModel::ParakeetUltra => {
+                                if let Ok(mut guard) = parakeet.lock() {
+                                    if guard.as_ref().is_some_and(|(loaded, _)| {
+                                        *loaded == crate::parakeet::ParakeetModel::Ultra
+                                    }) {
+                                        *guard = None;
+                                    }
+                                }
+                            }
+                            ManagedModel::Whistle => {
+                                if let Ok(mut guard) = whistle.lock() {
+                                    *guard = None;
+                                }
+                            }
+                        }
+                        model.delete()
+                    })
+                    .await
+                    .map_err(|err| anyhow::anyhow!("model cleanup task failed: {err}"))
+                    .and_then(|result| result);
+                    let _ = tx.send(result).await;
+                });
+
+                let win = win.clone();
+                let row = row.clone();
+                let download_button = download_button.clone();
+                let delete_button = delete_button.clone();
+                glib::spawn_future_local(async move {
+                    match rx.recv().await {
+                        Ok(Ok(())) => {
+                            win.update_managed_model_row(
+                                model,
+                                &row,
+                                &download_button,
+                                &delete_button,
+                            );
+                            win.toast(&format!("{} model deleted", model.display_name()));
+                        }
+                        Ok(Err(err)) => {
+                            win.toast(&format!(
+                                "Could not delete {}: {err:#}",
+                                model.display_name()
+                            ));
+                        }
+                        Err(_) => {}
+                    }
+                });
+            });
+        }
+
+        row
     }
 
-    fn update_whistle_model_row(
-        &self,
-        row: &adw::ActionRow,
-        download: &gtk::Button,
-        delete: &gtk::Button,
-    ) {
-        let downloaded = crate::whistle::is_downloaded();
-        row.set_subtitle(if downloaded {
-            "Downloaded · ~160 MB · Apache-2.0"
-        } else {
-            "Not downloaded · ~160 MB · Apache-2.0"
-        });
-        download.set_label(if downloaded { "Downloaded" } else { "Download" });
-        download.set_sensitive(!downloaded);
-        delete.set_visible(downloaded);
-    }
+    fn build_models_page(self: &Rc<Self>, badges: &ParakeetBadges) -> adw::PreferencesPage {
+        let page = adw::PreferencesPage::new();
 
-    fn sync_stt_model_rows(
-        &self,
-        provider: &str,
-        parakeet_model_row: &adw::ComboRow,
-        parakeet_download: &gtk::Button,
-        whistle_download: &gtk::Button,
-    ) {
-        parakeet_model_row.set_visible(provider == "parakeet");
-        parakeet_download.set_visible(matches!(provider, "auto" | "parakeet"));
-        whistle_download.set_visible(matches!(provider, "auto" | "whistle"));
-    }
+        let stt = adw::PreferencesGroup::new();
+        stt.set_title("Speech to Text models");
+        stt.set_description(Some(
+            "Download or delete local speech recognition models. The active provider is chosen in General.",
+        ));
+        stt.add(&self.build_model_row(
+            ManagedModel::ParakeetRedux,
+            Some((Rc::clone(badges), crate::parakeet::ParakeetModel::Redux)),
+        ));
+        stt.add(&self.build_model_row(
+            ManagedModel::ParakeetUltra,
+            Some((Rc::clone(badges), crate::parakeet::ParakeetModel::Ultra)),
+        ));
+        stt.add(&self.build_model_row(ManagedModel::Whistle, None));
+        page.add(&stt);
 
-    fn sync_tts_model_row(&self, backend: &str, paradee_download: &gtk::Button) {
-        paradee_download.set_visible(matches!(backend, "auto" | "paradee"));
+        let tts = adw::PreferencesGroup::new();
+        tts.set_title("Text to Speech models");
+        tts.set_description(Some(
+            "Download or delete local voice models. The active backend is chosen in General.",
+        ));
+        tts.add(&self.build_model_row(ManagedModel::Paradee, None));
+        page.add(&tts);
+
+        page
     }
 
     fn live_available(&self) -> bool {
@@ -5561,10 +5805,8 @@ impl ChatWindow {
     }
 
     fn show_settings(self: &Rc<Self>) {
-        let page = adw::PreferencesPage::new();
-        let prefs_dialog = adw::PreferencesDialog::builder()
-            .title("Preferences")
-            .build();
+        let general_page = adw::PreferencesPage::new();
+        let parakeet_badges: ParakeetBadges = Rc::new(RefCell::new(Vec::new()));
 
         let connection = adw::PreferencesGroup::new();
         connection.set_title("Connection");
@@ -5579,7 +5821,7 @@ impl ChatWindow {
         key_row.set_text(&self.state.settings.borrow().api_key);
         connection.add(&key_row);
 
-        page.add(&connection);
+        general_page.add(&connection);
 
         let application = adw::PreferencesGroup::new();
         application.set_title("Application");
@@ -5599,7 +5841,7 @@ impl ChatWindow {
         });
         autostart_row.set_active(autostart::is_enabled());
         application.add(&autostart_row);
-        page.add(&application);
+        general_page.add(&application);
 
         {
             let win = self.clone();
@@ -5676,7 +5918,7 @@ impl ChatWindow {
         context_row.set_subtitle("num_ctx passed to Ollama");
         generation.add(&context_row);
 
-        page.add(&generation);
+        general_page.add(&generation);
 
         let memory_group = adw::PreferencesGroup::new();
         memory_group.set_title("Long-term memory");
@@ -5784,7 +6026,7 @@ impl ChatWindow {
         memory_clear_row.add_suffix(&memory_clear_button);
         memory_group.add(&memory_clear_row);
 
-        page.add(&memory_group);
+        general_page.add(&memory_group);
 
         {
             let win = self.clone();
@@ -5911,27 +6153,7 @@ impl ChatWindow {
         tts_autoread_row.set_sensitive(self.state.settings.borrow().tts_enabled);
         speech.add(&tts_autoread_row);
 
-        let paradee_row = adw::ActionRow::new();
-        paradee_row.set_title("Paradee model");
-        let paradee_spinner = gtk::Spinner::new();
-        paradee_spinner.set_valign(gtk::Align::Center);
-        paradee_spinner.set_visible(false);
-        paradee_row.add_suffix(&paradee_spinner);
-        let paradee_button = gtk::Button::new();
-        paradee_button.add_css_class("flat");
-        paradee_button.set_valign(gtk::Align::Center);
-        paradee_row.add_suffix(&paradee_button);
-        let paradee_delete = gtk::Button::from_icon_name("user-trash-symbolic");
-        paradee_delete.add_css_class("flat");
-        paradee_delete.set_valign(gtk::Align::Center);
-        paradee_delete.set_tooltip_text(Some("Delete model"));
-        paradee_row.add_suffix(&paradee_delete);
-        self.update_paradee_model_row(&paradee_row, &paradee_button, &paradee_delete);
-        let tts_backend = self.state.settings.borrow().tts_backend.clone();
-        self.sync_tts_model_row(&tts_backend, &paradee_button);
-        speech.add(&paradee_row);
-
-        page.add(&speech);
+        general_page.add(&speech);
 
         let stt = adw::PreferencesGroup::new();
         stt.set_title("Speech to Text");
@@ -6037,50 +6259,10 @@ impl ChatWindow {
         stt_autosend_row.set_active(self.state.settings.borrow().stt_autosend);
         stt.add(&stt_autosend_row);
 
-        let parakeet_row = adw::ActionRow::new();
-        let parakeet_spinner = gtk::Spinner::new();
-        parakeet_spinner.set_valign(gtk::Align::Center);
-        parakeet_spinner.set_visible(false);
-        parakeet_row.add_suffix(&parakeet_spinner);
-        let parakeet_button = gtk::Button::new();
-        parakeet_button.add_css_class("flat");
-        parakeet_button.set_valign(gtk::Align::Center);
-        parakeet_row.add_suffix(&parakeet_button);
-        let parakeet_delete = gtk::Button::from_icon_name("user-trash-symbolic");
-        parakeet_delete.add_css_class("flat");
-        parakeet_delete.set_valign(gtk::Align::Center);
-        parakeet_delete.set_tooltip_text(Some("Delete model"));
-        parakeet_row.add_suffix(&parakeet_delete);
-        self.update_parakeet_model_row(&parakeet_row, &parakeet_button, &parakeet_delete);
-        stt.add(&parakeet_row);
-
-        let whistle_row = adw::ActionRow::new();
-        whistle_row.set_title("Whistle model");
-        let whistle_spinner = gtk::Spinner::new();
-        whistle_spinner.set_valign(gtk::Align::Center);
-        whistle_spinner.set_visible(false);
-        whistle_row.add_suffix(&whistle_spinner);
-        let whistle_button = gtk::Button::new();
-        whistle_button.add_css_class("flat");
-        whistle_button.set_valign(gtk::Align::Center);
-        whistle_row.add_suffix(&whistle_button);
-        let whistle_delete = gtk::Button::from_icon_name("user-trash-symbolic");
-        whistle_delete.add_css_class("flat");
-        whistle_delete.set_valign(gtk::Align::Center);
-        whistle_delete.set_tooltip_text(Some("Delete model"));
-        whistle_row.add_suffix(&whistle_delete);
-        self.update_whistle_model_row(&whistle_row, &whistle_button, &whistle_delete);
-        stt.add(&whistle_row);
-
         let stt_provider = self.state.settings.borrow().stt_provider.clone();
-        self.sync_stt_model_rows(
-            &stt_provider,
-            &parakeet_model_row,
-            &parakeet_button,
-            &whistle_button,
-        );
+        self.sync_parakeet_model_row(&stt_provider, &parakeet_model_row);
 
-        page.add(&stt);
+        general_page.add(&stt);
 
         let wake = adw::PreferencesGroup::new();
         wake.set_title("Wake word");
@@ -6197,7 +6379,7 @@ impl ChatWindow {
         wake_model_row.add_suffix(&wake_model_button);
         wake.add(&wake_model_row);
 
-        page.add(&wake);
+        general_page.add(&wake);
 
         {
             let win = self.clone();
@@ -6287,6 +6469,97 @@ impl ChatWindow {
             });
         }
 
+        {
+            let win = self.clone();
+            stt_enable_row.connect_active_notify(move |row| {
+                win.state.settings.borrow_mut().stt_enabled = row.is_active();
+                win.save_settings();
+                if row.is_active() {
+                    win.update_stt_ui();
+                } else {
+                    win.stop_stt();
+                    win.unload_stt_engine(None);
+                }
+            });
+        }
+        {
+            let win = self.clone();
+            let language_row = stt_language_row.clone();
+            let choices = Rc::clone(&stt_choices);
+            let suppress = Rc::clone(&suppress_stt_language);
+            let parakeet_model_row = parakeet_model_row.clone();
+            stt_provider_row.connect_selected_notify(move |row| {
+                let provider = stt_provider_from_index(row.selected());
+                win.state.settings.borrow_mut().stt_provider = provider.to_string();
+                win.sync_parakeet_model_row(provider, &parakeet_model_row);
+                let current = win.state.settings.borrow().stt_language.clone();
+                let selected =
+                    fill_stt_language_row(&language_row, provider, &current, &choices, &suppress);
+                win.state.settings.borrow_mut().stt_language = selected;
+                win.save_settings();
+                win.stop_stt();
+            });
+        }
+        {
+            let win = self.clone();
+            let choices = Rc::clone(&stt_choices);
+            let suppress = Rc::clone(&suppress_stt_language);
+            stt_language_row.connect_selected_notify(move |row| {
+                if suppress.get() {
+                    return;
+                }
+                let index = row.selected() as usize;
+                if let Some(language) = choices.borrow().get(index).copied() {
+                    win.state.settings.borrow_mut().stt_language = language.code.to_string();
+                    win.save_settings();
+                    win.stop_stt();
+                }
+            });
+        }
+        {
+            let win = self.clone();
+            stt_start_row.connect_value_notify(move |row| {
+                win.state.settings.borrow_mut().stt_start_timeout_secs =
+                    row.value().max(1.0) as u32;
+                win.save_settings();
+            });
+        }
+        {
+            let win = self.clone();
+            stt_end_row.connect_value_notify(move |row| {
+                win.state.settings.borrow_mut().stt_end_silence_ms =
+                    (row.value() * 1000.0).max(200.0) as u32;
+                win.save_settings();
+            });
+        }
+        {
+            let win = self.clone();
+            stt_autosend_row.connect_active_notify(move |row| {
+                win.state.settings.borrow_mut().stt_autosend = row.is_active();
+                win.save_settings();
+            });
+        }
+        {
+            let win = self.clone();
+            let badges = Rc::clone(&parakeet_badges);
+            parakeet_model_row.connect_selected_notify(move |combo| {
+                let model = if combo.selected() == 1 {
+                    crate::parakeet::ParakeetModel::Ultra
+                } else {
+                    crate::parakeet::ParakeetModel::Redux
+                };
+                win.state.settings.borrow_mut().stt_parakeet_model = model.as_str().to_string();
+                win.save_settings();
+                if win.stt_listening.get() || win.stt_preparing.get() {
+                    win.stop_stt();
+                }
+                win.unload_stt_engine(None);
+                for (variant, label) in badges.borrow().iter() {
+                    label.set_visible(*variant == model);
+                }
+            });
+        }
+
         let appearance = adw::PreferencesGroup::new();
         appearance.set_title("Appearance");
 
@@ -6301,7 +6574,7 @@ impl ChatWindow {
         });
         appearance.add(&theme_row);
 
-        page.add(&appearance);
+        general_page.add(&appearance);
 
         {
             let win = self.clone();
@@ -6389,11 +6662,9 @@ impl ChatWindow {
             let voice_row = voice_row.clone();
             let voice_choices = Rc::clone(&voice_choices);
             let suppress_voice = Rc::clone(&suppress_voice);
-            let paradee_button = paradee_button.clone();
             backend_row.connect_selected_notify(move |row| {
                 let backend = tts_backend_from_index(row.selected());
                 win.state.settings.borrow_mut().tts_backend = backend.to_string();
-                win.sync_tts_model_row(backend, &paradee_button);
                 let current = win.state.settings.borrow().tts_language.clone();
                 let selected =
                     fill_language_row(&language_row, backend, &current, &choices, &suppress);
@@ -6463,391 +6734,40 @@ impl ChatWindow {
                 }
             });
         }
-        {
-            let win = self.clone();
-            let row = paradee_row.clone();
-            let spinner = paradee_spinner.clone();
-            let button = paradee_button.clone();
-            let delete = paradee_delete.clone();
-            paradee_button.connect_clicked(move |_| {
-                if crate::paradee::is_downloaded() {
-                    return;
-                }
-                spinner.set_visible(true);
-                spinner.start();
-                button.set_sensitive(false);
-                delete.set_visible(false);
-                row.set_subtitle("Downloading…");
-                let (tx, rx) = async_channel::bounded(1);
-                win.state.runtime.spawn(async move {
-                    let result = crate::paradee::ensure_downloaded().await;
-                    let _ = tx.send(result).await;
-                });
+        let models_page = self.build_models_page(&parakeet_badges);
 
-                let win = win.clone();
-                let row = row.clone();
-                let spinner = spinner.clone();
-                let button = button.clone();
-                let delete = delete.clone();
-                glib::spawn_future_local(async move {
-                    match rx.recv().await {
-                        Ok(Ok(())) => {
-                            spinner.stop();
-                            spinner.set_visible(false);
-                            win.update_paradee_model_row(&row, &button, &delete);
-                            win.toast("Paradee voice model downloaded");
-                        }
-                        Ok(Err(err)) => {
-                            spinner.stop();
-                            spinner.set_visible(false);
-                            win.update_paradee_model_row(&row, &button, &delete);
-                            win.toast(&format!("Could not download Paradee model: {err:#}"));
-                        }
-                        Err(_) => {
-                            spinner.stop();
-                            spinner.set_visible(false);
-                        }
-                    }
-                });
-            });
-        }
-        {
-            let win = self.clone();
-            let row = paradee_row.clone();
-            let button = paradee_button.clone();
-            let delete = paradee_delete.clone();
-            paradee_delete.connect_clicked(move |_| {
-                win.stop_speech();
-                let engine = Arc::clone(&win.state.paradee);
-                let (tx, rx) = async_channel::bounded(1);
-                win.state.runtime.spawn(async move {
-                    let result = tokio::task::spawn_blocking(move || {
-                        if let Ok(mut guard) = engine.lock() {
-                            *guard = None;
-                        }
-                        crate::paradee::delete()
-                    })
-                    .await
-                    .map_err(|err| anyhow::anyhow!("model cleanup task failed: {err}"))
-                    .and_then(|result| result);
-                    let _ = tx.send(result).await;
-                });
+        let stack = adw::ViewStack::new();
+        stack.add_titled(&general_page, Some("general"), "General");
+        stack.add_titled(&models_page, Some("models"), "Models");
+        stack.set_visible_child_name("general");
 
-                let win = win.clone();
-                let row = row.clone();
-                let button = button.clone();
-                let delete = delete.clone();
-                glib::spawn_future_local(async move {
-                    match rx.recv().await {
-                        Ok(Ok(())) => {
-                            win.update_paradee_model_row(&row, &button, &delete);
-                            win.toast("Paradee model deleted");
-                        }
-                        Ok(Err(err)) => {
-                            win.toast(&format!("Could not delete Paradee model: {err:#}"));
-                        }
-                        Err(_) => {}
-                    }
-                });
-            });
-        }
+        let switcher = adw::ViewSwitcher::new();
+        switcher.set_policy(adw::ViewSwitcherPolicy::Wide);
+        switcher.set_stack(Some(&stack));
 
-        {
-            let win = self.clone();
-            stt_enable_row.connect_active_notify(move |row| {
-                win.state.settings.borrow_mut().stt_enabled = row.is_active();
-                win.save_settings();
-                if row.is_active() {
-                    win.update_stt_ui();
-                } else {
-                    win.stop_stt();
-                    win.unload_stt_engine(None);
-                }
-            });
-        }
-        {
-            let win = self.clone();
-            let language_row = stt_language_row.clone();
-            let choices = Rc::clone(&stt_choices);
-            let suppress = Rc::clone(&suppress_stt_language);
-            let parakeet_model_row = parakeet_model_row.clone();
-            let parakeet_button = parakeet_button.clone();
-            let whistle_button = whistle_button.clone();
-            stt_provider_row.connect_selected_notify(move |row| {
-                let provider = stt_provider_from_index(row.selected());
-                win.state.settings.borrow_mut().stt_provider = provider.to_string();
-                win.sync_stt_model_rows(
-                    provider,
-                    &parakeet_model_row,
-                    &parakeet_button,
-                    &whistle_button,
-                );
-                let current = win.state.settings.borrow().stt_language.clone();
-                let selected =
-                    fill_stt_language_row(&language_row, provider, &current, &choices, &suppress);
-                win.state.settings.borrow_mut().stt_language = selected;
-                win.save_settings();
-                win.stop_stt();
-            });
-        }
-        {
-            let win = self.clone();
-            let choices = Rc::clone(&stt_choices);
-            let suppress = Rc::clone(&suppress_stt_language);
-            stt_language_row.connect_selected_notify(move |row| {
-                if suppress.get() {
-                    return;
-                }
-                let index = row.selected() as usize;
-                if let Some(language) = choices.borrow().get(index).copied() {
-                    win.state.settings.borrow_mut().stt_language = language.code.to_string();
-                    win.save_settings();
-                    win.stop_stt();
-                }
-            });
-        }
-        {
-            let win = self.clone();
-            stt_start_row.connect_value_notify(move |row| {
-                win.state.settings.borrow_mut().stt_start_timeout_secs =
-                    row.value().max(1.0) as u32;
-                win.save_settings();
-            });
-        }
-        {
-            let win = self.clone();
-            stt_end_row.connect_value_notify(move |row| {
-                win.state.settings.borrow_mut().stt_end_silence_ms =
-                    (row.value() * 1000.0).max(200.0) as u32;
-                win.save_settings();
-            });
-        }
-        {
-            let win = self.clone();
-            stt_autosend_row.connect_active_notify(move |row| {
-                win.state.settings.borrow_mut().stt_autosend = row.is_active();
-                win.save_settings();
-            });
-        }
-        {
-            let win = self.clone();
-            let row = parakeet_row.clone();
-            let button = parakeet_button.clone();
-            let delete = parakeet_delete.clone();
-            parakeet_model_row.connect_selected_notify(move |combo| {
-                let model = if combo.selected() == 1 {
-                    crate::parakeet::ParakeetModel::Ultra
-                } else {
-                    crate::parakeet::ParakeetModel::Redux
-                };
-                win.state.settings.borrow_mut().stt_parakeet_model = model.as_str().to_string();
-                win.save_settings();
-                if win.stt_listening.get() || win.stt_preparing.get() {
-                    win.stop_stt();
-                }
-                win.unload_stt_engine(None);
-                win.update_parakeet_model_row(&row, &button, &delete);
-            });
-        }
-        {
-            let win = self.clone();
-            let row = parakeet_row.clone();
-            let spinner = parakeet_spinner.clone();
-            let button = parakeet_button.clone();
-            let delete = parakeet_delete.clone();
-            parakeet_button.connect_clicked(move |_| {
-                let model = win.parakeet_model();
-                if crate::parakeet::is_downloaded(model) {
-                    return;
-                }
-                spinner.set_visible(true);
-                spinner.start();
-                button.set_sensitive(false);
-                delete.set_visible(false);
-                row.set_subtitle(&format!("Downloading {}…", model.display_name()));
-                let (tx, rx) = async_channel::bounded(1);
-                win.state.runtime.spawn(async move {
-                    let result = crate::parakeet::ensure_downloaded(model).await;
-                    let _ = tx.send(result).await;
-                });
+        let header = adw::HeaderBar::new();
+        header.set_show_end_title_buttons(false);
+        header.set_title_widget(Some(&switcher));
 
-                let win = win.clone();
-                let row = row.clone();
-                let spinner = spinner.clone();
-                let button = button.clone();
-                let delete = delete.clone();
-                glib::spawn_future_local(async move {
-                    match rx.recv().await {
-                        Ok(Ok(())) => {
-                            spinner.stop();
-                            spinner.set_visible(false);
-                            win.update_parakeet_model_row(&row, &button, &delete);
-                            win.toast(&format!("{} model downloaded", model.display_name()));
-                        }
-                        Ok(Err(err)) => {
-                            spinner.stop();
-                            spinner.set_visible(false);
-                            win.update_parakeet_model_row(&row, &button, &delete);
-                            win.toast(&format!(
-                                "Could not download {}: {err:#}",
-                                model.display_name()
-                            ));
-                        }
-                        Err(_) => {
-                            spinner.stop();
-                            spinner.set_visible(false);
-                        }
-                    }
-                });
-            });
-        }
-        {
-            let win = self.clone();
-            let row = parakeet_row.clone();
-            let button = parakeet_button.clone();
-            let delete = parakeet_delete.clone();
-            parakeet_delete.connect_clicked(move |_| {
-                let model = win.parakeet_model();
-                if !crate::parakeet::is_downloaded(model) {
-                    return;
-                }
-                if win.stt_listening.get() || win.stt_preparing.get() {
-                    win.stop_stt();
-                }
-                let engine = Arc::clone(&win.state.parakeet);
-                let (tx, rx) = async_channel::bounded(1);
-                win.state.runtime.spawn(async move {
-                    let result = tokio::task::spawn_blocking(move || {
-                        if let Ok(mut guard) = engine.lock() {
-                            if guard.as_ref().is_some_and(|(loaded, _)| *loaded == model) {
-                                *guard = None;
-                            }
-                        }
-                        crate::parakeet::delete(model)
-                    })
-                    .await
-                    .map_err(|err| anyhow::anyhow!("model cleanup task failed: {err}"))
-                    .and_then(|result| result);
-                    let _ = tx.send(result).await;
-                });
+        let dialog = adw::Dialog::builder()
+            .title("Preferences")
+            .content_width(1000)
+            .content_height(780)
+            .build();
 
-                let win = win.clone();
-                let row = row.clone();
-                let button = button.clone();
-                let delete = delete.clone();
-                glib::spawn_future_local(async move {
-                    match rx.recv().await {
-                        Ok(Ok(())) => {
-                            win.update_parakeet_model_row(&row, &button, &delete);
-                            win.toast(&format!("{} model deleted", model.display_name()));
-                        }
-                        Ok(Err(err)) => {
-                            win.toast(&format!(
-                                "Could not delete {}: {err:#}",
-                                model.display_name()
-                            ));
-                        }
-                        Err(_) => {}
-                    }
-                });
-            });
-        }
-        {
-            let win = self.clone();
-            let row = whistle_row.clone();
-            let spinner = whistle_spinner.clone();
-            let button = whistle_button.clone();
-            let delete = whistle_delete.clone();
-            whistle_button.connect_clicked(move |_| {
-                if crate::whistle::is_downloaded() {
-                    return;
-                }
-                spinner.set_visible(true);
-                spinner.start();
-                button.set_sensitive(false);
-                delete.set_visible(false);
-                row.set_subtitle("Downloading…");
-                let (tx, rx) = async_channel::bounded(1);
-                win.state.runtime.spawn(async move {
-                    let result = crate::whistle::ensure_downloaded().await;
-                    let _ = tx.send(result).await;
-                });
+        let close = gtk::Button::from_icon_name("window-close-symbolic");
+        close.add_css_class("flat");
+        let dialog_for_close = dialog.clone();
+        close.connect_clicked(move |_| {
+            dialog_for_close.close();
+        });
+        header.pack_end(&close);
 
-                let win = win.clone();
-                let row = row.clone();
-                let spinner = spinner.clone();
-                let button = button.clone();
-                let delete = delete.clone();
-                glib::spawn_future_local(async move {
-                    match rx.recv().await {
-                        Ok(Ok(())) => {
-                            spinner.stop();
-                            spinner.set_visible(false);
-                            win.update_whistle_model_row(&row, &button, &delete);
-                            win.toast("Whistle speech model downloaded");
-                        }
-                        Ok(Err(err)) => {
-                            spinner.stop();
-                            spinner.set_visible(false);
-                            win.update_whistle_model_row(&row, &button, &delete);
-                            win.toast(&format!("Could not download Whistle model: {err:#}"));
-                        }
-                        Err(_) => {
-                            spinner.stop();
-                            spinner.set_visible(false);
-                        }
-                    }
-                });
-            });
-        }
-        {
-            let win = self.clone();
-            let row = whistle_row.clone();
-            let button = whistle_button.clone();
-            let delete = whistle_delete.clone();
-            whistle_delete.connect_clicked(move |_| {
-                if !crate::whistle::is_downloaded() {
-                    return;
-                }
-                if win.stt_listening.get() || win.stt_preparing.get() {
-                    win.stop_stt();
-                }
-                let engine = Arc::clone(&win.state.whistle);
-                let (tx, rx) = async_channel::bounded(1);
-                win.state.runtime.spawn(async move {
-                    let result = tokio::task::spawn_blocking(move || {
-                        if let Ok(mut guard) = engine.lock() {
-                            *guard = None;
-                        }
-                        crate::whistle::delete()
-                    })
-                    .await
-                    .map_err(|err| anyhow::anyhow!("model cleanup task failed: {err}"))
-                    .and_then(|result| result);
-                    let _ = tx.send(result).await;
-                });
-
-                let win = win.clone();
-                let row = row.clone();
-                let button = button.clone();
-                let delete = delete.clone();
-                glib::spawn_future_local(async move {
-                    match rx.recv().await {
-                        Ok(Ok(())) => {
-                            win.update_whistle_model_row(&row, &button, &delete);
-                            win.toast("Whistle model deleted");
-                        }
-                        Ok(Err(err)) => {
-                            win.toast(&format!("Could not delete Whistle model: {err:#}"));
-                        }
-                        Err(_) => {}
-                    }
-                });
-            });
-        }
-
-        prefs_dialog.add(&page);
-        prefs_dialog.present(Some(&self.window));
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&header);
+        toolbar.set_content(Some(&stack));
+        dialog.set_child(Some(&toolbar));
+        dialog.present(Some(&self.window));
     }
 
     fn show_about(&self) {
