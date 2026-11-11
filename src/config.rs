@@ -61,6 +61,8 @@ pub struct Settings {
     pub wake_threshold: f32,
     /// Seconds a wake-triggered session waits for speech before stopping
     pub wake_listen_timeout_secs: u32,
+    /// Start a fresh conversation after a wake session ends with a sleep phrase
+    pub wake_new_conversation: bool,
 }
 
 impl Default for Settings {
@@ -97,6 +99,7 @@ impl Default for Settings {
             wake_word: "hey jarvis".to_string(),
             wake_threshold: 0.0,
             wake_listen_timeout_secs: 30,
+            wake_new_conversation: false,
         }
     }
 }

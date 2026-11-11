@@ -18,6 +18,8 @@ pub enum Cue {
     Wake,
     /// The wake-triggered listening window timed out.
     Timeout,
+    /// The user ended the conversation with a sleep phrase.
+    Sleep,
 }
 
 impl Cue {
@@ -27,6 +29,8 @@ impl Cue {
             Cue::Wake => sequence(&[(700.0, 0.09), (1_050.0, 0.12)]),
             // Falling pair: "I stopped listening".
             Cue::Timeout => sequence(&[(700.0, 0.09), (520.0, 0.14)]),
+            // Three descending notes: "conversation closed".
+            Cue::Sleep => sequence(&[(620.0, 0.08), (466.0, 0.10), (349.0, 0.14)]),
         }
     }
 }
@@ -106,7 +110,7 @@ mod tests {
 
     #[test]
     fn cues_are_short_and_bounded() {
-        for cue in [Cue::Wake, Cue::Timeout] {
+        for cue in [Cue::Wake, Cue::Timeout, Cue::Sleep] {
             let samples = cue.samples();
             let seconds = samples.len() as f32 / SAMPLE_RATE as f32;
             assert!((0.2..0.4).contains(&seconds), "{cue:?} lasted {seconds}s");
@@ -121,6 +125,8 @@ mod tests {
     #[test]
     fn wake_and_timeout_are_different() {
         assert_ne!(Cue::Wake.samples(), Cue::Timeout.samples());
+        assert_ne!(Cue::Wake.samples(), Cue::Sleep.samples());
+        assert_ne!(Cue::Timeout.samples(), Cue::Sleep.samples());
     }
 
     #[test]
