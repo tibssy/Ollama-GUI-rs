@@ -42,6 +42,8 @@ const MEMORY_DEBOUNCE_MS: u64 = 3_000;
 /// Let the graphical session and microphone settle before an autostart launch
 /// arms the wake detector.
 const AUTOSTART_WAKE_DELAY_SECS: u32 = 3;
+/// How long Ollama keeps an unused model loaded.
+const CHAT_KEEP_ALIVE: &str = "5m";
 /// Feed memory extraction this fraction of `num_ctx` at a time.
 const MEMORY_TRANSCRIPT_RATIO: f64 = 0.45;
 const MEMORY_TEMPERATURE: f64 = 0.1;
@@ -1012,6 +1014,12 @@ struct ChatWindow {
     stt_keep_alive: RefCell<Option<Arc<std::sync::atomic::AtomicBool>>>,
     live_mode: Cell<bool>,
     live_pending: Cell<bool>,
+    /// True once the LLM was preloaded for the current live session.
+    live_model_warmed: Cell<bool>,
+    /// Whether the last live session ended with a sleep phrase.
+    last_voice_end_goodbye: Cell<bool>,
+    /// Set at wake start when the next user message should open a new chat.
+    voice_new_chat_requested: Cell<bool>,
     wake_session: RefCell<Option<wake::WakeSession>>,
     wake_generation: Cell<u64>,
     wake_preparing: Cell<bool>,
@@ -1380,6 +1388,9 @@ impl ChatWindow {
             stt_keep_alive: RefCell::new(None),
             live_mode: Cell::new(false),
             live_pending: Cell::new(false),
+            live_model_warmed: Cell::new(false),
+            last_voice_end_goodbye: Cell::new(false),
+            voice_new_chat_requested: Cell::new(false),
             wake_session: RefCell::new(None),
             wake_generation: Cell::new(0),
             wake_preparing: Cell::new(false),
@@ -2391,6 +2402,20 @@ impl ChatWindow {
             .unwrap_or(false)
     }
 
+    /// Cloud models do not have local weights, so preloading them is useless.
+    fn selected_model_is_remote(&self) -> bool {
+        let model = self.selected_model();
+        let remote_host = self
+            .state
+            .models
+            .borrow()
+            .iter()
+            .find(|candidate| memory::model_names_match(&candidate.name, &model))
+            .and_then(|candidate| candidate.remote_host.clone());
+        let base_url = self.state.settings.borrow().base_url.clone();
+        memory::model_is_cloud(&model, remote_host.as_deref(), &base_url)
+    }
+
     fn refresh_thinking_control(self: &Rc<Self>) {
         let model = self.selected_model();
         if model.is_empty() || !self.selected_model_supports("thinking") {
@@ -3089,6 +3114,8 @@ impl ChatWindow {
         // dictation, …), hand the microphone back to the wake detector.
         if !self.stt_listening.get() && !self.stt_preparing.get() {
             self.wake_pending.set(false);
+            self.live_model_warmed.set(false);
+            self.voice_new_chat_requested.set(false);
             self.refresh_wake();
         }
     }
@@ -3375,6 +3402,8 @@ impl ChatWindow {
             return;
         }
 
+        let wake_started = live && idle_timeout.is_some();
+
         // Internal stop: refresh_wake() reopens the microphone, and we are
         // about to take it for dictation.
         self.stop_stt_session();
@@ -3411,6 +3440,17 @@ impl ChatWindow {
                 self.wake_pending.set(false);
                 self.stt_listening.set(true);
                 self.stt_preparing.set(false);
+                if live {
+                    self.live_model_warmed.set(false);
+                    self.voice_new_chat_requested
+                        .set(should_start_new_voice_chat(
+                            wake_started,
+                            self.state.settings.borrow().wake_new_conversation,
+                            self.last_voice_end_goodbye.get(),
+                        ));
+                } else {
+                    self.voice_new_chat_requested.set(false);
+                }
                 self.update_stt_ui();
                 if live {
                     self.toast("Live voice conversation started");
@@ -3433,11 +3473,22 @@ impl ChatWindow {
                                         win.stop_streaming();
                                     }
                                     win.stop_speech();
+                                    win.warm_live_model();
                                 }
                                 SttEvent::Partial(text) => win.apply_stt_text(&text),
                                 SttEvent::Final(text) => {
                                     if text.trim().is_empty() {
                                         continue;
+                                    }
+                                    if is_sleep_command(&text) {
+                                        win.stop_streaming();
+                                        win.stop_speech();
+                                        win.input.buffer().set_text("");
+                                        win.stop_stt_goodbye();
+                                        feedback::play(Cue::Sleep);
+                                        win.toast("Live conversation ended");
+                                        finished = true;
+                                        break;
                                     }
                                     win.apply_stt_text(&text);
                                     if win.active.borrow().is_some() {
@@ -3512,6 +3563,8 @@ impl ChatWindow {
                 self.stt_listening.set(false);
                 self.live_mode.set(false);
                 self.live_pending.set(false);
+                self.live_model_warmed.set(false);
+                self.voice_new_chat_requested.set(false);
                 self.update_stt_ui();
                 self.toast(&format!("Could not start the microphone: {error:#}"));
             }
@@ -3539,6 +3592,16 @@ impl ChatWindow {
     }
 
     fn stop_stt(self: &Rc<Self>) {
+        self.last_voice_end_goodbye.set(false);
+        self.voice_new_chat_requested.set(false);
+        self.stop_stt_session();
+        self.wake_pending.set(false);
+        self.refresh_wake();
+    }
+
+    fn stop_stt_goodbye(self: &Rc<Self>) {
+        self.last_voice_end_goodbye.set(true);
+        self.voice_new_chat_requested.set(false);
         self.stop_stt_session();
         self.wake_pending.set(false);
         self.refresh_wake();
@@ -3554,9 +3617,49 @@ impl ChatWindow {
         self.stt_preparing.set(false);
         self.live_mode.set(false);
         self.live_pending.set(false);
+        self.live_model_warmed.set(false);
         *self.stt_keep_alive.borrow_mut() = None;
         self.update_stt_ui();
         self.schedule_stt_idle_unload();
+    }
+
+    /// Load the chat model in parallel with the first transcription. VAD has
+    /// just detected speech, so this avoids warming the model for a wake that
+    /// never turns into a conversation.
+    fn warm_live_model(self: &Rc<Self>) {
+        if self.live_model_warmed.get() {
+            return;
+        }
+        let model = self.selected_model();
+        if model.is_empty() || self.selected_model_is_remote() {
+            return;
+        }
+        self.live_model_warmed.set(true);
+        let num_ctx = self.state.settings.borrow().num_ctx.max(1);
+        let client = self.state.client.borrow().clone();
+        let generation = self.stt_generation.get();
+        let (tx, rx) = async_channel::bounded(1);
+        let log_model = model.clone();
+        self.state.runtime.spawn(async move {
+            let result = client.preload(&model, num_ctx, CHAT_KEEP_ALIVE).await;
+            let _ = tx.send(result).await;
+        });
+
+        let win = self.clone();
+        glib::spawn_future_local(async move {
+            let Ok(result) = rx.recv().await else {
+                return;
+            };
+            match result {
+                Ok(()) => tracing::debug!("model: preloaded {log_model}"),
+                Err(err) => {
+                    tracing::debug!("model: could not preload {log_model}: {err:#}");
+                    if win.stt_generation.get() == generation {
+                        win.live_model_warmed.set(false);
+                    }
+                }
+            }
+        });
     }
 
     /// Tell the idle timer that a reply or its speech is still in progress.
@@ -3762,6 +3865,18 @@ impl ChatWindow {
         if !images.is_empty() && !self.selected_model_supports("vision") {
             self.toast("The selected model does not support images.");
             return;
+        }
+
+        let from_live = self.live_mode.get();
+        let start_new = from_live && self.voice_new_chat_requested.replace(false);
+        if start_new {
+            *self.current_id.borrow_mut() = None;
+            self.chat_list.unselect_all();
+            self.show_empty();
+        }
+        self.last_voice_end_goodbye.set(false);
+        if !from_live {
+            self.voice_new_chat_requested.set(false);
         }
 
         let existing_id = *self.current_id.borrow();
@@ -4215,7 +4330,7 @@ impl ChatWindow {
                 num_ctx: Some(num_ctx),
                 ..Default::default()
             }),
-            keep_alive: Some("5m".to_string()),
+            keep_alive: Some(CHAT_KEEP_ALIVE.to_string()),
             think,
         };
 
@@ -5848,8 +5963,9 @@ impl ChatWindow {
 
         let wake_enable_row = adw::SwitchRow::new();
         wake_enable_row.set_title("Enable wake word");
-        wake_enable_row
-            .set_subtitle("Adds a Wake word toggle to the tray; listening never starts on its own");
+        wake_enable_row.set_subtitle(
+            "Adds a Wake word toggle to the tray; autostart launches arm it automatically",
+        );
         wake_enable_row.set_active(self.state.settings.borrow().wake_enabled);
         wake.add(&wake_enable_row);
 
@@ -5893,6 +6009,13 @@ impl ChatWindow {
             },
         );
         wake.add(&wake_timeout_row);
+
+        let wake_new_chat_row = adw::SwitchRow::new();
+        wake_new_chat_row.set_title("New conversation on wake word");
+        wake_new_chat_row
+            .set_subtitle("Start a fresh chat only after the previous one ended with a goodbye");
+        wake_new_chat_row.set_active(self.state.settings.borrow().wake_new_conversation);
+        wake.add(&wake_new_chat_row);
 
         let wake_threshold_row = adw::SpinRow::new(
             Some(&gtk::Adjustment::new(
@@ -5989,6 +6112,15 @@ impl ChatWindow {
                 };
                 win.state.settings.borrow_mut().wake_listen_timeout_secs = seconds;
                 win.save_settings();
+            });
+        }
+        {
+            let win = self.clone();
+            wake_new_chat_row.connect_active_notify(move |row| {
+                win.state.settings.borrow_mut().wake_new_conversation = row.is_active();
+                win.save_settings();
+                win.voice_new_chat_requested.set(false);
+                win.last_voice_end_goodbye.set(false);
             });
         }
         {
@@ -6466,6 +6598,137 @@ fn title_from(text: &str) -> String {
     } else {
         title
     }
+}
+
+/// A wake session opens a new chat only when the setting is on and the last
+/// live session ended with a closing phrase, not a timeout.
+fn should_start_new_voice_chat(
+    wake_started: bool,
+    setting_enabled: bool,
+    last_end_goodbye: bool,
+) -> bool {
+    wake_started && setting_enabled && last_end_goodbye
+}
+
+const SLEEP_PHRASES: &[&str] = &[
+    "goodbye",
+    "good bye",
+    "bye",
+    "bye bye",
+    "see you",
+    "see ya",
+    "see you later",
+    "talk to you later",
+    "talk to you tomorrow",
+    "thats all",
+    "im done",
+    "i am done",
+    "stop listening",
+    "end conversation",
+    "go to sleep",
+    "sleep",
+    "good night",
+    "goodnight",
+];
+
+const SLEEP_TAILS: &[&str] = &[
+    "thanks",
+    "thank you",
+    "for now",
+    "then",
+    "everyone",
+    "all",
+    "now",
+    "please",
+    "have a nice day",
+    "have a good day",
+    "have a good night",
+    "and thanks",
+    "and thank you",
+    "thanks for everything",
+    "thanks for your help",
+    "thank you for everything",
+    "thank you for your help",
+    "see you",
+    "see you later",
+    "see you tomorrow",
+    "talk to you later",
+    "tomorrow",
+    "soon",
+    "later",
+];
+
+/// Leading words that speech recognition often adds before a command.
+const SLEEP_FILLERS: &[&str] = &[
+    "all right",
+    "alright",
+    "okay",
+    "ok",
+    "well",
+    "then",
+    "hey",
+    "um",
+    "uh",
+    "yeah",
+];
+
+fn normalize_sleep_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut pending_space = false;
+    for ch in text.chars().flat_map(char::to_lowercase) {
+        if ch == '\'' || ch == '’' {
+            // "that's" -> "thats", "I'm" -> "im".
+            continue;
+        }
+        if ch.is_alphanumeric() {
+            if pending_space && !out.is_empty() {
+                out.push(' ');
+            }
+            out.push(ch);
+            pending_space = false;
+        } else {
+            pending_space = true;
+        }
+    }
+    out
+}
+
+fn strip_sleep_fillers(mut text: &str) -> &str {
+    loop {
+        let mut changed = false;
+        for filler in SLEEP_FILLERS {
+            if let Some(rest) = text
+                .strip_prefix(filler)
+                .and_then(|rest| rest.strip_prefix(' '))
+            {
+                text = rest;
+                changed = true;
+                break;
+            }
+        }
+        if !changed {
+            return text;
+        }
+    }
+}
+
+/// Match phrases that end a live conversation. Only a short trailing courtesy
+/// is allowed, so "goodbye, what's the weather?" is still a real question.
+fn is_sleep_command(text: &str) -> bool {
+    let normalized = normalize_sleep_text(text);
+    let normalized = strip_sleep_fillers(&normalized);
+    if normalized.is_empty() {
+        return false;
+    }
+    SLEEP_PHRASES.iter().any(|phrase| {
+        if normalized == *phrase {
+            return true;
+        }
+        normalized
+            .strip_prefix(phrase)
+            .and_then(|rest| rest.strip_prefix(' '))
+            .is_some_and(|rest| SLEEP_TAILS.contains(&rest))
+    })
 }
 
 /// Size a message image to a 4:3 card that matches its bubble width.
@@ -7131,7 +7394,7 @@ async fn run_memory_job(client: OllamaClient, job: MemoryJob) -> anyhow::Result<
             ),
             ..Default::default()
         }),
-        keep_alive: Some("5m".to_string()),
+        keep_alive: Some(CHAT_KEEP_ALIVE.to_string()),
         think,
     };
 
@@ -7188,7 +7451,7 @@ async fn run_compression(
                 num_predict: Some(budget as i64),
                 ..Default::default()
             }),
-            keep_alive: Some("5m".to_string()),
+            keep_alive: Some(CHAT_KEEP_ALIVE.to_string()),
             think: None,
         };
 
@@ -7407,9 +7670,9 @@ mod tests {
     use super::{
         build_compression_plan, build_request_messages, chunk_messages, clamp_summary,
         context_needs_compression, decode_wav, estimate_tokens, file_is_image, format_percent,
-        formats_have_image, group_digits, kept_turn_start, plain_text_for_speech,
-        sentences_for_speech, split_sentences, take_complete_sentences, tts_language,
-        voice_options_for_backend, SpeechTextBuffer,
+        formats_have_image, group_digits, is_sleep_command, kept_turn_start, plain_text_for_speech,
+        sentences_for_speech, should_start_new_voice_chat, split_sentences,
+        take_complete_sentences, tts_language, voice_options_for_backend, SpeechTextBuffer,
     };
     use crate::store::{StoredImage, StoredMessage, StoredSummary};
     use gtk::{gdk, gio};
@@ -7421,6 +7684,57 @@ mod tests {
         assert_eq!(group_digits(999), "999");
         assert_eq!(group_digits(8_192), "8,192");
         assert_eq!(group_digits(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn recognizes_sleep_commands() {
+        for text in [
+            "Goodbye.",
+            "Good bye!",
+            "Okay, goodbye.",
+            "All right, bye.",
+            "Bye bye",
+            "See you later",
+            "See you tomorrow",
+            "Talk to you later",
+            "That's all for now.",
+            "I'm done.",
+            "Stop listening, please.",
+            "Good night",
+            "goodnight",
+            "Go to sleep",
+            "goodbye thanks",
+            "okay bye",
+            "okay then, goodbye",
+            "goodbye, thanks for everything",
+            "goodbye, have a good night",
+            "goodbye have a nice day",
+        ] {
+            assert!(is_sleep_command(text), "did not recognize {text:?}");
+        }
+    }
+
+    #[test]
+    fn new_voice_chat_requires_a_goodbye_not_a_timeout() {
+        assert!(should_start_new_voice_chat(true, true, true));
+        assert!(!should_start_new_voice_chat(true, true, false));
+        assert!(!should_start_new_voice_chat(true, false, true));
+        assert!(!should_start_new_voice_chat(false, true, true));
+    }
+
+    #[test]
+    fn ignores_sleep_words_inside_questions() {
+        for text in [
+            "I don't want to say goodbye.",
+            "Goodbye, what's the weather?",
+            "By the way, what time is it?",
+            "See you at the meeting",
+            "Don't stop listening to music.",
+            "I am not done yet.",
+            "Goodbye is a word I like",
+        ] {
+            assert!(!is_sleep_command(text), "falsely recognized {text:?}");
+        }
     }
 
     #[test]

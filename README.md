@@ -309,6 +309,12 @@ the composer. It is available when both **Enable dictation** and
 
 - Starts a continuous STT session that keeps listening across turns.
 - Each finished utterance is sent to the model automatically.
+- When the VAD first hears speech, the selected Ollama model is preloaded in
+  the background with the same context size and a five-minute keep-alive, so
+  the first reply does not pay the full cold-load cost.
+- Say a closing phrase such as **goodbye**, **bye**, **see you later**,
+  **that's all**, **I'm done**, or **stop listening** to end the session and
+  return to wake-word listening. The phrase is not sent to the model.
 - Assistant replies are spoken automatically as they stream: each complete
   sentence is synthesized and queued while the model is still generating, so
   playback starts after the first sentence arrives.
@@ -411,10 +417,16 @@ Behaviour:
   after the configured **Listening timeout** (15, 30, or 60 seconds) without
   speech, then the detector re-arms. The timeout counts from the end of the
   last utterance and is paused while a reply is being spoken.
-- Two short synthesized cues confirm the transitions: a rising pair when the
-  word is detected, and a falling pair when the listening window times out.
-  They are generated in-process, so no sound theme or audio files are needed.
-  Live listening starts a moment after the cue so it is not transcribed.
+- **New conversation on wake word** is an optional setting. When it is on,
+  the next wake starts a fresh chat only if the previous live session ended
+  with a closing phrase. Timeouts, errors, and manual stops continue the
+  current conversation. Nothing is created until the first user message, so a
+  wake that stays silent or only says goodbye does not create an empty chat.
+- Three short synthesized cues confirm the transitions: a rising pair when the
+  word is detected, a falling pair when the listening window times out, and a
+  descending triple when a closing phrase ends the conversation. They are
+  generated in-process, so no sound theme or audio files are needed. Live
+  listening starts a moment after the cue so it is not transcribed.
 - **Detection threshold** `0` uses the value calibrated for the selected word;
   raise it if the detector fires too easily, lower it if it misses.
 

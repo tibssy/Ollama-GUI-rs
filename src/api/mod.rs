@@ -420,6 +420,34 @@ impl OllamaClient {
             .trim()
             .to_string())
     }
+
+    /// Ask Ollama to load a model without generating anything. An empty
+    /// `/api/generate` request returns `done_reason: "load"` once the weights
+    /// are ready, which lets the next chat request skip the cold start.
+    pub async fn preload(&self, model: &str, num_ctx: u32, keep_alive: &str) -> Result<()> {
+        let response = self
+            .request(reqwest::Method::POST, "/api/generate")
+            .json(&serde_json::json!({
+                "model": model,
+                "keep_alive": keep_alive,
+                "stream": false,
+                "options": { "num_ctx": num_ctx.max(1) },
+            }))
+            .send()
+            .await
+            .context("could not preload the model")?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            let detail = body.trim();
+            if detail.is_empty() {
+                bail!("Ollama returned HTTP {status}");
+            }
+            bail!("Ollama returned HTTP {status}: {detail}");
+        }
+        let _ = response.bytes().await?;
+        Ok(())
+    }
 }
 
 /// Drives a streaming chat request on the tokio runtime and forwards parsed
@@ -758,6 +786,25 @@ mod tests {
                 .expect("speech request");
             assert!(audio.starts_with(b"RIFF"), "response is not a WAV file");
             assert!(audio.len() > 1_000, "speech audio is suspiciously short");
+        });
+    }
+
+    #[test]
+    #[ignore = "requires a local Ollama daemon"]
+    fn live_preloads_a_model() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let client = OllamaClient::new("http://localhost:11434", "");
+            let models = client.list_models().await.expect("list models");
+            let model = models
+                .iter()
+                .find(|model| model.is_chat_model())
+                .map(|model| model.name.clone())
+                .expect("no chat-capable models installed");
+            client
+                .preload(&model, 2048, "30s")
+                .await
+                .expect("preload model");
         });
     }
 
