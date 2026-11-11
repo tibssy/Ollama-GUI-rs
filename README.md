@@ -163,14 +163,15 @@ Preferences → Speech to Text enables the microphone button in the composer.
 - **Parakeet model** — *Redux* is the small, CPU-friendly export (~420 MB).
   *Ultra* is the larger, more accurate export (~720 MB) and is slower on CPU.
   Select the model here and download it from the row below. The selector is
-  shown for the Parakeet and Automatic providers.
+  shown when Parakeet is the selected provider.
 - **Language** — Parakeet detects the language automatically. Whistle supports
   English, German, French, Spanish, Italian, Dutch and Polish. Built-in
   languages depend on the selected model (`lfm3-audio` supports 19 languages).
   "Auto detect" is available.
-- Only the active provider shows its download button. Downloaded Parakeet and
-  Whistle rows stay visible for status, and both have a trash button that
-  unloads the engine and removes the model files.
+- Only the active provider shows its download button; **Automatic** shows both
+  local candidates. Downloaded Parakeet and Whistle rows stay visible for
+  status, and both have a trash button that unloads the engine and removes the
+  model files.
 - **Wait for speech** — if no voice is detected within this many seconds,
   listening stops and the microphone becomes clickable again.
 - **End of speech silence** — seconds of silence after which the utterance is

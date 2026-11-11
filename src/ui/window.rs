@@ -5172,11 +5172,9 @@ impl ChatWindow {
         parakeet_download: &gtk::Button,
         whistle_download: &gtk::Button,
     ) {
-        let parakeet = matches!(provider, "auto" | "parakeet");
-        let whistle = matches!(provider, "auto" | "whistle");
-        parakeet_model_row.set_visible(parakeet);
-        parakeet_download.set_visible(parakeet);
-        whistle_download.set_visible(whistle);
+        parakeet_model_row.set_visible(provider == "parakeet");
+        parakeet_download.set_visible(matches!(provider, "auto" | "parakeet"));
+        whistle_download.set_visible(matches!(provider, "auto" | "whistle"));
     }
 
     fn sync_tts_model_row(&self, backend: &str, paradee_download: &gtk::Button) {
