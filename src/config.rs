@@ -43,8 +43,10 @@ pub struct Settings {
     pub tts_autoread: bool,
     /// Enable the microphone/dictation button
     pub stt_enabled: bool,
-    /// "auto", "whistle" or "builtin"
+    /// "auto", "parakeet", "whistle" or "builtin"
     pub stt_provider: String,
+    /// "redux" or "ultra"
+    pub stt_parakeet_model: String,
     /// "auto" or a language code
     pub stt_language: String,
     /// Seconds to wait for speech before stopping
@@ -91,6 +93,7 @@ impl Default for Settings {
             tts_autoread: false,
             stt_enabled: false,
             stt_provider: "auto".to_string(),
+            stt_parakeet_model: "redux".to_string(),
             stt_language: "auto".to_string(),
             stt_start_timeout_secs: 5,
             stt_end_silence_ms: 1000,

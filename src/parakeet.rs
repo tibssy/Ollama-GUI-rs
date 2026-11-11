@@ -5,16 +5,141 @@ use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-const MODEL_REPO: &str = "https://huggingface.co/eschmidbauer/parakeet-redux-onnx/resolve/main";
 const CONFIG_NAME: &str = "config.json";
 const VOCAB_NAME: &str = "vocab.txt";
 const PREPROCESSOR_NAME: &str = "preprocessor.onnx";
 const ENCODER_NAME: &str = "encoder-model.onnx";
 const DECODER_NAME: &str = "decoder_joint-model.onnx";
-const ENCODER_MIN_BYTES: u64 = 300_000_000;
-const DECODER_MIN_BYTES: u64 = 60_000_000;
 
 static DOWNLOAD_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Which Parakeet export the app should use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ParakeetModel {
+    /// Small and fast, intended for CPUs.
+    #[default]
+    Redux,
+    /// Full-size model with better accuracy, but slower on CPU.
+    Ultra,
+}
+
+impl ParakeetModel {
+    pub fn from_setting(value: &str) -> Self {
+        if value.eq_ignore_ascii_case("ultra") {
+            Self::Ultra
+        } else {
+            Self::Redux
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Redux => "redux",
+            Self::Ultra => "ultra",
+        }
+    }
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Redux => "Parakeet Redux",
+            Self::Ultra => "Parakeet Ultra",
+        }
+    }
+
+    pub fn approx_size(self) -> &'static str {
+        match self {
+            Self::Redux => "~420 MB",
+            Self::Ultra => "~720 MB",
+        }
+    }
+
+    pub fn dir(self) -> PathBuf {
+        crate::config::data_dir().join("models").join(match self {
+            Self::Redux => "parakeet-redux",
+            Self::Ultra => "parakeet-ultra",
+        })
+    }
+
+    fn repo(self) -> &'static str {
+        match self {
+            Self::Redux => "https://huggingface.co/eschmidbauer/parakeet-redux-onnx/resolve/main",
+            Self::Ultra => "https://huggingface.co/mrfakename/parakeet-ultra-ONNX/resolve/main",
+        }
+    }
+
+    fn files(self) -> &'static [FileSpec] {
+        match self {
+            Self::Redux => REDUX_FILES,
+            Self::Ultra => ULTRA_FILES,
+        }
+    }
+}
+
+struct FileSpec {
+    remote: &'static str,
+    local: &'static str,
+    min_bytes: u64,
+}
+
+const REDUX_FILES: &[FileSpec] = &[
+    FileSpec {
+        remote: CONFIG_NAME,
+        local: CONFIG_NAME,
+        min_bytes: 100,
+    },
+    FileSpec {
+        remote: VOCAB_NAME,
+        local: VOCAB_NAME,
+        min_bytes: 1_000,
+    },
+    FileSpec {
+        remote: PREPROCESSOR_NAME,
+        local: PREPROCESSOR_NAME,
+        min_bytes: 100_000,
+    },
+    FileSpec {
+        remote: ENCODER_NAME,
+        local: ENCODER_NAME,
+        min_bytes: 300_000_000,
+    },
+    FileSpec {
+        remote: DECODER_NAME,
+        local: DECODER_NAME,
+        min_bytes: 60_000_000,
+    },
+];
+
+const ULTRA_FILES: &[FileSpec] = &[
+    FileSpec {
+        remote: CONFIG_NAME,
+        local: CONFIG_NAME,
+        min_bytes: 100,
+    },
+    FileSpec {
+        remote: VOCAB_NAME,
+        local: VOCAB_NAME,
+        min_bytes: 50_000,
+    },
+    FileSpec {
+        remote: PREPROCESSOR_NAME,
+        local: PREPROCESSOR_NAME,
+        min_bytes: 100_000,
+    },
+    FileSpec {
+        // The q8 encoder is the closest quantized export to the fp32 model.
+        remote: "encoder-model.q8.onnx",
+        local: ENCODER_NAME,
+        min_bytes: 600_000_000,
+    },
+    FileSpec {
+        remote: DECODER_NAME,
+        local: DECODER_NAME,
+        min_bytes: 60_000_000,
+    },
+];
+
+/// Shared handle to the lazily loaded Parakeet engine and the variant it holds.
+pub type SharedParakeet = std::sync::Arc<std::sync::Mutex<Option<(ParakeetModel, Parakeet)>>>;
 
 #[derive(Debug, Deserialize)]
 struct Config {
@@ -30,56 +155,56 @@ struct Config {
     sample_rate: u32,
 }
 
-pub fn model_dir() -> PathBuf {
-    crate::config::data_dir()
-        .join("models")
-        .join("parakeet-redux")
+pub fn model_dir(model: ParakeetModel) -> PathBuf {
+    model.dir()
 }
 
-fn path_for(name: &str) -> PathBuf {
-    model_dir().join(name)
+fn path_for(model: ParakeetModel, name: &str) -> PathBuf {
+    model_dir(model).join(name)
 }
 
-pub fn is_downloaded() -> bool {
-    let encoder = std::fs::metadata(path_for(ENCODER_NAME))
-        .map(|meta| meta.len() >= ENCODER_MIN_BYTES)
-        .unwrap_or(false);
-    let decoder = std::fs::metadata(path_for(DECODER_NAME))
-        .map(|meta| meta.len() >= DECODER_MIN_BYTES)
-        .unwrap_or(false);
-    encoder
-        && decoder
-        && path_for(PREPROCESSOR_NAME).exists()
-        && path_for(VOCAB_NAME).exists()
-        && path_for(CONFIG_NAME).exists()
+pub fn is_downloaded(model: ParakeetModel) -> bool {
+    model.files().iter().all(|file| {
+        std::fs::metadata(path_for(model, file.local))
+            .map(|meta| meta.len() >= file.min_bytes)
+            .unwrap_or(false)
+    })
 }
 
-pub async fn ensure_downloaded() -> Result<()> {
+/// Remove the downloaded files for one Parakeet variant. The caller must
+/// unload the engine first when it may still be in use.
+pub fn delete(model: ParakeetModel) -> Result<()> {
+    let dir = model_dir(model);
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("removing {}", dir.display())),
+    }
+}
+
+pub async fn ensure_downloaded(model: ParakeetModel) -> Result<()> {
     let _guard = DOWNLOAD_LOCK.lock().await;
-    if is_downloaded() {
+    if is_downloaded(model) {
         return Ok(());
     }
 
-    let dir = model_dir();
+    let dir = model_dir(model);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(900))
         .build()
         .context("creating Parakeet download client")?;
 
-    for (name, minimum) in [
-        (CONFIG_NAME, 100u64),
-        (VOCAB_NAME, 1_000),
-        (PREPROCESSOR_NAME, 100_000),
-        (ENCODER_NAME, ENCODER_MIN_BYTES),
-        (DECODER_NAME, DECODER_MIN_BYTES),
-    ] {
-        let url = format!("{MODEL_REPO}/{name}");
-        download(&client, &url, &path_for(name), minimum).await?;
+    for file in model.files() {
+        let url = format!("{}/{}", model.repo(), file.remote);
+        download(&client, &url, &path_for(model, file.local), file.min_bytes).await?;
     }
 
-    if !is_downloaded() {
-        bail!("Parakeet model download did not produce complete files");
+    if !is_downloaded(model) {
+        bail!(
+            "{} model download did not produce complete files",
+            model.display_name()
+        );
     }
     Ok(())
 }
@@ -338,16 +463,24 @@ fn shape_usize(shape: &ort::value::Shape) -> Vec<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::Parakeet;
+    use super::{Parakeet, ParakeetModel};
+
+    #[test]
+    fn parses_model_names() {
+        assert_eq!(ParakeetModel::from_setting("redux"), ParakeetModel::Redux);
+        assert_eq!(ParakeetModel::from_setting("ultra"), ParakeetModel::Ultra);
+        assert_eq!(ParakeetModel::from_setting("ULTRA"), ParakeetModel::Ultra);
+        assert_eq!(ParakeetModel::from_setting(""), ParakeetModel::Redux);
+    }
 
     #[test]
     #[ignore = "downloads the Parakeet Redux model (~418 MB) and requires a test WAV"]
     fn downloads_and_transcribes() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime
-            .block_on(super::ensure_downloaded())
+            .block_on(super::ensure_downloaded(ParakeetModel::Redux))
             .expect("download");
-        let mut parakeet = Parakeet::load(&super::model_dir()).expect("load");
+        let mut parakeet = Parakeet::load(&super::model_dir(ParakeetModel::Redux)).expect("load");
         let mut reader = hound::WavReader::open("/tmp/opencode/stt-mem/s1.wav").expect("wav");
         let samples: Vec<f32> = reader
             .samples::<i16>()
@@ -356,5 +489,48 @@ mod tests {
         let text = parakeet.transcribe(&samples).expect("transcribe");
         println!("parakeet transcript={text:?}");
         assert!(text.to_lowercase().contains("quick") || text.to_lowercase().contains("fox"));
+    }
+
+    #[test]
+    #[ignore = "downloads the Parakeet Ultra model (~720 MB) and requires a test WAV"]
+    fn ultra_downloads_and_transcribes() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime
+            .block_on(super::ensure_downloaded(ParakeetModel::Ultra))
+            .expect("download");
+        let mut parakeet = Parakeet::load(&super::model_dir(ParakeetModel::Ultra)).expect("load");
+        let mut reader = hound::WavReader::open("/tmp/opencode/stt-mem/s1.wav").expect("wav");
+        let samples: Vec<f32> = reader
+            .samples::<i16>()
+            .map(|sample| sample.expect("sample") as f32 / 32_768.0)
+            .collect();
+        let text = parakeet.transcribe(&samples).expect("transcribe");
+        println!("parakeet ultra transcript={text:?}");
+        assert!(text.to_lowercase().contains("quick") || text.to_lowercase().contains("fox"));
+    }
+
+    #[test]
+    #[ignore = "requires the Parakeet Ultra ONNX files and a test WAV"]
+    fn ultra_prepare_loads_the_shared_engine() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let engine: crate::parakeet::SharedParakeet =
+                std::sync::Arc::new(std::sync::Mutex::new(None));
+            crate::stt::prepare_parakeet(std::sync::Arc::clone(&engine), ParakeetModel::Ultra)
+                .await
+                .expect("prepare Ultra");
+
+            let mut reader = hound::WavReader::open("/tmp/opencode/stt-mem/s1.wav").expect("wav");
+            let samples: Vec<f32> = reader
+                .samples::<i16>()
+                .map(|sample| sample.expect("sample") as f32 / 32_768.0)
+                .collect();
+            let mut guard = engine.lock().expect("lock");
+            let (model, parakeet) = guard.as_mut().expect("loaded engine");
+            assert_eq!(*model, ParakeetModel::Ultra);
+            let text = parakeet.transcribe(&samples).expect("transcribe");
+            println!("parakeet ultra shared engine transcript={text:?}");
+            assert!(text.to_lowercase().contains("quick") || text.to_lowercase().contains("fox"));
+        });
     }
 }
