@@ -73,17 +73,14 @@ pub fn normalize_repo(input: &str) -> Result<(String, Option<String>)> {
     Ok((repo.to_string(), tag))
 }
 
-/// The short Ollama model name shown in the model list.
-pub fn short_name(repo: &str, tag: &str) -> Result<String> {
-    let tag = tag.trim();
-    if tag.is_empty() {
-        bail!("choose a quantization");
-    }
-    let name = repo.rsplit('/').next().unwrap_or(repo);
+/// The short Ollama model name shown in the model list. The quantization is
+/// still used for the pull reference, but it is not part of the local name.
+pub fn short_name(repo: &str) -> Result<String> {
+    let name = repo.rsplit('/').next().unwrap_or(repo).trim();
     if name.is_empty() {
         bail!("repository name is empty");
     }
-    Ok(format!("{name}:{tag}"))
+    Ok(name.to_string())
 }
 
 /// The reference Ollama expects when pulling directly from Hugging Face.
@@ -300,10 +297,7 @@ mod tests {
     #[test]
     fn builds_short_names_and_pull_references() {
         let repo = "AtomicChat/LFM3-1.7B-Uncensored-GGUF";
-        assert_eq!(
-            short_name(repo, "Q4_K_M").unwrap(),
-            "LFM3-1.7B-Uncensored-GGUF:Q4_K_M"
-        );
+        assert_eq!(short_name(repo).unwrap(), "LFM3-1.7B-Uncensored-GGUF");
         assert_eq!(
             pull_reference(repo, "Q4_K_M"),
             "hf.co/AtomicChat/LFM3-1.7B-Uncensored-GGUF:Q4_K_M"

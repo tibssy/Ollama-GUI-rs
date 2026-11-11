@@ -419,10 +419,13 @@ The **add** button opens a download dialog with two sources:
 
 Hugging Face downloads are pulled as
 `hf.co/owner/repository:QUANT`, then copied to a short local name such as
-`LFM3-1.7B-Uncensored-GGUF:Q4_K_M`, and the long intermediate name is removed.
-Ollama stores blobs by content, so this rename does not duplicate the model on
-disk. If a model with the short name already exists, delete it first. Gated or
-private Hugging Face repositories are not supported without a token.
+`LFM3-1.7B-Uncensored-GGUF` (shown by Ollama as
+`LFM3-1.7B-Uncensored-GGUF:latest`), and the long intermediate name is removed.
+The quantization is still used for the download, but it is not part of the
+final name. Ollama stores blobs by content, so this rename does not duplicate
+the model on disk. If a model with the short name already exists, delete it
+first. Gated or private Hugging Face repositories are not supported without a
+token.
 
 The dialog reports pull progress as a horizontal bar and percentage, and the
 download can be cancelled while it is running.

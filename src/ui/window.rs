@@ -1322,13 +1322,10 @@ impl AddModelForm {
             self.saved_row.set_visible(true);
             let raw = self.hf_repo.text();
             match hf::normalize_repo(&raw) {
-                Ok((repo, typed_tag)) => {
-                    let tag = self.selected_quant().map(|quant| quant.tag).or(typed_tag);
-                    match tag.and_then(|tag| hf::short_name(&repo, &tag).ok()) {
-                        Some(short) => self.saved_row.set_subtitle(&short),
-                        None => self.saved_row.set_subtitle("Choose a quantization"),
-                    }
-                }
+                Ok((repo, _)) => match hf::short_name(&repo) {
+                    Ok(short) => self.saved_row.set_subtitle(&short),
+                    Err(_) => self.saved_row.set_subtitle("Enter owner/repository"),
+                },
                 Err(_) => self.saved_row.set_subtitle("Enter owner/repository"),
             }
         } else {
@@ -1346,12 +1343,14 @@ impl AddModelForm {
         }
         let raw = self.hf_repo.text();
         if raw.trim().is_empty() {
+            self.download.set_sensitive(true);
             self.set_error(None);
             return;
         }
         let (repo, typed_tag) = match hf::normalize_repo(&raw) {
             Ok(value) => value,
             Err(err) => {
+                self.download.set_sensitive(true);
                 self.set_error(Some(&format!("{err:#}")));
                 return;
             }
@@ -1365,6 +1364,7 @@ impl AddModelForm {
         self.quant_spinner.set_visible(true);
         self.quant_spinner.start();
         self.load_button.set_sensitive(false);
+        self.download.set_sensitive(false);
 
         let (tx, rx) = async_channel::bounded(1);
         self.win.state.runtime.spawn(async move {
@@ -1382,12 +1382,14 @@ impl AddModelForm {
             form.quant_spinner.stop();
             form.quant_spinner.set_visible(false);
             form.load_button.set_sensitive(true);
+            form.download.set_sensitive(true);
             match result {
                 Ok(quants) if quants.is_empty() => {
                     form.clear_quant_choices();
                     form.set_error(Some("No GGUF files were found in this repository."));
                 }
                 Ok(quants) => {
+                    form.set_error(None);
                     let labels: Vec<String> = quants
                         .iter()
                         .map(|quant| match quant.size {
@@ -1478,21 +1480,20 @@ impl AddModelForm {
                 self.set_error(Some("Choose a quantization first."));
                 return;
             };
-            let short = match hf::short_name(&repo, &tag) {
+            let short = match hf::short_name(&repo) {
                 Ok(short) => short,
                 Err(err) => {
                     self.set_error(Some(&format!("{err:#}")));
                     return;
                 }
             };
-            if self
-                .win
-                .state
-                .models
-                .borrow()
-                .iter()
-                .any(|model| model.name == short)
-            {
+            if self.win.state.models.borrow().iter().any(|model| {
+                model.name == short
+                    || model
+                        .name
+                        .rsplit_once(':')
+                        .is_some_and(|(name, _)| name == short)
+            }) {
                 self.set_error(Some(&format!(
                     "A model named {short} already exists. Delete it first."
                 )));
@@ -6185,6 +6186,7 @@ impl ChatWindow {
                 } else {
                     "Enter a model name from ollama.com/library, for example llama3.2:3b."
                 }));
+                form.download.set_sensitive(true);
                 form.set_error(None);
                 form.refresh_visibility();
             });
@@ -6209,6 +6211,7 @@ impl ChatWindow {
                 form.quant_spinner.stop();
                 form.quant_spinner.set_visible(false);
                 form.load_button.set_sensitive(true);
+                form.download.set_sensitive(true);
                 form.set_error(None);
                 form.update_preview();
             });
@@ -6411,11 +6414,16 @@ impl ChatWindow {
         ));
 
         let header_actions = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        header_actions.set_valign(gtk::Align::Center);
         let refresh = gtk::Button::from_icon_name("view-refresh-symbolic");
         refresh.add_css_class("flat");
+        refresh.set_valign(gtk::Align::Center);
+        refresh.set_size_request(32, 32);
         refresh.set_tooltip_text(Some("Refresh model list"));
         let add = gtk::Button::from_icon_name("list-add-symbolic");
         add.add_css_class("flat");
+        add.set_valign(gtk::Align::Center);
+        add.set_size_request(32, 32);
         add.set_tooltip_text(Some("Add model"));
         header_actions.append(&refresh);
         header_actions.append(&add);
