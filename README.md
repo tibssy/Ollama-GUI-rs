@@ -269,6 +269,24 @@ The tray uses the freedesktop StatusNotifierItem specification, so a compatible
 panel or host is required (KDE, GNOME's AppIndicator extension, Waybar, and
 similar).
 
+### Start at login
+
+**Start automatically at login** is available in the same preferences group. It
+writes an XDG autostart entry to
+`~/.config/autostart/io.github.ltux.OllamaGui.desktop` and launches the app with
+`--autostart`. That launch starts hidden in the tray and, if the wake word is
+enabled, arms wake detection after a short delay so the graphical session and
+microphone are ready. Manual launches are unchanged: the window opens and wake
+detection stays off until the tray toggle arms it.
+
+Autostart implies background mode, because a hidden app needs the tray. Turning
+off **Keep running in the background** also removes the autostart entry.
+
+The entry is read by GNOME and KDE directly. On minimal compositors such as
+niri, systemd's `systemd-xdg-autostart-generator` starts it through
+`xdg-desktop-autostart.target`, so no manual unit or compositor configuration
+is needed.
+
 ## Thinking
 
 For models that advertise the `thinking` capability, a **Think** toggle appears
@@ -380,9 +398,10 @@ fixed phrase, so a new phrase needs a separately trained head.
 
 Behaviour:
 
-- Enabling the feature only adds a **Wake word** toggle to the tray menu. It
-  never starts listening on its own, including after restarting the app; the
-  toggle is the only way to arm it.
+- Enabling the feature only adds a **Wake word** toggle to the tray menu. A
+  normal launch never starts listening on its own; the toggle is the only way
+  to arm it. The exception is an autostart launch, which arms the detector
+  when the wake word is enabled.
 - While listening, the tray icon switches to a blue listening badge, and the
   menu item is checked. Turning the toggle off stops the microphone.
 - Detection runs only while idle. It stops as soon as live conversation,
@@ -411,6 +430,7 @@ every 80 ms.
 src/
   main.rs            GtkApplication bootstrap, CSS, app actions
   config.rs          JSON settings in the XDG config dir
+  autostart.rs       XDG autostart desktop entry management
   api/mod.rs         thin Ollama client + streaming worker
   api/stream.rs      incremental NDJSON parser (unit tested)
   store/mod.rs       SQLite schema, migrations, conversation and memory CRUD
