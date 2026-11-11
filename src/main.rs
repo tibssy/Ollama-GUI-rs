@@ -2,6 +2,7 @@ mod api;
 mod autostart;
 mod config;
 mod feedback;
+mod hf;
 mod memory;
 mod paradee;
 mod parakeet;
