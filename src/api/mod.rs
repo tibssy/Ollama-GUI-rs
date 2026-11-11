@@ -46,15 +46,39 @@ impl ModelSummary {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ModelDetails {
+    #[serde(default)]
+    pub parent_model: String,
+    #[serde(default)]
+    pub format: String,
+    #[serde(default)]
+    pub family: String,
+    #[serde(default, deserialize_with = "deserialize_vec_or_null")]
+    pub families: Vec<String>,
     #[serde(default)]
     pub parameter_size: String,
     #[serde(default)]
     pub quantization_level: String,
+}
+
+/// Parsed `/api/show` response used by the model details dialog.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ModelShow {
     #[serde(default)]
-    pub family: String,
+    pub details: ModelDetails,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub model_info: serde_json::Map<String, serde_json::Value>,
+    #[serde(default)]
+    pub parameters: Option<String>,
+    #[serde(default)]
+    pub license: Option<String>,
+    #[serde(default)]
+    pub modified_at: Option<String>,
+    #[serde(default)]
+    pub requires: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -279,6 +303,21 @@ impl OllamaClient {
             .cloned()
             .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
         serde_json::from_value(models).context("unexpected /api/tags payload")
+    }
+
+    /// Fetch the model description used by the details dialog.
+    pub async fn show_model(&self, model: &str) -> Result<ModelShow> {
+        let response = self
+            .request(reqwest::Method::POST, "/api/show")
+            .json(&serde_json::json!({ "model": model }))
+            .send()
+            .await
+            .context("could not reach Ollama")?;
+        let response = ensure_success(response, "show").await?;
+        response
+            .json()
+            .await
+            .context("unexpected /api/show payload")
     }
 
     /// Fetch the model's thinking controls from `/api/show`.
@@ -533,6 +572,13 @@ impl OllamaClient {
     }
 }
 
+fn deserialize_vec_or_null<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<String>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 async fn ensure_success(response: reqwest::Response, operation: &str) -> Result<reqwest::Response> {
     if response.status().is_success() {
         return Ok(response);
@@ -751,6 +797,31 @@ mod tests {
             .fraction(),
             None
         );
+    }
+
+    #[test]
+    fn parses_show_payload() {
+        let show: ModelShow = serde_json::from_value(serde_json::json!({
+            "details": {
+                "format": "gguf",
+                "family": "qwen35",
+                "families": null,
+                "parameter_size": "9.0B",
+                "quantization_level": "Q4_K_M"
+            },
+            "capabilities": ["completion", "tools"],
+            "parameters": "temperature 0.7",
+            "license": "MIT",
+            "modified_at": "2026-11-09T22:23:30.826158724Z",
+            "requires": "0.30.9"
+        }))
+        .unwrap();
+        assert_eq!(show.details.family, "qwen35");
+        assert_eq!(show.details.format, "gguf");
+        assert!(show.details.families.is_empty());
+        assert_eq!(show.capabilities, vec!["completion", "tools"]);
+        assert_eq!(show.parameters.as_deref(), Some("temperature 0.7"));
+        assert_eq!(show.license.as_deref(), Some("MIT"));
     }
 
     #[test]
