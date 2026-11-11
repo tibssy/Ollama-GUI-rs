@@ -405,8 +405,11 @@ Preferences → Models manages both language models and the local speech models.
 
 **Language models** lists everything installed in Ollama, equivalent to
 `ollama list`. Each row shows the model name, size, parameter count, and
-quantization. Cloud models are marked as such. The trash button asks for
-confirmation, then removes the model and refreshes the chat model selector.
+quantization. Cloud models are marked as such. The info button opens the same
+details reported by `ollama show`: architecture, parameters, context and
+embedding length, quantization, capabilities, runtime parameters, and license.
+The trash button asks for confirmation, then removes the model and refreshes
+the chat model selector.
 
 The **add** button opens a download dialog with two sources:
 

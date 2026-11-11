@@ -12,8 +12,8 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 
 use crate::api::{
-    self, ChatMessage, ChatOptions, ChatRequest, ModelSummary, OllamaClient, StreamEvent,
-    StreamStats, ThinkSetting, ThinkingControl,
+    self, ChatMessage, ChatOptions, ChatRequest, ModelShow, ModelSummary, OllamaClient,
+    StreamEvent, StreamStats, ThinkSetting, ThinkingControl,
 };
 use crate::autostart;
 use crate::config::Settings;
@@ -6281,6 +6281,153 @@ impl ChatWindow {
         dialog.present(Some(&self.window));
     }
 
+    fn show_model_info(self: &Rc<Self>, model: ModelSummary) {
+        let client = self.state.client.borrow().clone();
+        let name = model.name.clone();
+        let (tx, rx) = async_channel::bounded(1);
+        self.state.runtime.spawn(async move {
+            let _ = tx.send(client.show_model(&name).await).await;
+        });
+
+        let win = self.clone();
+        glib::spawn_future_local(async move {
+            match rx.recv().await {
+                Ok(Ok(show)) => win.present_model_info(model, show),
+                Ok(Err(err)) => {
+                    win.toast(&format!(
+                        "Could not load details for {}: {err:#}",
+                        model.name
+                    ));
+                }
+                Err(_) => {}
+            }
+        });
+    }
+
+    fn present_model_info(&self, model: ModelSummary, show: ModelShow) {
+        let dialog = adw::Dialog::builder()
+            .title(&model.name)
+            .content_width(720)
+            .content_height(620)
+            .build();
+
+        let header = adw::HeaderBar::new();
+        header.set_show_end_title_buttons(false);
+        let close = gtk::Button::from_icon_name("window-close-symbolic");
+        close.add_css_class("flat");
+        {
+            let dialog = dialog.downgrade();
+            close.connect_clicked(move |_| {
+                if let Some(dialog) = dialog.upgrade() {
+                    dialog.close();
+                }
+            });
+        }
+        header.pack_end(&close);
+
+        let page = adw::PreferencesPage::new();
+
+        let details_group = adw::PreferencesGroup::new();
+        details_group.set_title("Model");
+
+        let architecture = if show.details.family.is_empty() {
+            show.model_info
+                .get("general.architecture")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string()
+        } else {
+            show.details.family.clone()
+        };
+        add_info_row(&details_group, "Architecture", &architecture);
+        add_info_row(&details_group, "Parameters", &show.details.parameter_size);
+        if let Some(context) = model_info_number(&show.details, &show.model_info, "context_length")
+        {
+            add_info_row(
+                &details_group,
+                "Context length",
+                &group_digits(context.min(u32::MAX as u64) as u32),
+            );
+        }
+        if let Some(embedding) =
+            model_info_number(&show.details, &show.model_info, "embedding_length")
+        {
+            add_info_row(
+                &details_group,
+                "Embedding length",
+                &group_digits(embedding.min(u32::MAX as u64) as u32),
+            );
+        }
+        add_info_row(
+            &details_group,
+            "Quantization",
+            &show.details.quantization_level,
+        );
+        add_info_row(&details_group, "Format", &show.details.format);
+        if !show.details.families.is_empty() {
+            add_info_row(
+                &details_group,
+                "Families",
+                &show.details.families.join(" · "),
+            );
+        }
+        if !show.details.parent_model.is_empty() {
+            add_info_row(&details_group, "Parent model", &show.details.parent_model);
+        }
+        if model.remote_host.is_some() {
+            add_info_row(&details_group, "Size", "Cloud (no local weight files)");
+        } else if model.size > 0 {
+            add_info_row(&details_group, "Size", &format_bytes(model.size));
+        }
+        if let Some(modified) = show.modified_at.as_deref().filter(|text| !text.is_empty()) {
+            add_info_row(&details_group, "Modified", &format_modified_at(modified));
+        }
+        if let Some(requires) = show.requires.as_deref().filter(|text| !text.is_empty()) {
+            add_info_row(&details_group, "Requires Ollama", requires);
+        }
+        page.add(&details_group);
+
+        if !show.capabilities.is_empty() {
+            let capabilities = adw::PreferencesGroup::new();
+            capabilities.set_title("Capabilities");
+            let row = adw::ActionRow::new();
+            row.set_title("Supported");
+            row.set_subtitle(&show.capabilities.join(" · "));
+            capabilities.add(&row);
+            page.add(&capabilities);
+        }
+
+        if let Some(parameters) = show
+            .parameters
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
+            let group = adw::PreferencesGroup::new();
+            group.set_title("Parameters");
+            group.add(&text_expander("Runtime parameters", parameters));
+            page.add(&group);
+        }
+
+        if let Some(license) = show
+            .license
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
+            let group = adw::PreferencesGroup::new();
+            group.set_title("License");
+            group.add(&text_expander("License text", license));
+            page.add(&group);
+        }
+
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&header);
+        toolbar.set_content(Some(&page));
+        dialog.set_child(Some(&toolbar));
+        dialog.present(Some(&self.window));
+    }
+
     fn build_llm_model_row(
         self: &Rc<Self>,
         state: &Rc<LlmModelsState>,
@@ -6295,11 +6442,23 @@ impl ChatWindow {
         spinner.set_visible(false);
         row.add_suffix(&spinner);
 
+        let info = gtk::Button::from_icon_name("dialog-information-symbolic");
+        info.add_css_class("flat");
+        info.set_valign(gtk::Align::Center);
+        info.set_tooltip_text(Some("Model details"));
+        row.add_suffix(&info);
+
         let delete = gtk::Button::from_icon_name("user-trash-symbolic");
         delete.add_css_class("flat");
         delete.set_valign(gtk::Align::Center);
         delete.set_tooltip_text(Some("Delete model"));
         row.add_suffix(&delete);
+
+        {
+            let win = self.clone();
+            let model = model.clone();
+            info.connect_clicked(move |_| win.show_model_info(model.clone()));
+        }
 
         let name = model.name.clone();
         let size = if model.remote_host.is_some() {
@@ -8053,6 +8212,59 @@ fn group_digits(value: u32) -> String {
     out
 }
 
+fn add_info_row(group: &adw::PreferencesGroup, title: &str, value: &str) {
+    if value.trim().is_empty() {
+        return;
+    }
+    let row = adw::ActionRow::new();
+    row.set_title(title);
+    row.set_subtitle(value);
+    group.add(&row);
+}
+
+fn text_expander(title: &str, text: &str) -> adw::ExpanderRow {
+    let expander = adw::ExpanderRow::new();
+    expander.set_title(title);
+    expander.set_subtitle("Expand to view");
+
+    let label = gtk::Label::new(Some(text));
+    label.set_xalign(0.0);
+    label.set_wrap(true);
+    label.set_selectable(true);
+    label.add_css_class("monospace");
+    label.set_margin_top(6);
+    label.set_margin_bottom(6);
+    label.set_margin_start(12);
+    label.set_margin_end(12);
+    expander.add_row(&label);
+    expander
+}
+
+fn model_info_number(
+    details: &crate::api::ModelDetails,
+    info: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Option<u64> {
+    if !details.family.is_empty() {
+        let key = format!("{}.{}", details.family, field);
+        if let Some(value) = info.get(&key).and_then(|value| value.as_u64()) {
+            return Some(value);
+        }
+    }
+    let suffix = format!(".{field}");
+    info.iter()
+        .find(|(key, _)| key.ends_with(&suffix))
+        .and_then(|(_, value)| value.as_u64())
+}
+
+fn format_modified_at(value: &str) -> String {
+    let value = value.trim_end_matches('Z');
+    match value.split_once('T') {
+        Some((date, time)) => format!("{date} {}", &time[..time.len().min(8)]),
+        None => value.to_string(),
+    }
+}
+
 fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut value = bytes as f64;
@@ -9005,10 +9217,11 @@ mod tests {
     use super::{
         build_compression_plan, build_request_messages, chunk_messages, clamp_summary,
         context_needs_compression, decode_wav, estimate_tokens, file_is_image, format_bytes,
-        format_percent, formats_have_image, group_digits, is_sleep_command, kept_turn_start,
-        llm_model_subtitle, plain_text_for_speech, sentences_for_speech,
-        should_start_new_voice_chat, split_sentences, take_complete_sentences, tts_language,
-        voice_options_for_backend, ModelSummary, SpeechTextBuffer, SttProviderChoice,
+        format_modified_at, format_percent, formats_have_image, group_digits, is_sleep_command,
+        kept_turn_start, llm_model_subtitle, model_info_number, plain_text_for_speech,
+        sentences_for_speech, should_start_new_voice_chat, split_sentences,
+        take_complete_sentences, tts_language, voice_options_for_backend, ModelSummary,
+        SpeechTextBuffer, SttProviderChoice,
     };
     use crate::store::{StoredImage, StoredMessage, StoredSummary};
     use gtk::{gdk, gio};
@@ -9032,6 +9245,37 @@ mod tests {
     }
 
     #[test]
+    fn formats_show_timestamps() {
+        assert_eq!(
+            format_modified_at("2026-11-09T22:23:30.826158724Z"),
+            "2026-11-09 22:23:30"
+        );
+        assert_eq!(format_modified_at("2026-11-09"), "2026-11-09");
+    }
+
+    #[test]
+    fn reads_model_info_numbers() {
+        let details = crate::api::ModelDetails {
+            family: "qwen35".to_string(),
+            ..Default::default()
+        };
+        let info = serde_json::json!({
+            "qwen35.context_length": 262144,
+            "qwen35.embedding_length": 4096,
+            "other.context_length": 512,
+        });
+        let info = info.as_object().unwrap();
+        assert_eq!(
+            model_info_number(&details, info, "context_length"),
+            Some(262144)
+        );
+        assert_eq!(
+            model_info_number(&details, info, "embedding_length"),
+            Some(4096)
+        );
+    }
+
+    #[test]
     fn builds_model_subtitles() {
         let model = ModelSummary {
             name: "mimo-v2.6:latest".into(),
@@ -9040,6 +9284,7 @@ mod tests {
                 parameter_size: "9.0B".into(),
                 quantization_level: "Q4_K_M".into(),
                 family: String::new(),
+                ..Default::default()
             },
             capabilities: Vec::new(),
             remote_host: None,
