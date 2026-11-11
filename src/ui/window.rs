@@ -61,7 +61,7 @@ pub struct AppState {
     pub models: RefCell<Vec<ModelSummary>>,
     pub paradee: Arc<std::sync::Mutex<Option<crate::paradee::Paradee>>>,
     pub whistle: Arc<std::sync::Mutex<Option<crate::whistle::Whistle>>>,
-    pub parakeet: Arc<std::sync::Mutex<Option<crate::parakeet::Parakeet>>>,
+    pub parakeet: crate::parakeet::SharedParakeet,
 }
 
 impl AppState {
@@ -3158,7 +3158,8 @@ impl ChatWindow {
             .as_deref()
             .is_none_or(|code| crate::whistle::WHISTLE_LANGUAGES.contains(&code));
 
-        let parakeet_downloaded = crate::parakeet::is_downloaded();
+        let parakeet_model = self.parakeet_model();
+        let parakeet_downloaded = crate::parakeet::is_downloaded(parakeet_model);
         let choice = match provider.as_str() {
             "parakeet" => SttChoice::Parakeet,
             "whistle" => SttChoice::Whistle,
@@ -3195,7 +3196,7 @@ impl ChatWindow {
         tracing::info!(
             "STT: using {} for language {:?}{}",
             match choice {
-                SttChoice::Parakeet => "Parakeet Redux",
+                SttChoice::Parakeet => parakeet_model.display_name(),
                 SttChoice::Whistle => "Whistle",
                 SttChoice::Builtin => "Ollama",
             },
@@ -3205,7 +3206,14 @@ impl ChatWindow {
 
         if choice == SttChoice::Parakeet {
             let engine = Arc::clone(&self.state.parakeet);
-            let loaded = engine.lock().map(|guard| guard.is_some()).unwrap_or(false);
+            let loaded = engine
+                .lock()
+                .map(|guard| {
+                    guard
+                        .as_ref()
+                        .is_some_and(|(loaded, _)| *loaded == parakeet_model)
+                })
+                .unwrap_or(false);
             if loaded && parakeet_downloaded {
                 self.begin_listening(
                     PreparedBackend::Parakeet(engine),
@@ -3226,15 +3234,22 @@ impl ChatWindow {
             self.stt_generation.set(prep_id);
             self.update_stt_ui();
             if parakeet_downloaded {
-                self.toast("Preparing Parakeet Redux speech recognition…");
+                self.toast(&format!(
+                    "Preparing {} speech recognition…",
+                    parakeet_model.display_name()
+                ));
             } else {
-                self.toast("Downloading Parakeet Redux model (~420 MB)…");
+                self.toast(&format!(
+                    "Downloading {} model ({})…",
+                    parakeet_model.display_name(),
+                    parakeet_model.approx_size()
+                ));
             }
 
             let (tx, rx) = async_channel::bounded(1);
             let prepare_engine = Arc::clone(&engine);
             self.state.runtime.spawn(async move {
-                let result = stt::prepare_parakeet(prepare_engine).await;
+                let result = stt::prepare_parakeet(prepare_engine, parakeet_model).await;
                 let _ = tx.send(result).await;
             });
 
@@ -3248,6 +3263,11 @@ impl ChatWindow {
                         win.stt_preparing.set(false);
                         if !win.state.settings.borrow().stt_enabled {
                             win.live_pending.set(false);
+                            win.update_stt_ui();
+                            return;
+                        }
+                        if win.parakeet_model() != parakeet_model {
+                            win.unload_stt_engine(None);
                             win.update_stt_ui();
                             return;
                         }
@@ -3268,7 +3288,10 @@ impl ChatWindow {
                         win.live_pending.set(false);
                         win.update_stt_ui();
                         win.schedule_stt_idle_unload();
-                        win.toast(&format!("Could not prepare Parakeet: {error:#}"));
+                        win.toast(&format!(
+                            "Could not prepare {}: {error:#}",
+                            parakeet_model.display_name()
+                        ));
                     }
                     Err(_) => {
                         if win.stt_generation.get() == prep_id {
@@ -5079,6 +5102,29 @@ impl ChatWindow {
         }
     }
 
+    fn parakeet_model(&self) -> crate::parakeet::ParakeetModel {
+        crate::parakeet::ParakeetModel::from_setting(
+            &self.state.settings.borrow().stt_parakeet_model,
+        )
+    }
+
+    fn update_parakeet_model_row(&self, row: &adw::ActionRow, button: &gtk::Button) {
+        let model = self.parakeet_model();
+        let downloaded = crate::parakeet::is_downloaded(model);
+        row.set_title(&format!("{} model", model.display_name()));
+        row.set_subtitle(&format!(
+            "{} · {} · CC-BY-4.0",
+            if downloaded {
+                "Downloaded"
+            } else {
+                "Not downloaded"
+            },
+            model.approx_size()
+        ));
+        button.set_label(if downloaded { "Downloaded" } else { "Download" });
+        button.set_sensitive(!downloaded);
+    }
+
     fn live_available(&self) -> bool {
         let enabled = {
             let settings = self.state.settings.borrow();
@@ -5839,11 +5885,11 @@ impl ChatWindow {
         let stt_provider_row = adw::ComboRow::new();
         stt_provider_row.set_title("Preferred STT");
         stt_provider_row.set_subtitle(
-            "Automatic prefers Parakeet Redux, then Whistle, then an audio-capable Ollama model",
+            "Automatic prefers the selected Parakeet model, then Whistle, then an audio-capable Ollama model",
         );
         let stt_providers = gtk::StringList::new(&[
             "Automatic",
-            "Parakeet Redux (local ONNX)",
+            "Parakeet (local ONNX)",
             "Whistle (local ONNX)",
             "Ollama model (built-in)",
         ]);
@@ -5852,6 +5898,22 @@ impl ChatWindow {
             &self.state.settings.borrow().stt_provider,
         ));
         stt.add(&stt_provider_row);
+
+        let parakeet_model_row = adw::ComboRow::new();
+        parakeet_model_row.set_title("Parakeet model");
+        parakeet_model_row
+            .set_subtitle("Redux is faster on CPU; Ultra is more accurate but larger");
+        let parakeet_models =
+            gtk::StringList::new(&["Redux — fast · ~420 MB", "Ultra — accurate · ~720 MB"]);
+        parakeet_model_row.set_model(Some(&parakeet_models));
+        parakeet_model_row.set_selected(
+            if self.parakeet_model() == crate::parakeet::ParakeetModel::Ultra {
+                1
+            } else {
+                0
+            },
+        );
+        stt.add(&parakeet_model_row);
 
         let stt_language_row = adw::ComboRow::new();
         stt_language_row.set_title("Language");
@@ -5916,22 +5978,11 @@ impl ChatWindow {
         stt.add(&stt_autosend_row);
 
         let parakeet_row = adw::ActionRow::new();
-        parakeet_row.set_title("Parakeet Redux model");
-        let parakeet_downloaded = crate::parakeet::is_downloaded();
-        parakeet_row.set_subtitle(if parakeet_downloaded {
-            "Downloaded · ~420 MB · CC-BY-4.0"
-        } else {
-            "Not downloaded · ~420 MB · CC-BY-4.0"
-        });
-        let parakeet_button = gtk::Button::with_label(if parakeet_downloaded {
-            "Downloaded"
-        } else {
-            "Download"
-        });
+        let parakeet_button = gtk::Button::new();
         parakeet_button.add_css_class("flat");
         parakeet_button.set_valign(gtk::Align::Center);
-        parakeet_button.set_sensitive(!parakeet_downloaded);
         parakeet_row.add_suffix(&parakeet_button);
+        self.update_parakeet_model_row(&parakeet_row, &parakeet_button);
         stt.add(&parakeet_row);
 
         let whistle_row = adw::ActionRow::new();
@@ -6444,15 +6495,35 @@ impl ChatWindow {
             let win = self.clone();
             let row = parakeet_row.clone();
             let button = parakeet_button.clone();
+            parakeet_model_row.connect_selected_notify(move |combo| {
+                let model = if combo.selected() == 1 {
+                    crate::parakeet::ParakeetModel::Ultra
+                } else {
+                    crate::parakeet::ParakeetModel::Redux
+                };
+                win.state.settings.borrow_mut().stt_parakeet_model = model.as_str().to_string();
+                win.save_settings();
+                if win.stt_listening.get() || win.stt_preparing.get() {
+                    win.stop_stt();
+                }
+                win.unload_stt_engine(None);
+                win.update_parakeet_model_row(&row, &button);
+            });
+        }
+        {
+            let win = self.clone();
+            let row = parakeet_row.clone();
+            let button = parakeet_button.clone();
             parakeet_button.connect_clicked(move |_| {
-                if crate::parakeet::is_downloaded() {
+                let model = win.parakeet_model();
+                if crate::parakeet::is_downloaded(model) {
                     return;
                 }
                 button.set_sensitive(false);
-                row.set_subtitle("Downloading…");
+                row.set_subtitle(&format!("Downloading {}…", model.display_name()));
                 let (tx, rx) = async_channel::bounded(1);
                 win.state.runtime.spawn(async move {
-                    let result = crate::parakeet::ensure_downloaded().await;
+                    let result = crate::parakeet::ensure_downloaded(model).await;
                     let _ = tx.send(result).await;
                 });
 
@@ -6462,15 +6533,15 @@ impl ChatWindow {
                 glib::spawn_future_local(async move {
                     match rx.recv().await {
                         Ok(Ok(())) => {
-                            row.set_subtitle("Downloaded · ~420 MB · CC-BY-4.0");
-                            button.set_label("Downloaded");
-                            button.set_sensitive(false);
-                            win.toast("Parakeet Redux model downloaded");
+                            win.update_parakeet_model_row(&row, &button);
+                            win.toast(&format!("{} model downloaded", model.display_name()));
                         }
                         Ok(Err(err)) => {
-                            row.set_subtitle("Not downloaded · ~420 MB · CC-BY-4.0");
-                            button.set_sensitive(true);
-                            win.toast(&format!("Could not download Parakeet model: {err:#}"));
+                            win.update_parakeet_model_row(&row, &button);
+                            win.toast(&format!(
+                                "Could not download {}: {err:#}",
+                                model.display_name()
+                            ));
                         }
                         Err(_) => {}
                     }

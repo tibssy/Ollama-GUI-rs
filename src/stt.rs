@@ -1,5 +1,5 @@
 use crate::api::OllamaClient;
-use crate::parakeet::{self, Parakeet};
+use crate::parakeet::{self, Parakeet, ParakeetModel};
 use crate::whistle::{self, Whistle};
 use anyhow::{bail, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -28,7 +28,7 @@ pub enum SttEvent {
 }
 
 pub enum PreparedBackend {
-    Parakeet(Arc<Mutex<Option<Parakeet>>>),
+    Parakeet(parakeet::SharedParakeet),
     Whistle(Arc<Mutex<Option<Whistle>>>),
     Builtin { client: OllamaClient, model: String },
 }
@@ -76,17 +76,20 @@ pub async fn prepare_whistle(engine: Arc<Mutex<Option<Whistle>>>) -> Result<()> 
     Ok(())
 }
 
-pub async fn prepare_parakeet(engine: Arc<Mutex<Option<Parakeet>>>) -> Result<()> {
-    std::fs::create_dir_all(parakeet::model_dir())
-        .with_context(|| format!("creating {}", parakeet::model_dir().display()))?;
-    parakeet::ensure_downloaded().await?;
+pub async fn prepare_parakeet(
+    engine: parakeet::SharedParakeet,
+    model: ParakeetModel,
+) -> Result<()> {
+    let dir = parakeet::model_dir(model);
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    parakeet::ensure_downloaded(model).await?;
 
     tokio::task::spawn_blocking(move || {
         let mut guard = engine
             .lock()
             .map_err(|_| anyhow::anyhow!("Parakeet engine lock failed"))?;
-        if guard.is_none() {
-            *guard = Some(Parakeet::load(&parakeet::model_dir())?);
+        if guard.as_ref().is_none_or(|(loaded, _)| *loaded != model) {
+            *guard = Some((model, Parakeet::load(&parakeet::model_dir(model))?));
         }
         Ok::<(), anyhow::Error>(())
     })
@@ -502,7 +505,7 @@ async fn transcribe_pcm(
                 let mut guard = engine
                     .lock()
                     .map_err(|_| anyhow::anyhow!("Parakeet engine lock failed"))?;
-                let engine = guard
+                let (_, engine) = guard
                     .as_mut()
                     .ok_or_else(|| anyhow::anyhow!("Parakeet engine is not loaded"))?;
                 engine.transcribe(&pcm)
@@ -756,10 +759,13 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let samples = read_wav("/tmp/opencode/stt-mem/s1.wav");
-            let engine = Arc::new(std::sync::Mutex::new(Some(
-                crate::parakeet::Parakeet::load(&crate::parakeet::model_dir())
-                    .expect("load Parakeet"),
-            )));
+            let engine = Arc::new(std::sync::Mutex::new(Some((
+                crate::parakeet::ParakeetModel::Redux,
+                crate::parakeet::Parakeet::load(&crate::parakeet::model_dir(
+                    crate::parakeet::ParakeetModel::Redux,
+                ))
+                .expect("load Parakeet"),
+            ))));
             let (audio_tx, audio_rx) = async_channel::unbounded();
             for chunk in samples.chunks(1024) {
                 audio_tx.send(chunk.to_vec()).await.unwrap();
