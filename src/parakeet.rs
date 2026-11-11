@@ -171,6 +171,17 @@ pub fn is_downloaded(model: ParakeetModel) -> bool {
     })
 }
 
+/// Remove the downloaded files for one Parakeet variant. The caller must
+/// unload the engine first when it may still be in use.
+pub fn delete(model: ParakeetModel) -> Result<()> {
+    let dir = model_dir(model);
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("removing {}", dir.display())),
+    }
+}
+
 pub async fn ensure_downloaded(model: ParakeetModel) -> Result<()> {
     let _guard = DOWNLOAD_LOCK.lock().await;
     if is_downloaded(model) {

@@ -64,6 +64,17 @@ pub fn is_downloaded() -> bool {
     model_ready && config_path().exists()
 }
 
+/// Remove the downloaded voice files. The caller must unload the engine first
+/// when it may still be in use.
+pub fn delete() -> Result<()> {
+    let dir = model_dir();
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("removing {}", dir.display())),
+    }
+}
+
 pub async fn ensure_downloaded() -> Result<()> {
     let _guard = DOWNLOAD_LOCK.lock().await;
     if is_downloaded() {

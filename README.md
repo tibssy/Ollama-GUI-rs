@@ -142,7 +142,9 @@ four voices. The int8 ONNX file is downloaded on first use (or from the
 **Paradee model → Download** button) from
 [huggingface.co/sahilmahendrakar/Paradee-8M-v1.2](https://huggingface.co/sahilmahendrakar/Paradee-8M-v1.2)
 and runs locally through ONNX Runtime. British voices use British eSpeak
-phonemes. The model is Apache-2.0; see its model card for details.
+phonemes. The model is Apache-2.0; see its model card for details. Only the
+backend selected in **Preferred TTS** shows its download button; the Paradee
+row remains visible for status and can be removed with its trash button.
 
 Speech is synthesized one sentence at a time and queued for background playback,
 so the first sentence starts before the rest of the reply is generated. Before
@@ -160,11 +162,15 @@ Preferences → Speech to Text enables the microphone button in the composer.
   also be forced explicitly.
 - **Parakeet model** — *Redux* is the small, CPU-friendly export (~420 MB).
   *Ultra* is the larger, more accurate export (~720 MB) and is slower on CPU.
-  Select the model here and download it from the row below.
+  Select the model here and download it from the row below. The selector is
+  shown for the Parakeet and Automatic providers.
 - **Language** — Parakeet detects the language automatically. Whistle supports
   English, German, French, Spanish, Italian, Dutch and Polish. Built-in
   languages depend on the selected model (`lfm3-audio` supports 19 languages).
   "Auto detect" is available.
+- Only the active provider shows its download button. Downloaded Parakeet and
+  Whistle rows stay visible for status, and both have a trash button that
+  unloads the engine and removes the model files.
 - **Wait for speech** — if no voice is detected within this many seconds,
   listening stops and the microphone becomes clickable again.
 - **End of speech silence** — seconds of silence after which the utterance is
