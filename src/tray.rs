@@ -1,4 +1,8 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use async_channel::Sender;
+use ksni::OfflineReason;
 
 /// Commands sent from the status-notifier thread to the GTK main loop.
 #[derive(Debug, Clone)]
@@ -18,6 +22,9 @@ pub struct StatusTray {
     /// True while the microphone is listening for the wake word.
     pub wake_listening: bool,
     pub wake_word: String,
+    /// Shared with the UI so an autostart launch can fall back to a visible
+    /// window when no StatusNotifier host ever appears.
+    pub watcher_online: Arc<AtomicBool>,
 }
 
 /// The activation token may arrive a moment after the tray event.
@@ -68,6 +75,16 @@ impl ksni::Tray for StatusTray {
     fn activate(&mut self, _x: i32, _y: i32) {
         let token = activation_token();
         let _ = self.commands.try_send(TrayCommand::ToggleWindow(token));
+    }
+
+    fn watcher_online(&self) {
+        self.watcher_online.store(true, Ordering::Relaxed);
+    }
+
+    fn watcher_offline(&self, reason: OfflineReason) -> bool {
+        tracing::warn!("system tray watcher offline: {reason:?}");
+        self.watcher_online.store(false, Ordering::Relaxed);
+        true
     }
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {

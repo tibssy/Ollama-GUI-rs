@@ -101,11 +101,14 @@ impl Default for Settings {
     }
 }
 
-pub fn config_dir() -> PathBuf {
+pub fn config_home() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".config"))
-        .join("ollama-gui")
+}
+
+pub fn config_dir() -> PathBuf {
+    config_home().join("ollama-gui")
 }
 
 pub fn data_dir() -> PathBuf {

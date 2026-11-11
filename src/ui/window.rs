@@ -1,7 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use base64::Engine as _;
@@ -15,6 +15,7 @@ use crate::api::{
     self, ChatMessage, ChatOptions, ChatRequest, ModelSummary, OllamaClient, StreamEvent,
     StreamStats, ThinkSetting, ThinkingControl,
 };
+use crate::autostart;
 use crate::config::Settings;
 use crate::feedback::{self, Cue};
 use crate::memory::{self, MemoryPool};
@@ -38,6 +39,9 @@ const CONTEXT_CHUNK_RATIO: f64 = 0.45;
 const SUMMARY_TEMPERATURE: f64 = 0.2;
 /// Wait this long after a reply before extracting long-term memory.
 const MEMORY_DEBOUNCE_MS: u64 = 3_000;
+/// Let the graphical session and microphone settle before an autostart launch
+/// arms the wake detector.
+const AUTOSTART_WAKE_DELAY_SECS: u32 = 3;
 /// Feed memory extraction this fraction of `num_ctx` at a time.
 const MEMORY_TRANSCRIPT_RATIO: f64 = 0.45;
 const MEMORY_TEMPERATURE: f64 = 0.1;
@@ -1014,6 +1018,11 @@ struct ChatWindow {
     wake_listening: Cell<bool>,
     /// Session-only armed state. Wake detection never starts by itself.
     wake_active: Cell<bool>,
+    /// True when the app was launched by its autostart entry.
+    autostart: bool,
+    /// Arms wake detection a few seconds after an autostart launch, unless the
+    /// user changes the wake state first.
+    autostart_wake_pending: Cell<bool>,
     wake_pending: Cell<bool>,
     wake_tx: async_channel::Sender<()>,
     wake_rx: RefCell<Option<async_channel::Receiver<()>>>,
@@ -1021,7 +1030,7 @@ struct ChatWindow {
     suppress_model_change: Cell<bool>,
 }
 
-pub fn build(app: &adw::Application) -> anyhow::Result<adw::ApplicationWindow> {
+pub fn build(app: &adw::Application, autostart: bool) -> anyhow::Result<adw::ApplicationWindow> {
     let state = Rc::new(AppState::new()?);
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -1030,14 +1039,14 @@ pub fn build(app: &adw::Application) -> anyhow::Result<adw::ApplicationWindow> {
         .default_height(760)
         .build();
 
-    let chat = ChatWindow::new(&window, state);
+    let chat = ChatWindow::new(&window, state, autostart);
     chat.wire();
     chat.start();
     Ok(window)
 }
 
 impl ChatWindow {
-    fn new(window: &adw::ApplicationWindow, state: Rc<AppState>) -> Rc<Self> {
+    fn new(window: &adw::ApplicationWindow, state: Rc<AppState>, autostart: bool) -> Rc<Self> {
         let (wake_tx, wake_rx) = async_channel::unbounded();
 
         // ----- Sidebar -----------------------------------------------------
@@ -1376,6 +1385,8 @@ impl ChatWindow {
             wake_preparing: Cell::new(false),
             wake_listening: Cell::new(false),
             wake_active: Cell::new(false),
+            autostart,
+            autostart_wake_pending: Cell::new(false),
             wake_pending: Cell::new(false),
             wake_tx,
             wake_rx: RefCell::new(Some(wake_rx)),
@@ -1642,6 +1653,13 @@ impl ChatWindow {
         self.apply_theme();
         self.reload_sidebar();
 
+        // An autostart entry only makes sense with the tray, so keep the
+        // background setting consistent even if it was edited externally.
+        if autostart::is_enabled() && !self.state.settings.borrow().run_in_background {
+            self.state.settings.borrow_mut().run_in_background = true;
+            self.save_settings();
+        }
+
         let first = self
             .state
             .store
@@ -1660,6 +1678,19 @@ impl ChatWindow {
         self.input.grab_focus();
         self.update_stt_ui();
         self.apply_background_startup();
+
+        // Autostart is the only launch path that arms wake detection on its
+        // own. Delay it a little so the tray host and microphone are ready.
+        if self.autostart && self.state.settings.borrow().wake_enabled {
+            self.autostart_wake_pending.set(true);
+            let win = self.clone();
+            glib::timeout_add_seconds_local_once(AUTOSTART_WAKE_DELAY_SECS, move || {
+                if win.autostart_wake_pending.replace(false) {
+                    win.wake_active.set(true);
+                    win.refresh_wake();
+                }
+            });
+        }
 
         if let Some(rx) = self.wake_rx.borrow_mut().take() {
             let win = self.clone();
@@ -5105,6 +5136,8 @@ impl ChatWindow {
         self.tray_wake_visible.set(wake_visible);
         self.tray_wake_listening.set(self.wake_listening.get());
         *self.tray_wake_word.borrow_mut() = wake_word.clone();
+        let watcher_online = Arc::new(AtomicBool::new(true));
+        let autostart = self.autostart;
         let tray = StatusTray {
             commands: commands_tx,
             live,
@@ -5112,10 +5145,18 @@ impl ChatWindow {
             wake_visible,
             wake_listening: self.wake_listening.get(),
             wake_word,
+            watcher_online: watcher_online.clone(),
         };
         let (result_tx, result_rx) = async_channel::bounded(1);
         self.state.runtime.spawn(async move {
-            let result = tray.spawn().await.map_err(|err| format!("{err}"));
+            // An autostart launch may beat the tray host. Let ksni wait for it
+            // instead of failing and showing the window immediately.
+            let result = if autostart {
+                tray.assume_sni_available(true).spawn().await
+            } else {
+                tray.spawn().await
+            };
+            let result = result.map_err(|err| format!("{err}"));
             let _ = result_tx.send(result).await;
         });
 
@@ -5123,7 +5164,7 @@ impl ChatWindow {
         glib::spawn_future_local(async move {
             match result_rx.recv().await {
                 Ok(Ok(handle)) => {
-                    let enabled = win.state.settings.borrow().run_in_background;
+                    let enabled = win.autostart || win.state.settings.borrow().run_in_background;
                     if !enabled {
                         win.state.runtime.spawn(async move {
                             handle.shutdown().await;
@@ -5135,6 +5176,21 @@ impl ChatWindow {
                     win.window.set_hide_on_close(true);
                     win.update_tray_state();
 
+                    if win.autostart {
+                        let win = win.clone();
+                        let online = watcher_online.clone();
+                        glib::timeout_add_seconds_local_once(15, move || {
+                            if !online.load(Ordering::Relaxed) {
+                                tracing::warn!(
+                                    "system tray watcher did not appear; showing window"
+                                );
+                                win.toast("The system tray is unavailable; showing the window.");
+                                win.window.set_hide_on_close(false);
+                                win.window.present();
+                            }
+                        });
+                    }
+
                     let win = win.clone();
                     glib::spawn_future_local(async move {
                         while let Ok(command) = commands_rx.recv().await {
@@ -5144,6 +5200,7 @@ impl ChatWindow {
                                 }
                                 TrayCommand::ToggleLive => win.toggle_live(),
                                 TrayCommand::ToggleWake => {
+                                    win.autostart_wake_pending.set(false);
                                     let active = !win.wake_active.get();
                                     win.wake_active.set(active);
                                     win.refresh_wake();
@@ -5156,15 +5213,22 @@ impl ChatWindow {
                 }
                 Ok(Err(err)) => {
                     tracing::warn!("system tray unavailable: {err}");
-                    win.toast("System tray is unavailable; background mode is disabled.");
-                    win.state.settings.borrow_mut().run_in_background = false;
-                    win.save_settings();
                     win.window.set_hide_on_close(false);
-                    if !win.window.is_visible() {
-                        win.window.present();
-                    }
-                    if let Some(row) = row {
-                        row.set_active(false);
+                    if win.autostart {
+                        win.toast("The system tray is unavailable; showing the window.");
+                        if !win.window.is_visible() {
+                            win.window.present();
+                        }
+                    } else {
+                        win.toast("System tray is unavailable; background mode is disabled.");
+                        win.state.settings.borrow_mut().run_in_background = false;
+                        win.save_settings();
+                        if !win.window.is_visible() {
+                            win.window.present();
+                        }
+                        if let Some(row) = row {
+                            row.set_active(false);
+                        }
                     }
                 }
                 Err(_) => {}
@@ -5244,7 +5308,7 @@ impl ChatWindow {
     }
 
     fn apply_background_startup(self: &Rc<Self>) {
-        if self.state.settings.borrow().run_in_background {
+        if self.autostart || self.state.settings.borrow().run_in_background {
             self.window.set_hide_on_close(true);
             self.start_tray(None);
         }
@@ -5308,11 +5372,50 @@ impl ChatWindow {
         background_row.set_subtitle("Closing the window hides it to the system tray");
         background_row.set_active(self.state.settings.borrow().run_in_background);
         application.add(&background_row);
+
+        let autostart_row = adw::SwitchRow::new();
+        autostart_row.set_title("Start automatically at login");
+        autostart_row.set_subtitle(if self.state.settings.borrow().wake_enabled {
+            "Starts hidden in the tray and listens for the wake word"
+        } else {
+            "Starts hidden in the system tray"
+        });
+        autostart_row.set_active(autostart::is_enabled());
+        application.add(&autostart_row);
         page.add(&application);
+
         {
             let win = self.clone();
+            let autostart_row = autostart_row.clone();
             background_row.connect_active_notify(move |row| {
                 win.set_background_enabled(row.is_active(), Some(row.clone()));
+                if !row.is_active() && autostart::is_enabled() {
+                    match autostart::set_enabled(false) {
+                        Ok(()) => autostart_row.set_active(false),
+                        Err(err) => {
+                            tracing::warn!("autostart: {err:#}");
+                            win.toast(&format!("Could not disable autostart: {err}"));
+                        }
+                    }
+                }
+            });
+        }
+        {
+            let win = self.clone();
+            let background_row = background_row.clone();
+            autostart_row.connect_active_notify(move |row| {
+                let enabled = row.is_active();
+                if enabled && !win.state.settings.borrow().run_in_background {
+                    // A hidden window needs the tray, so background mode is
+                    // implied by autostart.
+                    background_row.set_active(true);
+                    win.set_background_enabled(true, Some(background_row.clone()));
+                }
+                if let Err(err) = autostart::set_enabled(enabled) {
+                    tracing::warn!("autostart: {err:#}");
+                    row.set_active(!enabled);
+                    win.toast(&format!("Could not update autostart: {err}"));
+                }
             });
         }
 
@@ -5851,6 +5954,7 @@ impl ChatWindow {
             wake_enable_row.connect_active_notify(move |row| {
                 win.state.settings.borrow_mut().wake_enabled = row.is_active();
                 win.save_settings();
+                win.autostart_wake_pending.set(false);
                 if !row.is_active() {
                     win.wake_active.set(false);
                 }
