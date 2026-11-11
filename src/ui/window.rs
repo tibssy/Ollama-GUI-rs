@@ -7763,8 +7763,18 @@ impl ChatWindow {
         let (models_page, language_models) = self.build_models_page(&parakeet_badges);
 
         let stack = adw::ViewStack::new();
-        stack.add_titled(&general_page, Some("general"), "General");
-        stack.add_titled(&models_page, Some("models"), "Models");
+        stack.add_titled_with_icon(
+            &general_page,
+            Some("general"),
+            "General",
+            "preferences-system-symbolic",
+        );
+        stack.add_titled_with_icon(
+            &models_page,
+            Some("models"),
+            "Models",
+            "package-x-generic-symbolic",
+        );
         stack.set_visible_child_name("general");
         {
             let win = self.clone();
