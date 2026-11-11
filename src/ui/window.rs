@@ -18,6 +18,7 @@ use crate::api::{
 use crate::autostart;
 use crate::config::Settings;
 use crate::feedback::{self, Cue};
+use crate::hf;
 use crate::memory::{self, MemoryPool};
 use crate::store::{Store, StoredImage, StoredMessage, StoredSummary};
 use crate::stt::{self, PreparedBackend, SttEvent};
@@ -1149,6 +1150,481 @@ impl ManagedModel {
             Self::ParakeetUltra => crate::parakeet::delete(crate::parakeet::ParakeetModel::Ultra),
             Self::Whistle => crate::whistle::delete(),
         }
+    }
+}
+
+struct LlmModelsState {
+    group: adw::PreferencesGroup,
+    rows: RefCell<Vec<adw::ActionRow>>,
+    generation: Cell<u64>,
+}
+
+impl LlmModelsState {
+    fn new(group: adw::PreferencesGroup) -> Self {
+        Self {
+            group,
+            rows: RefCell::new(Vec::new()),
+            generation: Cell::new(0),
+        }
+    }
+
+    fn clear_rows(&self) {
+        for row in self.rows.borrow_mut().drain(..) {
+            self.group.remove(&row);
+        }
+    }
+
+    fn add_row(&self, row: adw::ActionRow) {
+        self.group.add(&row);
+        self.rows.borrow_mut().push(row);
+    }
+
+    fn show_loading(&self) {
+        let row = adw::ActionRow::new();
+        row.set_title("Loading models…");
+        let spinner = gtk::Spinner::new();
+        spinner.set_valign(gtk::Align::Center);
+        spinner.start();
+        row.add_suffix(&spinner);
+        self.add_row(row);
+    }
+
+    fn refresh(self: &Rc<Self>, win: &Rc<ChatWindow>) {
+        let generation = self.generation.get().saturating_add(1);
+        self.generation.set(generation);
+        self.clear_rows();
+        self.show_loading();
+
+        let client = win.state.client.borrow().clone();
+        let (tx, rx) = async_channel::bounded(1);
+        win.state.runtime.spawn(async move {
+            let _ = tx.send(client.list_models().await).await;
+        });
+
+        let state = Rc::clone(self);
+        let win = win.clone();
+        glib::spawn_future_local(async move {
+            let Ok(result) = rx.recv().await else {
+                return;
+            };
+            if state.generation.get() != generation {
+                return;
+            }
+            state.populate(&win, result);
+        });
+    }
+
+    fn populate(self: &Rc<Self>, win: &Rc<ChatWindow>, result: anyhow::Result<Vec<ModelSummary>>) {
+        self.clear_rows();
+        match result {
+            Ok(models) => {
+                if models.is_empty() {
+                    let row = adw::ActionRow::new();
+                    row.set_title("No models installed");
+                    row.set_subtitle(
+                        "Use the add button to pull a model from Ollama or Hugging Face.",
+                    );
+                    self.add_row(row);
+                } else {
+                    for model in models {
+                        let row = win.build_llm_model_row(self, model);
+                        self.add_row(row);
+                    }
+                }
+            }
+            Err(err) => {
+                let row = adw::ActionRow::new();
+                row.set_title("Could not load models");
+                row.set_subtitle(&format!("{err:#}"));
+                let retry = gtk::Button::from_icon_name("view-refresh-symbolic");
+                retry.add_css_class("flat");
+                retry.set_valign(gtk::Align::Center);
+                retry.set_tooltip_text(Some("Retry"));
+                let state = Rc::downgrade(self);
+                let win = win.clone();
+                retry.connect_clicked(move |_| {
+                    if let Some(state) = state.upgrade() {
+                        state.refresh(&win);
+                    }
+                });
+                row.add_suffix(&retry);
+                self.add_row(row);
+            }
+        }
+    }
+}
+
+enum PullMessage {
+    Progress(api::PullProgress),
+    Done(anyhow::Result<()>),
+}
+
+struct AddModelForm {
+    win: Rc<ChatWindow>,
+    dialog: glib::WeakRef<adw::Dialog>,
+    source_row: adw::ComboRow,
+    ollama_name: adw::EntryRow,
+    hf_repo: adw::EntryRow,
+    quant_row: adw::ComboRow,
+    quants: RefCell<Vec<hf::HfQuant>>,
+    saved_row: adw::ActionRow,
+    error: gtk::Label,
+    progress: gtk::ProgressBar,
+    status: gtk::Label,
+    load_button: gtk::Button,
+    quant_spinner: gtk::Spinner,
+    download: gtk::Button,
+    cancel: gtk::Button,
+    fetch_generation: Cell<u64>,
+    suppress_quant: Cell<bool>,
+    downloading: Cell<bool>,
+    cancel_handle: RefCell<Option<tokio::task::AbortHandle>>,
+}
+
+impl AddModelForm {
+    fn is_hf(&self) -> bool {
+        self.source_row.selected() == 1
+    }
+
+    fn selected_quant(&self) -> Option<hf::HfQuant> {
+        let index = self.quant_row.selected() as usize;
+        self.quants.borrow().get(index).cloned()
+    }
+
+    fn set_error(&self, message: Option<&str>) {
+        match message {
+            Some(message) => {
+                self.error.set_text(message);
+                self.error.set_visible(true);
+            }
+            None => self.error.set_visible(false),
+        }
+    }
+
+    fn clear_quant_choices(&self) {
+        self.quants.borrow_mut().clear();
+        self.suppress_quant.set(true);
+        self.quant_row.set_model(Some(&gtk::StringList::new(&[])));
+        self.suppress_quant.set(false);
+    }
+
+    fn refresh_visibility(&self) {
+        let hf = self.is_hf();
+        self.ollama_name.set_visible(!hf);
+        self.hf_repo.set_visible(hf);
+        self.quant_row.set_visible(hf);
+        self.saved_row.set_visible(hf);
+        self.update_preview();
+    }
+
+    fn update_preview(&self) {
+        if self.is_hf() {
+            self.saved_row.set_visible(true);
+            let raw = self.hf_repo.text();
+            match hf::normalize_repo(&raw) {
+                Ok((repo, _)) => match hf::short_name(&repo) {
+                    Ok(short) => self.saved_row.set_subtitle(&short),
+                    Err(_) => self.saved_row.set_subtitle("Enter owner/repository"),
+                },
+                Err(_) => self.saved_row.set_subtitle("Enter owner/repository"),
+            }
+        } else {
+            let name = self.ollama_name.text().trim().to_string();
+            self.saved_row.set_visible(!name.is_empty());
+            if !name.is_empty() {
+                self.saved_row.set_subtitle(&name);
+            }
+        }
+    }
+
+    fn fetch_quants(self: &Rc<Self>) {
+        if self.downloading.get() || !self.is_hf() {
+            return;
+        }
+        let raw = self.hf_repo.text();
+        if raw.trim().is_empty() {
+            self.download.set_sensitive(true);
+            self.set_error(None);
+            return;
+        }
+        let (repo, typed_tag) = match hf::normalize_repo(&raw) {
+            Ok(value) => value,
+            Err(err) => {
+                self.download.set_sensitive(true);
+                self.set_error(Some(&format!("{err:#}")));
+                return;
+            }
+        };
+
+        self.set_error(None);
+        let generation = self.fetch_generation.get().saturating_add(1);
+        self.fetch_generation.set(generation);
+        self.clear_quant_choices();
+        self.update_preview();
+        self.quant_spinner.set_visible(true);
+        self.quant_spinner.start();
+        self.load_button.set_sensitive(false);
+        self.download.set_sensitive(false);
+
+        let (tx, rx) = async_channel::bounded(1);
+        self.win.state.runtime.spawn(async move {
+            let _ = tx.send(hf::fetch_quantizations(&repo).await).await;
+        });
+
+        let form = Rc::clone(self);
+        glib::spawn_future_local(async move {
+            let Ok(result) = rx.recv().await else {
+                return;
+            };
+            if form.fetch_generation.get() != generation {
+                return;
+            }
+            form.quant_spinner.stop();
+            form.quant_spinner.set_visible(false);
+            form.load_button.set_sensitive(true);
+            form.download.set_sensitive(true);
+            match result {
+                Ok(quants) if quants.is_empty() => {
+                    form.clear_quant_choices();
+                    form.set_error(Some("No GGUF files were found in this repository."));
+                }
+                Ok(quants) => {
+                    form.set_error(None);
+                    let labels: Vec<String> = quants
+                        .iter()
+                        .map(|quant| match quant.size {
+                            Some(size) => format!("{} · {}", quant.tag, format_bytes(size)),
+                            None => quant.tag.clone(),
+                        })
+                        .collect();
+                    let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+                    let list = gtk::StringList::new(&refs);
+                    let preferred = typed_tag
+                        .as_deref()
+                        .and_then(|tag| {
+                            quants
+                                .iter()
+                                .position(|quant| quant.tag.eq_ignore_ascii_case(tag))
+                        })
+                        .or_else(|| quants.iter().position(|quant| quant.tag == "Q4_K_M"))
+                        .unwrap_or(0);
+                    *form.quants.borrow_mut() = quants;
+                    form.suppress_quant.set(true);
+                    form.quant_row.set_model(Some(&list));
+                    form.quant_row.set_selected(preferred as u32);
+                    form.suppress_quant.set(false);
+                    form.update_preview();
+                }
+                Err(err) => {
+                    form.clear_quant_choices();
+                    form.set_error(Some(&format!("{err:#}")));
+                }
+            }
+        });
+    }
+
+    fn set_busy(&self, busy: bool) {
+        self.downloading.set(busy);
+        self.source_row.set_sensitive(!busy);
+        self.ollama_name.set_sensitive(!busy);
+        self.hf_repo.set_sensitive(!busy);
+        self.quant_row.set_sensitive(!busy);
+        self.load_button.set_sensitive(!busy);
+        self.download.set_visible(!busy);
+        self.progress.set_visible(busy);
+        self.status.set_visible(busy);
+        self.cancel
+            .set_label(if busy { "Cancel download" } else { "Cancel" });
+        if let Some(dialog) = self.dialog.upgrade() {
+            dialog.set_can_close(!busy);
+        }
+        if busy {
+            self.set_error(None);
+            self.progress.set_fraction(0.0);
+            self.status.set_text("Starting download…");
+        } else {
+            self.progress.set_fraction(0.0);
+        }
+    }
+
+    fn apply_progress(&self, progress: &api::PullProgress) {
+        let label = pull_status_label(&progress.status);
+        if let Some(fraction) = progress.fraction() {
+            self.progress.set_fraction(fraction);
+            self.status
+                .set_text(&format!("{label} · {:.0}%", fraction * 100.0));
+        } else {
+            self.progress.pulse();
+            self.status.set_text(&label);
+        }
+        self.progress.set_visible(true);
+        self.status.set_visible(true);
+    }
+
+    fn start_download(self: &Rc<Self>, state: Rc<LlmModelsState>) {
+        if self.downloading.get() {
+            return;
+        }
+        self.set_error(None);
+
+        let (pull_ref, short, rename) = if self.is_hf() {
+            let raw = self.hf_repo.text();
+            let (repo, typed_tag) = match hf::normalize_repo(&raw) {
+                Ok(value) => value,
+                Err(err) => {
+                    self.set_error(Some(&format!("{err:#}")));
+                    return;
+                }
+            };
+            let Some(tag) = self.selected_quant().map(|quant| quant.tag).or(typed_tag) else {
+                self.set_error(Some("Choose a quantization first."));
+                return;
+            };
+            let short = match hf::short_name(&repo) {
+                Ok(short) => short,
+                Err(err) => {
+                    self.set_error(Some(&format!("{err:#}")));
+                    return;
+                }
+            };
+            if self.win.state.models.borrow().iter().any(|model| {
+                model.name == short
+                    || model
+                        .name
+                        .rsplit_once(':')
+                        .is_some_and(|(name, _)| name == short)
+            }) {
+                self.set_error(Some(&format!(
+                    "A model named {short} already exists. Delete it first."
+                )));
+                return;
+            }
+            (hf::pull_reference(&repo, &tag), short, true)
+        } else {
+            let name = self.ollama_name.text().trim().to_string();
+            if name.is_empty() {
+                self.set_error(Some("Enter a model name."));
+                return;
+            }
+            if name.starts_with("hf.co/") {
+                self.set_error(Some("Use the Hugging Face source for hf.co models."));
+                return;
+            }
+            (name.clone(), name, false)
+        };
+
+        self.set_busy(true);
+        let client = self.win.state.client.borrow().clone();
+        let (tx, rx) = async_channel::unbounded::<PullMessage>();
+        let pull_ref_for_task = pull_ref.clone();
+        let short_for_task = short.clone();
+        let handle = self.win.state.runtime.spawn(async move {
+            let result = run_model_pull(
+                client,
+                pull_ref_for_task,
+                short_for_task,
+                rename,
+                tx.clone(),
+            )
+            .await;
+            let _ = tx.send(PullMessage::Done(result)).await;
+        });
+        *self.cancel_handle.borrow_mut() = Some(handle.abort_handle());
+
+        let form = Rc::clone(self);
+        let short = short.clone();
+        glib::spawn_future_local(async move {
+            while let Ok(message) = rx.recv().await {
+                match message {
+                    PullMessage::Progress(progress) => form.apply_progress(&progress),
+                    PullMessage::Done(result) => {
+                        form.finish_download(result, &short, &state);
+                        return;
+                    }
+                }
+            }
+            form.finish_cancelled();
+        });
+    }
+
+    fn finish_download(&self, result: anyhow::Result<()>, short: &str, state: &Rc<LlmModelsState>) {
+        self.cancel_handle.borrow_mut().take();
+        self.set_busy(false);
+        self.progress.set_visible(false);
+        self.status.set_visible(false);
+        match result {
+            Ok(()) => {
+                self.win.toast(&format!("{short} downloaded"));
+                if let Some(dialog) = self.dialog.upgrade() {
+                    dialog.close();
+                }
+                state.refresh(&self.win);
+                self.win.refresh_models();
+            }
+            Err(err) => {
+                self.set_error(Some(&format!("Could not download {short}: {err:#}")));
+            }
+        }
+    }
+
+    fn finish_cancelled(&self) {
+        self.cancel_handle.borrow_mut().take();
+        self.set_busy(false);
+        self.progress.set_visible(false);
+        self.status.set_visible(false);
+        self.win.toast("Download cancelled");
+    }
+
+    fn cancel(self: &Rc<Self>) {
+        if self.downloading.get() {
+            self.status.set_text("Cancelling…");
+            if let Some(handle) = self.cancel_handle.borrow_mut().take() {
+                handle.abort();
+            }
+        } else if let Some(dialog) = self.dialog.upgrade() {
+            dialog.close();
+        }
+    }
+}
+
+async fn run_model_pull(
+    client: OllamaClient,
+    pull_ref: String,
+    short: String,
+    rename: bool,
+    tx: async_channel::Sender<PullMessage>,
+) -> anyhow::Result<()> {
+    let progress_tx = tx.clone();
+    client
+        .pull_model(&pull_ref, move |progress| {
+            let _ = progress_tx.try_send(PullMessage::Progress(progress));
+        })
+        .await?;
+
+    if rename {
+        let _ = tx.try_send(PullMessage::Progress(api::PullProgress {
+            status: "renaming".to_string(),
+            ..Default::default()
+        }));
+        client.copy_model(&pull_ref, &short).await?;
+        if let Err(err) = client.delete_model(&pull_ref).await {
+            tracing::warn!("could not remove temporary Hugging Face model {pull_ref}: {err:#}");
+        }
+    }
+    Ok(())
+}
+
+fn pull_status_label(status: &str) -> String {
+    match status {
+        "pulling manifest" => "Fetching model manifest…".to_string(),
+        "verifying sha256 digest" => "Verifying download…".to_string(),
+        "writing manifest" => "Writing manifest…".to_string(),
+        "removing unused layers" => "Cleaning up…".to_string(),
+        "success" => "Finishing…".to_string(),
+        "renaming" => "Renaming to a short model name…".to_string(),
+        "" => "Downloading…".to_string(),
+        other if other.starts_with("pulling ") => "Downloading model…".to_string(),
+        other => other.to_string(),
     }
 }
 
@@ -5555,8 +6031,424 @@ impl ChatWindow {
         row
     }
 
-    fn build_models_page(self: &Rc<Self>, badges: &ParakeetBadges) -> adw::PreferencesPage {
+    fn show_add_model_dialog(self: &Rc<Self>, state: Rc<LlmModelsState>) {
+        let dialog = adw::Dialog::builder()
+            .title("Add model")
+            .content_width(640)
+            .content_height(560)
+            .build();
+
+        let header = adw::HeaderBar::new();
+        header.set_show_end_title_buttons(false);
+        let close = gtk::Button::from_icon_name("window-close-symbolic");
+        close.add_css_class("flat");
+        header.pack_end(&close);
+
         let page = adw::PreferencesPage::new();
+
+        let source_group = adw::PreferencesGroup::new();
+        source_group.set_title("Source");
+        let source_row = adw::ComboRow::new();
+        source_row.set_title("Download from");
+        source_row.set_model(Some(&gtk::StringList::new(&["Ollama", "Hugging Face"])));
+        source_row.set_selected(0);
+        source_group.add(&source_row);
+        page.add(&source_group);
+
+        let form_group = adw::PreferencesGroup::new();
+        form_group.set_title("Model");
+        form_group.set_description(Some(
+            "Enter a model name from ollama.com/library, for example llama3.2:3b.",
+        ));
+
+        let ollama_name = adw::EntryRow::new();
+        ollama_name.set_title("Model name");
+        ollama_name.set_tooltip_text(Some("For example llama3.2:3b"));
+        form_group.add(&ollama_name);
+
+        let hf_repo = adw::EntryRow::new();
+        hf_repo.set_title("Hugging Face repository");
+        hf_repo.set_tooltip_text(Some("For example AtomicChat/LFM3-1.7B-Uncensored-GGUF"));
+        hf_repo.set_visible(false);
+        let load_button = gtk::Button::from_icon_name("view-refresh-symbolic");
+        load_button.add_css_class("flat");
+        load_button.set_valign(gtk::Align::Center);
+        load_button.set_tooltip_text(Some("Load available quantizations"));
+        hf_repo.add_suffix(&load_button);
+        form_group.add(&hf_repo);
+
+        let quant_row = adw::ComboRow::new();
+        quant_row.set_title("Quantization");
+        quant_row.set_subtitle("Choose the GGUF quantization to download");
+        quant_row.set_visible(false);
+        let quant_spinner = gtk::Spinner::new();
+        quant_spinner.set_valign(gtk::Align::Center);
+        quant_spinner.set_visible(false);
+        quant_row.add_suffix(&quant_spinner);
+        form_group.add(&quant_row);
+
+        let saved_row = adw::ActionRow::new();
+        saved_row.set_title("Saved as");
+        saved_row.set_visible(false);
+        form_group.add(&saved_row);
+
+        page.add(&form_group);
+
+        let error = gtk::Label::new(None);
+        error.add_css_class("error");
+        error.set_wrap(true);
+        error.set_xalign(0.0);
+        error.set_visible(false);
+
+        let progress = gtk::ProgressBar::new();
+        progress.set_visible(false);
+        progress.set_show_text(false);
+        progress.set_pulse_step(0.08);
+
+        let status = gtk::Label::new(None);
+        status.add_css_class("dim-label");
+        status.set_wrap(true);
+        status.set_xalign(0.0);
+        status.set_visible(false);
+
+        let feedback = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        feedback.set_margin_top(6);
+        feedback.set_margin_bottom(6);
+        feedback.set_margin_start(12);
+        feedback.set_margin_end(12);
+        feedback.append(&progress);
+        feedback.append(&status);
+        feedback.append(&error);
+        let feedback_group = adw::PreferencesGroup::new();
+        feedback_group.add(&feedback);
+        page.add(&feedback_group);
+
+        let cancel = gtk::Button::with_label("Cancel");
+        let download = gtk::Button::from_icon_name("folder-download-symbolic");
+        download.add_css_class("suggested-action");
+        download.set_tooltip_text(Some("Download model"));
+
+        let bottom = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        bottom.set_halign(gtk::Align::End);
+        bottom.set_margin_top(12);
+        bottom.set_margin_bottom(12);
+        bottom.set_margin_start(12);
+        bottom.set_margin_end(12);
+        bottom.append(&cancel);
+        bottom.append(&download);
+
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&header);
+        toolbar.set_content(Some(&page));
+        toolbar.add_bottom_bar(&bottom);
+        dialog.set_child(Some(&toolbar));
+
+        let form = Rc::new(AddModelForm {
+            win: self.clone(),
+            dialog: dialog.downgrade(),
+            source_row: source_row.clone(),
+            ollama_name: ollama_name.clone(),
+            hf_repo: hf_repo.clone(),
+            quant_row: quant_row.clone(),
+            quants: RefCell::new(Vec::new()),
+            saved_row: saved_row.clone(),
+            error: error.clone(),
+            progress: progress.clone(),
+            status: status.clone(),
+            load_button: load_button.clone(),
+            quant_spinner: quant_spinner.clone(),
+            download: download.clone(),
+            cancel: cancel.clone(),
+            fetch_generation: Cell::new(0),
+            suppress_quant: Cell::new(false),
+            downloading: Cell::new(false),
+            cancel_handle: RefCell::new(None),
+        });
+        form.refresh_visibility();
+
+        // The dialog owns the only strong reference to the form. Signal handlers
+        // keep weak references so the widget/form graph is not leaked.
+        {
+            let form = Rc::clone(&form);
+            dialog.connect_closed(move |_| {
+                let _ = &form;
+            });
+        }
+        {
+            let weak = Rc::downgrade(&form);
+            let form_group = form_group.clone();
+            source_row.connect_selected_notify(move |row| {
+                let Some(form) = weak.upgrade() else {
+                    return;
+                };
+                form_group.set_description(Some(if row.selected() == 1 {
+                    "Enter owner/repository from Hugging Face. Quantizations load when you press Enter or leave the field."
+                } else {
+                    "Enter a model name from ollama.com/library, for example llama3.2:3b."
+                }));
+                form.download.set_sensitive(true);
+                form.set_error(None);
+                form.refresh_visibility();
+            });
+        }
+        {
+            let weak = Rc::downgrade(&form);
+            ollama_name.connect_changed(move |_| {
+                if let Some(form) = weak.upgrade() {
+                    form.update_preview();
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(&form);
+            hf_repo.connect_changed(move |_| {
+                let Some(form) = weak.upgrade() else {
+                    return;
+                };
+                form.fetch_generation
+                    .set(form.fetch_generation.get().saturating_add(1));
+                form.clear_quant_choices();
+                form.quant_spinner.stop();
+                form.quant_spinner.set_visible(false);
+                form.load_button.set_sensitive(true);
+                form.download.set_sensitive(true);
+                form.set_error(None);
+                form.update_preview();
+            });
+        }
+        {
+            let weak = Rc::downgrade(&form);
+            hf_repo.connect_entry_activated(move |_| {
+                if let Some(form) = weak.upgrade() {
+                    form.fetch_quants();
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(&form);
+            load_button.connect_clicked(move |_| {
+                if let Some(form) = weak.upgrade() {
+                    form.fetch_quants();
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(&form);
+            quant_row.connect_selected_notify(move |_| {
+                if let Some(form) = weak.upgrade() {
+                    if !form.suppress_quant.get() {
+                        form.update_preview();
+                    }
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(&form);
+            let focus = gtk::EventControllerFocus::new();
+            hf_repo.add_controller(focus.clone());
+            focus.connect_leave(move |_| {
+                if let Some(form) = weak.upgrade() {
+                    form.fetch_quants();
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(&form);
+            let state = Rc::clone(&state);
+            download.connect_clicked(move |_| {
+                if let Some(form) = weak.upgrade() {
+                    form.start_download(Rc::clone(&state));
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(&form);
+            cancel.connect_clicked(move |_| {
+                if let Some(form) = weak.upgrade() {
+                    form.cancel();
+                }
+            });
+        }
+        {
+            let dialog = dialog.downgrade();
+            close.connect_clicked(move |_| {
+                if let Some(dialog) = dialog.upgrade() {
+                    dialog.close();
+                }
+            });
+        }
+
+        dialog.present(Some(&self.window));
+    }
+
+    fn build_llm_model_row(
+        self: &Rc<Self>,
+        state: &Rc<LlmModelsState>,
+        model: ModelSummary,
+    ) -> adw::ActionRow {
+        let row = adw::ActionRow::new();
+        row.set_title(&model.name);
+        row.set_subtitle(&llm_model_subtitle(&model));
+
+        let spinner = gtk::Spinner::new();
+        spinner.set_valign(gtk::Align::Center);
+        spinner.set_visible(false);
+        row.add_suffix(&spinner);
+
+        let delete = gtk::Button::from_icon_name("user-trash-symbolic");
+        delete.add_css_class("flat");
+        delete.set_valign(gtk::Align::Center);
+        delete.set_tooltip_text(Some("Delete model"));
+        row.add_suffix(&delete);
+
+        let name = model.name.clone();
+        let size = if model.remote_host.is_some() {
+            "no local weight files".to_string()
+        } else {
+            format_bytes(model.size)
+        };
+        let delete_for_alert = delete.clone();
+        let spinner_for_alert = spinner.clone();
+        let state_for_alert = Rc::downgrade(state);
+        let win = self.clone();
+        delete.connect_clicked(move |_| {
+            let name = name.clone();
+            let alert_name = name.clone();
+            let size = size.clone();
+            let delete = delete_for_alert.clone();
+            let spinner = spinner_for_alert.clone();
+            let state = state_for_alert.clone();
+            let win = win.clone();
+            let win_for_delete = win.clone();
+            win.confirm_delete_model(&alert_name, &size, move || {
+                let Some(state) = state.upgrade() else {
+                    return;
+                };
+                delete.set_sensitive(false);
+                delete.set_visible(false);
+                spinner.set_visible(true);
+                spinner.start();
+
+                if win_for_delete
+                    .active
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|active| active.model == name)
+                {
+                    win_for_delete.stop_streaming();
+                }
+
+                let client = win_for_delete.state.client.borrow().clone();
+                let (tx, rx) = async_channel::bounded(1);
+                let task_name = name.clone();
+                win_for_delete.state.runtime.spawn(async move {
+                    let _ = tx.send(client.delete_model(&task_name).await).await;
+                });
+
+                let win = win_for_delete.clone();
+                let state = Rc::clone(&state);
+                let name = name.clone();
+                let delete = delete.clone();
+                let spinner = spinner.clone();
+                glib::spawn_future_local(async move {
+                    match rx.recv().await {
+                        Ok(Ok(())) => {
+                            win.toast(&format!("{name} deleted"));
+                            state.refresh(&win);
+                            win.refresh_models();
+                        }
+                        Ok(Err(err)) => {
+                            spinner.stop();
+                            spinner.set_visible(false);
+                            delete.set_visible(true);
+                            delete.set_sensitive(true);
+                            win.toast(&format!("Could not delete {name}: {err:#}"));
+                        }
+                        Err(_) => {
+                            spinner.stop();
+                            spinner.set_visible(false);
+                            delete.set_visible(true);
+                            delete.set_sensitive(true);
+                        }
+                    }
+                });
+            });
+        });
+
+        row
+    }
+
+    fn confirm_delete_model(&self, name: &str, size: &str, on_delete: impl Fn() + 'static) {
+        let body = if size.is_empty() {
+            format!("Delete {name}? You can pull it again later.")
+        } else if size.starts_with("no local") {
+            format!("Delete {name}? This only removes the local cloud entry. You can add it again later.")
+        } else {
+            format!("Delete {name}? This removes {size}. You can pull it again later.")
+        };
+        let alert = adw::AlertDialog::new(Some("Delete model?"), Some(&body));
+        alert.add_response("cancel", "Cancel");
+        alert.add_response("delete", "Delete");
+        alert.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+        alert.set_default_response(Some("cancel"));
+        alert.set_close_response("cancel");
+        let on_delete = Rc::new(on_delete);
+        alert.connect_response(None, move |_, response| {
+            if response == "delete" {
+                on_delete();
+            }
+        });
+        alert.present(Some(&self.window));
+    }
+
+    fn build_models_page(
+        self: &Rc<Self>,
+        badges: &ParakeetBadges,
+    ) -> (adw::PreferencesPage, Rc<LlmModelsState>) {
+        let page = adw::PreferencesPage::new();
+
+        let language = adw::PreferencesGroup::new();
+        language.set_title("Language models");
+        language.set_description(Some(
+            "Models available to chat. Pull from Ollama or Hugging Face, or delete models you no longer need.",
+        ));
+
+        let header_actions = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        header_actions.set_valign(gtk::Align::Center);
+        let refresh = gtk::Button::from_icon_name("view-refresh-symbolic");
+        refresh.add_css_class("flat");
+        refresh.set_valign(gtk::Align::Center);
+        refresh.set_size_request(32, 32);
+        refresh.set_tooltip_text(Some("Refresh model list"));
+        let add = gtk::Button::from_icon_name("list-add-symbolic");
+        add.add_css_class("flat");
+        add.set_valign(gtk::Align::Center);
+        add.set_size_request(32, 32);
+        add.set_tooltip_text(Some("Add model"));
+        header_actions.append(&refresh);
+        header_actions.append(&add);
+        language.set_header_suffix(Some(&header_actions));
+        page.add(&language);
+
+        let language_state = Rc::new(LlmModelsState::new(language));
+        {
+            let win = self.clone();
+            let state = Rc::downgrade(&language_state);
+            refresh.connect_clicked(move |_| {
+                if let Some(state) = state.upgrade() {
+                    state.refresh(&win);
+                }
+            });
+        }
+        {
+            let win = self.clone();
+            let state = Rc::downgrade(&language_state);
+            add.connect_clicked(move |_| {
+                if let Some(state) = state.upgrade() {
+                    win.show_add_model_dialog(state);
+                }
+            });
+        }
 
         let stt = adw::PreferencesGroup::new();
         stt.set_title("Speech to Text models");
@@ -5582,7 +6474,7 @@ impl ChatWindow {
         tts.add(&self.build_model_row(ManagedModel::Paradee, None));
         page.add(&tts);
 
-        page
+        (page, language_state)
     }
 
     fn live_available(&self) -> bool {
@@ -6868,7 +7760,7 @@ impl ChatWindow {
                 }
             });
         }
-        let models_page = self.build_models_page(&parakeet_badges);
+        let (models_page, language_models) = self.build_models_page(&parakeet_badges);
 
         let stack = adw::ViewStack::new();
         stack.add_titled(&general_page, Some("general"), "General");
@@ -6877,9 +7769,12 @@ impl ChatWindow {
         {
             let win = self.clone();
             let provider_state = Rc::clone(&stt_provider_state);
+            let language_models = Rc::clone(&language_models);
             stack.connect_visible_child_name_notify(move |stack| {
-                if stack.visible_child_name().as_deref() == Some("general") {
-                    provider_state.refresh(&win);
+                match stack.visible_child_name().as_deref() {
+                    Some("general") => provider_state.refresh(&win),
+                    Some("models") => language_models.refresh(&win),
+                    _ => {}
                 }
             });
         }
@@ -7146,6 +8041,41 @@ fn group_digits(value: u32) -> String {
         out.push(ch);
     }
     out
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1000.0 && unit + 1 < UNITS.len() {
+        value /= 1000.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else if value >= 10.0 {
+        format!("{value:.0} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn llm_model_subtitle(model: &ModelSummary) -> String {
+    let mut parts = Vec::new();
+    if model.remote_host.is_some() {
+        parts.push("Cloud".to_string());
+    } else if model.size > 0 {
+        parts.push(format_bytes(model.size));
+    } else {
+        parts.push("Unknown size".to_string());
+    }
+    if !model.details.parameter_size.is_empty() {
+        parts.push(model.details.parameter_size.clone());
+    }
+    if !model.details.quantization_level.is_empty() {
+        parts.push(model.details.quantization_level.clone());
+    }
+    parts.join(" · ")
 }
 
 fn title_case(value: &str) -> String {
@@ -8064,11 +8994,11 @@ mod tests {
     use super::build_stt_provider_choices;
     use super::{
         build_compression_plan, build_request_messages, chunk_messages, clamp_summary,
-        context_needs_compression, decode_wav, estimate_tokens, file_is_image, format_percent,
-        formats_have_image, group_digits, is_sleep_command, kept_turn_start, plain_text_for_speech,
-        sentences_for_speech, should_start_new_voice_chat, split_sentences,
-        take_complete_sentences, tts_language, voice_options_for_backend, SpeechTextBuffer,
-        SttProviderChoice,
+        context_needs_compression, decode_wav, estimate_tokens, file_is_image, format_bytes,
+        format_percent, formats_have_image, group_digits, is_sleep_command, kept_turn_start,
+        llm_model_subtitle, plain_text_for_speech, sentences_for_speech,
+        should_start_new_voice_chat, split_sentences, take_complete_sentences, tts_language,
+        voice_options_for_backend, ModelSummary, SpeechTextBuffer, SttProviderChoice,
     };
     use crate::store::{StoredImage, StoredMessage, StoredSummary};
     use gtk::{gdk, gio};
@@ -8080,6 +9010,40 @@ mod tests {
         assert_eq!(group_digits(999), "999");
         assert_eq!(group_digits(8_192), "8,192");
         assert_eq!(group_digits(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn formats_model_sizes() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(999), "999 B");
+        assert_eq!(format_bytes(1_500), "1.5 KB");
+        assert_eq!(format_bytes(45_960_996), "46 MB");
+        assert_eq!(format_bytes(6_550_811_033), "6.6 GB");
+    }
+
+    #[test]
+    fn builds_model_subtitles() {
+        let model = ModelSummary {
+            name: "mimo-v2.6:latest".into(),
+            size: 6_550_811_033,
+            details: crate::api::ModelDetails {
+                parameter_size: "9.0B".into(),
+                quantization_level: "Q4_K_M".into(),
+                family: String::new(),
+            },
+            capabilities: Vec::new(),
+            remote_host: None,
+        };
+        assert_eq!(llm_model_subtitle(&model), "6.6 GB · 9.0B · Q4_K_M");
+
+        let cloud = ModelSummary {
+            name: "gpt-oss:120b-cloud".into(),
+            size: 307,
+            details: model.details,
+            capabilities: Vec::new(),
+            remote_host: Some("https://ollama.com".into()),
+        };
+        assert_eq!(llm_model_subtitle(&cloud), "Cloud · 9.0B · Q4_K_M");
     }
 
     #[test]

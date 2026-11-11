@@ -162,6 +162,27 @@ impl StreamStats {
     }
 }
 
+/// One line of Ollama's streaming pull response.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PullProgress {
+    pub status: String,
+    pub digest: Option<String>,
+    pub total: Option<u64>,
+    pub completed: Option<u64>,
+}
+
+impl PullProgress {
+    /// Fraction of the current download layer, when Ollama reports a total.
+    pub fn fraction(&self) -> Option<f64> {
+        let total = self.total?;
+        if total == 0 {
+            return None;
+        }
+        let completed = self.completed.unwrap_or(0);
+        Some((completed as f64 / total as f64).clamp(0.0, 1.0))
+    }
+}
+
 #[derive(Debug)]
 pub enum StreamEvent {
     Delta(String),
@@ -448,6 +469,102 @@ impl OllamaClient {
         let _ = response.bytes().await?;
         Ok(())
     }
+
+    /// Pull a model and report progress as Ollama streams it.
+    pub async fn pull_model<F>(&self, model: &str, mut on_progress: F) -> Result<()>
+    where
+        F: FnMut(PullProgress) + Send,
+    {
+        let response = self
+            .request(reqwest::Method::POST, "/api/pull")
+            .json(&serde_json::json!({ "model": model, "stream": true }))
+            .send()
+            .await
+            .context("could not reach Ollama")?;
+        let response = ensure_success(response, "pull").await?;
+
+        let mut stream = response.bytes_stream();
+        let mut buffer = NdjsonBuffer::new();
+        let mut success = false;
+
+        while let Some(chunk) = stream.next().await {
+            let bytes = chunk.context("error while reading the pull stream")?;
+            for line in buffer.push(&bytes) {
+                let progress = parse_pull_progress(&line)?;
+                success |= progress.status == "success";
+                on_progress(progress);
+            }
+        }
+        if let Some(line) = buffer.finish() {
+            let progress = parse_pull_progress(&line)?;
+            success |= progress.status == "success";
+            on_progress(progress);
+        }
+
+        if !success {
+            bail!("model pull ended before Ollama reported success");
+        }
+        Ok(())
+    }
+
+    /// Copy a model to another name. Used to shorten Hugging Face model names.
+    pub async fn copy_model(&self, source: &str, destination: &str) -> Result<()> {
+        let response = self
+            .request(reqwest::Method::POST, "/api/copy")
+            .json(&serde_json::json!({
+                "source": source,
+                "destination": destination,
+            }))
+            .send()
+            .await
+            .context("could not reach Ollama")?;
+        ensure_success(response, "copy").await.map(|_| ())
+    }
+
+    /// Remove a model from Ollama.
+    pub async fn delete_model(&self, model: &str) -> Result<()> {
+        let response = self
+            .request(reqwest::Method::DELETE, "/api/delete")
+            .json(&serde_json::json!({ "model": model }))
+            .send()
+            .await
+            .context("could not reach Ollama")?;
+        ensure_success(response, "delete").await.map(|_| ())
+    }
+}
+
+async fn ensure_success(response: reqwest::Response, operation: &str) -> Result<reqwest::Response> {
+    if response.status().is_success() {
+        return Ok(response);
+    }
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    let detail = body.trim();
+    if detail.is_empty() {
+        bail!("Ollama {operation} returned HTTP {status}");
+    }
+    bail!("Ollama {operation} returned HTTP {status}: {detail}")
+}
+
+fn parse_pull_progress(line: &[u8]) -> Result<PullProgress> {
+    let value: serde_json::Value =
+        serde_json::from_slice(line).context("could not parse the pull stream")?;
+    if let Some(error) = value.get("error").and_then(|value| value.as_str()) {
+        bail!("{error}");
+    }
+    Ok(PullProgress {
+        status: value
+            .get("status")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        digest: value
+            .get("digest")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        total: value.get("total").and_then(|value| value.as_u64()),
+        completed: value.get("completed").and_then(|value| value.as_u64()),
+    })
 }
 
 /// Drives a streaming chat request on the tokio runtime and forwards parsed
@@ -615,6 +732,39 @@ mod tests {
             prompt_eval_count: None,
         };
         assert_eq!(stats.tokens_per_second(), Some(50.0));
+    }
+
+    #[test]
+    fn pull_progress_computes_fraction() {
+        let progress = PullProgress {
+            completed: Some(25),
+            total: Some(100),
+            ..Default::default()
+        };
+        assert_eq!(progress.fraction(), Some(0.25));
+        assert_eq!(
+            PullProgress {
+                completed: Some(5),
+                total: Some(0),
+                ..Default::default()
+            }
+            .fraction(),
+            None
+        );
+    }
+
+    #[test]
+    fn parses_pull_progress_lines() {
+        let progress = parse_pull_progress(
+            br#"{"status":"pulling 797b70c4edf8","digest":"sha256:797b","total":10,"completed":4}"#,
+        )
+        .unwrap();
+        assert_eq!(progress.status, "pulling 797b70c4edf8");
+        assert_eq!(progress.digest.as_deref(), Some("sha256:797b"));
+        assert_eq!(progress.fraction(), Some(0.4));
+
+        let error = parse_pull_progress(br#"{"error":"model not found"}"#).unwrap_err();
+        assert!(error.to_string().contains("model not found"));
     }
 
     #[test]

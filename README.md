@@ -401,7 +401,36 @@ returns the process to about 50 MB.
 
 ## Models
 
-Preferences → Models lists all local speech model files regardless of the
+Preferences → Models manages both language models and the local speech models.
+
+**Language models** lists everything installed in Ollama, equivalent to
+`ollama list`. Each row shows the model name, size, parameter count, and
+quantization. Cloud models are marked as such. The trash button asks for
+confirmation, then removes the model and refreshes the chat model selector.
+
+The **add** button opens a download dialog with two sources:
+
+- **Ollama** — paste a name from `ollama.com/library`, for example
+  `llama3.2:3b`, and press the download icon.
+- **Hugging Face** — paste `owner/repository`, for example
+  `AtomicChat/LFM3-1.7B-Uncensored-GGUF`. Quantizations load when you press
+  Enter or leave the field. Choose one and download; the dialog previews the
+  short name that will be saved.
+
+Hugging Face downloads are pulled as
+`hf.co/owner/repository:QUANT`, then copied to a short local name such as
+`LFM3-1.7B-Uncensored-GGUF` (shown by Ollama as
+`LFM3-1.7B-Uncensored-GGUF:latest`), and the long intermediate name is removed.
+The quantization is still used for the download, but it is not part of the
+final name. Ollama stores blobs by content, so this rename does not duplicate
+the model on disk. If a model with the short name already exists, delete it
+first. Gated or private Hugging Face repositories are not supported without a
+token.
+
+The dialog reports pull progress as a horizontal bar and percentage, and the
+download can be cancelled while it is running.
+
+The local speech groups are listed below language models regardless of the
 active provider:
 
 - **Speech to Text** — Parakeet Redux, Parakeet Ultra, Whistle
