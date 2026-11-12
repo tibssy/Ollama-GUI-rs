@@ -21,6 +21,13 @@ pub struct StoredMessage {
     pub id: i64,
     pub role: String,
     pub content: String,
+    /// JSON array of tool calls made by an assistant message.
+    pub tool_calls: Option<String>,
+    /// Name of the tool that produced a `role: "tool"` message.
+    pub tool_name: Option<String>,
+    /// Ollama call id used to match a tool result with its request.
+    #[allow(dead_code)]
+    pub tool_call_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -135,6 +142,9 @@ impl Store {
         self.ensure_column("conversations", "summary_upto_id", "INTEGER")?;
         self.ensure_column("conversations", "summary_tokens", "INTEGER")?;
         self.ensure_column("conversations", "memory_upto_id", "INTEGER")?;
+        self.ensure_column("messages", "tool_calls", "TEXT")?;
+        self.ensure_column("messages", "tool_name", "TEXT")?;
+        self.ensure_column("messages", "tool_call_id", "TEXT")?;
         self.backfill_context_usage()?;
         Ok(())
     }
@@ -539,6 +549,21 @@ impl Store {
         content: &str,
         stats: Option<&StreamStats>,
     ) -> Result<i64> {
+        self.add_message_full(conversation_id, role, content, stats, None, None, None)
+    }
+
+    /// Insert a message with optional tool metadata.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_message_full(
+        &self,
+        conversation_id: i64,
+        role: &str,
+        content: &str,
+        stats: Option<&StreamStats>,
+        tool_calls: Option<&str>,
+        tool_name: Option<&str>,
+        tool_call_id: Option<&str>,
+    ) -> Result<i64> {
         let stats_json = stats.and_then(|stats| {
             if stats.eval_count.is_none()
                 && stats.eval_duration.is_none()
@@ -555,9 +580,19 @@ impl Store {
         });
 
         self.conn.execute(
-            "INSERT INTO messages(conversation_id, role, content, stats_json)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![conversation_id, role, content, stats_json],
+            "INSERT INTO messages(
+                conversation_id, role, content, stats_json,
+                tool_calls, tool_name, tool_call_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                conversation_id,
+                role,
+                content,
+                stats_json,
+                tool_calls,
+                tool_name,
+                tool_call_id
+            ],
         )?;
 
         let context_used = if role == "assistant" {
@@ -577,6 +612,45 @@ impl Store {
             params![conversation_id, context_used],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Insert an assistant message that requested one or more tools.
+    pub fn add_tool_call_message(
+        &self,
+        conversation_id: i64,
+        content: &str,
+        tool_calls: &[crate::api::ToolCall],
+        stats: Option<&StreamStats>,
+    ) -> Result<i64> {
+        let tool_calls = serde_json::to_string(tool_calls)?;
+        self.add_message_full(
+            conversation_id,
+            "assistant",
+            content,
+            stats,
+            Some(&tool_calls),
+            None,
+            None,
+        )
+    }
+
+    /// Insert the result of one tool call.
+    pub fn add_tool_result_message(
+        &self,
+        conversation_id: i64,
+        tool_name: &str,
+        tool_call_id: Option<&str>,
+        content: &str,
+    ) -> Result<i64> {
+        self.add_message_full(
+            conversation_id,
+            "tool",
+            content,
+            None,
+            None,
+            Some(tool_name),
+            tool_call_id,
+        )
     }
 
     /// Insert a message and its images atomically.
@@ -617,7 +691,8 @@ impl Store {
         after_id: i64,
     ) -> Result<Vec<StoredMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, role, content FROM messages
+            "SELECT id, role, content, tool_calls, tool_name, tool_call_id
+             FROM messages
              WHERE conversation_id = ?1 AND id > ?2 ORDER BY id ASC",
         )?;
         let rows = stmt.query_map(params![conversation_id, after_id], |row| {
@@ -625,6 +700,9 @@ impl Store {
                 id: row.get(0)?,
                 role: row.get(1)?,
                 content: row.get(2)?,
+                tool_calls: row.get(3)?,
+                tool_name: row.get(4)?,
+                tool_call_id: row.get(5)?,
             })
         })?;
         let mut messages = Vec::new();
@@ -677,27 +755,21 @@ impl Store {
             return Ok(Vec::new());
         };
 
-        let mut ids = vec![message_id];
-        match messages[index].role.as_str() {
-            "user" => {
-                if let Some(next) = messages.get(index + 1) {
-                    if next.role == "assistant" {
-                        ids.push(next.id);
-                    }
-                }
-            }
-            "assistant" => {
-                if let Some(previous) = index
-                    .checked_sub(1)
-                    .and_then(|previous_index| messages.get(previous_index))
-                {
-                    if previous.role == "user" {
-                        ids.push(previous.id);
-                    }
-                }
-            }
-            _ => {}
-        }
+        // A turn starts at the user message and includes every assistant and
+        // tool message up to the next user message.
+        let start = messages[..=index]
+            .iter()
+            .rposition(|message| message.role == "user")
+            .unwrap_or(0);
+        let end = messages[index + 1..]
+            .iter()
+            .position(|message| message.role == "user")
+            .map(|offset| index + 1 + offset)
+            .unwrap_or(messages.len());
+        let ids: Vec<i64> = messages[start..end]
+            .iter()
+            .map(|message| message.id)
+            .collect();
 
         for id in &ids {
             self.conn.execute(
@@ -859,6 +931,43 @@ mod tests {
             eval_duration: None,
             prompt_eval_count: Some(prompt_eval_count),
         }
+    }
+
+    #[test]
+    fn stores_tool_calls_and_results() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_conversation("model", "title").unwrap();
+        let user = store
+            .add_message(id, "user", "what is 2 + 2?", None)
+            .unwrap();
+        let calls = vec![crate::api::ToolCall {
+            id: Some("call_1".into()),
+            function: crate::api::ToolFunctionCall {
+                name: "calculator".into(),
+                arguments: serde_json::json!({"expression": "2 + 2"}),
+            },
+        }];
+        let assistant = store.add_tool_call_message(id, "", &calls, None).unwrap();
+        let result = store
+            .add_tool_result_message(id, "calculator", Some("call_1"), "2 + 2 = 4")
+            .unwrap();
+
+        let messages = store.messages(id).unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1].id, assistant);
+        assert!(messages[1]
+            .tool_calls
+            .as_deref()
+            .is_some_and(|json| json.contains("calculator")));
+        assert_eq!(messages[2].id, result);
+        assert_eq!(messages[2].role, "tool");
+        assert_eq!(messages[2].tool_name.as_deref(), Some("calculator"));
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_1"));
+
+        let removed = store.delete_turn(id, assistant).unwrap();
+        assert_eq!(removed.len(), 3);
+        assert!(removed.contains(&user));
+        assert!(store.messages(id).unwrap().is_empty());
     }
 
     #[test]

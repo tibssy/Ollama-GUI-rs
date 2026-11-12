@@ -52,7 +52,6 @@ The MVP is working:
 
 ### Roadmap
 
-- Tool calls in chat (the Tools tab installs and tests tools)
 - `think` blocks
 - Chat search (SQLite FTS5), rename, export/import
 - Flatpak packaging
@@ -459,6 +458,13 @@ Each installed tool has two permission choices:
 The info button shows the manifest, requirements, sandbox access, and script,
 and includes a test runner with a JSON argument box. The trash button removes
 the tool and its permission settings after confirmation.
+
+When a tool-capable model is selected, enabled tools are offered to it. The
+model can call them during a turn; each call appears as a card with its
+arguments, status, and result. With **Ask** permission, the call pauses and
+shows a dialog with **Deny**, **Allow once**, and **Allow for this chat**.
+Tool calls and results are stored with the conversation, so reloading a chat
+keeps the full exchange.
 
 Tools run inside [bubblewrap](https://github.com/containers/bubblewrap) with a
 deny-by-default profile: no network, no home directory, and no desktop sockets
