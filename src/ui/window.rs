@@ -49,6 +49,11 @@ const CHAT_KEEP_ALIVE: &str = "5m";
 const TOOL_MAX_ROUNDS: usize = 8;
 /// Maximum number of calls executed from one model response.
 const TOOL_MAX_CALLS_PER_ROUND: usize = 8;
+/// Longest string value kept in stored tool-call arguments.
+const TOOL_ARG_PREVIEW_CHARS: usize = 600;
+/// Ask the model to summarize tool output instead of repeating it.
+const TOOL_SUMMARY_NUDGE: &str = "Tool results are already available. Answer concisely \
+and summarize only the relevant details. Do not repeat the full tool output verbatim.";
 /// Feed memory extraction this fraction of `num_ctx` at a time.
 const MEMORY_TRANSCRIPT_RATIO: f64 = 0.45;
 const MEMORY_TEMPERATURE: f64 = 0.1;
@@ -1886,6 +1891,28 @@ fn canonical_tool_key(name: &str, args: &serde_json::Value) -> String {
         }
     }
     key
+}
+
+fn compact_tool_calls(calls: &[ToolCall]) -> Vec<ToolCall> {
+    calls
+        .iter()
+        .map(|call| {
+            let mut call = call.clone();
+            if let Some(object) = call.function.arguments.as_object_mut() {
+                for value in object.values_mut() {
+                    if let Some(text) = value.as_str() {
+                        if text.chars().count() > TOOL_ARG_PREVIEW_CHARS {
+                            *value = serde_json::Value::String(truncate_tool_text(
+                                text,
+                                TOOL_ARG_PREVIEW_CHARS,
+                            ));
+                        }
+                    }
+                }
+            }
+            call
+        })
+        .collect()
 }
 
 fn truncate_tool_text(text: &str, max_chars: usize) -> String {
@@ -5438,6 +5465,9 @@ impl ChatWindow {
             &images,
             num_ctx,
         );
+        if tool_round > 0 {
+            messages.push(ChatMessage::new("system", TOOL_SUMMARY_NUDGE));
+        }
         if tool_round >= TOOL_MAX_ROUNDS {
             messages.push(ChatMessage::new(
                 "system",
@@ -5580,10 +5610,11 @@ impl ChatWindow {
                         stats.as_ref(),
                     )
                 } else {
+                    let stored_calls = compact_tool_calls(&tool_calls);
                     self.state.store.borrow().add_tool_call_message(
                         active.conv_id,
                         &content,
-                        &tool_calls,
+                        &stored_calls,
                         stats.as_ref(),
                     )
                 };
@@ -5709,6 +5740,15 @@ impl ChatWindow {
         {
             self.speak(&content, None);
         }
+    }
+
+    fn tool_result_budget(&self) -> usize {
+        let num_ctx = self.state.settings.borrow().num_ctx.max(1) as usize;
+        ((num_ctx / 6) * 4).clamp(1200, 6000)
+    }
+
+    fn cap_tool_result(&self, text: &str) -> String {
+        truncate_tool_text(text, self.tool_result_budget())
     }
 
     fn save_tool_result(
@@ -5872,6 +5912,7 @@ impl ChatWindow {
                     Ok(Err(err)) => (false, format!("Error: {err:#}")),
                     Err(_) => (false, "Error: the tool was cancelled.".to_string()),
                 };
+                let text = win.cap_tool_result(&text);
                 card.set_done(success, &text);
                 win.save_tool_result(conv_id, &name, call.id.as_deref(), &text);
             }
@@ -10879,16 +10920,36 @@ mod tests {
     use super::build_stt_provider_choices;
     use super::{
         build_compression_plan, build_request_messages, chunk_messages, clamp_summary,
-        context_needs_compression, decode_wav, estimate_tokens, file_is_image, format_bytes,
-        format_modified_at, format_percent, formats_have_image, group_digits, is_sleep_command,
-        kept_turn_start, llm_model_subtitle, model_info_number, plain_text_for_speech,
-        sentences_for_speech, should_start_new_voice_chat, split_sentences,
+        compact_tool_calls, context_needs_compression, decode_wav, estimate_tokens, file_is_image,
+        format_bytes, format_modified_at, format_percent, formats_have_image, group_digits,
+        is_sleep_command, kept_turn_start, llm_model_subtitle, model_info_number,
+        plain_text_for_speech, sentences_for_speech, should_start_new_voice_chat, split_sentences,
         take_complete_sentences, tts_language, voice_options_for_backend, ModelSummary,
         SpeechTextBuffer, SttProviderChoice,
     };
     use crate::store::{StoredImage, StoredMessage, StoredSummary};
     use gtk::{gdk, gio};
     use std::collections::HashMap;
+
+    #[test]
+    fn compacts_long_tool_arguments() {
+        let long = "x".repeat(2_000);
+        let compacted = compact_tool_calls(&[crate::api::ToolCall {
+            id: Some("call_1".into()),
+            function: crate::api::ToolFunctionCall {
+                name: "kdeconnect".into(),
+                arguments: serde_json::json!({
+                    "text": long,
+                    "action": "share_text"
+                }),
+            },
+        }]);
+        let arguments = &compacted[0].function.arguments;
+        let text = arguments["text"].as_str().expect("text");
+        assert!(text.chars().count() <= super::TOOL_ARG_PREVIEW_CHARS + 12);
+        assert!(text.ends_with("[truncated]"));
+        assert_eq!(arguments["action"], "share_text");
+    }
 
     #[test]
     fn groups_thousands() {
