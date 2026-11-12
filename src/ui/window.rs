@@ -1254,6 +1254,92 @@ impl LlmModelsState {
     }
 }
 
+struct ToolsState {
+    group: adw::PreferencesGroup,
+    rows: RefCell<Vec<gtk::Widget>>,
+    generation: Cell<u64>,
+}
+
+impl ToolsState {
+    fn new(group: adw::PreferencesGroup) -> Self {
+        Self {
+            group,
+            rows: RefCell::new(Vec::new()),
+            generation: Cell::new(0),
+        }
+    }
+
+    fn clear_rows(&self) {
+        for row in self.rows.borrow_mut().drain(..) {
+            self.group.remove(&row);
+        }
+    }
+
+    fn add_row(&self, row: gtk::Widget) {
+        self.group.add(&row);
+        self.rows.borrow_mut().push(row);
+    }
+
+    fn show_loading(&self) {
+        let row = adw::ActionRow::new();
+        row.set_title("Loading tools…");
+        let spinner = gtk::Spinner::new();
+        spinner.set_valign(gtk::Align::Center);
+        spinner.start();
+        row.add_suffix(&spinner);
+        self.add_row(row.upcast());
+    }
+
+    fn refresh(self: &Rc<Self>, win: &Rc<ChatWindow>) {
+        let generation = self.generation.get().saturating_add(1);
+        self.generation.set(generation);
+        self.clear_rows();
+        self.show_loading();
+
+        let (tx, rx) = async_channel::bounded(1);
+        win.state.runtime.spawn_blocking(move || {
+            let installed = crate::tools::list_installed();
+            let statuses = installed
+                .iter()
+                .map(|tool| crate::tools::requirement_status(&tool.manifest))
+                .collect::<Vec<_>>();
+            let _ = tx.send_blocking((installed, statuses));
+        });
+
+        let state = Rc::clone(self);
+        let win = win.clone();
+        glib::spawn_future_local(async move {
+            let Ok((installed, statuses)) = rx.recv().await else {
+                return;
+            };
+            if state.generation.get() != generation {
+                return;
+            }
+            state.populate(&win, installed, statuses);
+        });
+    }
+
+    fn populate(
+        self: &Rc<Self>,
+        win: &Rc<ChatWindow>,
+        installed: Vec<crate::tools::InstalledTool>,
+        statuses: Vec<crate::tools::RequirementStatus>,
+    ) {
+        self.clear_rows();
+        if installed.is_empty() {
+            let row = adw::ActionRow::new();
+            row.set_title("No tools installed");
+            row.set_subtitle("Use the browse button to install tools from the registry.");
+            self.add_row(row.upcast());
+            return;
+        }
+        for (tool, status) in installed.into_iter().zip(statuses) {
+            let row = win.build_tool_row(self, tool, status);
+            self.add_row(row.upcast());
+        }
+    }
+}
+
 enum PullMessage {
     Progress(api::PullProgress),
     Done(anyhow::Result<()>),
@@ -6636,6 +6722,907 @@ impl ChatWindow {
         (page, language_state)
     }
 
+    fn build_tools_page(self: &Rc<Self>) -> (adw::PreferencesPage, Rc<ToolsState>) {
+        let page = adw::PreferencesPage::new();
+
+        let group = adw::PreferencesGroup::new();
+        group.set_title("Installed tools");
+        group.set_description(Some(
+            "Tools add actions the model can call. Install them from the registry, then choose whether local and cloud models may run them.",
+        ));
+
+        let header_actions = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        header_actions.set_valign(gtk::Align::Center);
+        let refresh = gtk::Button::from_icon_name("view-refresh-symbolic");
+        refresh.add_css_class("flat");
+        refresh.set_valign(gtk::Align::Center);
+        refresh.set_size_request(32, 32);
+        refresh.set_tooltip_text(Some("Refresh installed tools"));
+        let browse = gtk::Button::from_icon_name("list-add-symbolic");
+        browse.add_css_class("flat");
+        browse.set_valign(gtk::Align::Center);
+        browse.set_size_request(32, 32);
+        browse.set_tooltip_text(Some("Browse tools"));
+        header_actions.append(&refresh);
+        header_actions.append(&browse);
+        group.set_header_suffix(Some(&header_actions));
+        page.add(&group);
+
+        let state = Rc::new(ToolsState::new(group));
+        {
+            let win = self.clone();
+            let state = Rc::downgrade(&state);
+            refresh.connect_clicked(move |_| {
+                if let Some(state) = state.upgrade() {
+                    state.refresh(&win);
+                }
+            });
+        }
+        {
+            let win = self.clone();
+            let state = Rc::clone(&state);
+            browse.connect_clicked(move |_| {
+                win.show_browse_tools_dialog(Rc::clone(&state));
+            });
+        }
+
+        (page, state)
+    }
+
+    fn tool_permission(
+        &self,
+        manifest: &crate::tools::ToolManifest,
+        cloud: bool,
+    ) -> crate::config::ToolPermission {
+        let settings = self.state.settings.borrow();
+        crate::tools::permission_for(&settings, manifest, cloud)
+    }
+
+    fn tool_row_subtitle(
+        &self,
+        manifest: &crate::tools::ToolManifest,
+        status: &crate::tools::RequirementStatus,
+    ) -> String {
+        let settings = self.state.settings.borrow();
+        let permissions = settings
+            .tool_permissions
+            .get(&manifest.name)
+            .cloned()
+            .unwrap_or_else(|| {
+                crate::config::ToolPermissions::from_manifest(
+                    &manifest.default_permission,
+                    &manifest.default_cloud_permission,
+                )
+            });
+        drop(settings);
+
+        let runtime = match manifest.runtime.as_str() {
+            "python3" => "Python",
+            "binary" => "Binary",
+            other => other,
+        };
+        let mut text = format!(
+            "v{} · {} · Local: {} · Cloud: {}",
+            manifest.version,
+            runtime,
+            permissions.local.label(),
+            permissions.cloud.label()
+        );
+        if let Some(summary) = status.summary() {
+            text.push_str(" · ⚠ ");
+            text.push_str(&summary);
+        }
+        text
+    }
+
+    fn build_tool_row(
+        self: &Rc<Self>,
+        state: &Rc<ToolsState>,
+        tool: crate::tools::InstalledTool,
+        status: crate::tools::RequirementStatus,
+    ) -> adw::ExpanderRow {
+        let row = adw::ExpanderRow::new();
+        row.set_title(&tool.manifest.name);
+        row.set_subtitle(&self.tool_row_subtitle(&tool.manifest, &status));
+        row.set_subtitle_lines(2);
+
+        let local = adw::ComboRow::new();
+        local.set_title("Local models");
+        local.set_subtitle("Allow runs automatically, Ask confirms, Deny hides the tool.");
+        let permission_labels: Vec<&str> = crate::config::ToolPermission::ALL
+            .iter()
+            .map(|permission| permission.label())
+            .collect();
+        local.set_model(Some(&gtk::StringList::new(&permission_labels)));
+        local.set_selected(self.tool_permission(&tool.manifest, false).index());
+        {
+            let win = self.clone();
+            let row = row.clone();
+            let id = tool.manifest.name.clone();
+            let manifest = tool.manifest.clone();
+            let status = status.clone();
+            local.connect_selected_notify(move |combo| {
+                let permission = crate::config::ToolPermission::from_index(combo.selected());
+                {
+                    let mut settings = win.state.settings.borrow_mut();
+                    settings
+                        .tool_permissions
+                        .entry(id.clone())
+                        .or_default()
+                        .local = permission;
+                }
+                win.save_settings();
+                row.set_subtitle(&win.tool_row_subtitle(&manifest, &status));
+            });
+        }
+        row.add_row(&local);
+
+        let cloud = adw::ComboRow::new();
+        cloud.set_title("Cloud models");
+        cloud.set_subtitle("Applies to models hosted on ollama.com or a remote server.");
+        cloud.set_model(Some(&gtk::StringList::new(&permission_labels)));
+        cloud.set_selected(self.tool_permission(&tool.manifest, true).index());
+        {
+            let win = self.clone();
+            let row = row.clone();
+            let id = tool.manifest.name.clone();
+            let manifest = tool.manifest.clone();
+            let status = status.clone();
+            cloud.connect_selected_notify(move |combo| {
+                let permission = crate::config::ToolPermission::from_index(combo.selected());
+                {
+                    let mut settings = win.state.settings.borrow_mut();
+                    settings
+                        .tool_permissions
+                        .entry(id.clone())
+                        .or_default()
+                        .cloud = permission;
+                }
+                win.save_settings();
+                row.set_subtitle(&win.tool_row_subtitle(&manifest, &status));
+            });
+        }
+        row.add_row(&cloud);
+
+        let info = gtk::Button::from_icon_name("dialog-information-symbolic");
+        info.add_css_class("flat");
+        info.set_valign(gtk::Align::Center);
+        info.set_tooltip_text(Some("Tool details and test"));
+        {
+            let win = self.clone();
+            let tool = tool.clone();
+            let status = status.clone();
+            let state_for_info = state.clone();
+            info.connect_clicked(move |_| {
+                win.show_tool_info(tool.clone(), status.clone(), state_for_info.clone())
+            });
+        }
+        row.add_suffix(&info);
+
+        let delete = gtk::Button::from_icon_name("user-trash-symbolic");
+        delete.add_css_class("flat");
+        delete.set_valign(gtk::Align::Center);
+        delete.set_tooltip_text(Some("Delete tool"));
+        {
+            let win = self.clone();
+            let state = state.clone();
+            let id = tool.manifest.name.clone();
+            delete.connect_clicked(move |_| {
+                let win = win.clone();
+                let state = state.clone();
+                let id = id.clone();
+                let win_for_delete = win.clone();
+                let id_for_delete = id.clone();
+                win.confirm_delete_tool(&id, move || {
+                    win_for_delete.delete_tool(&id_for_delete, state.clone())
+                });
+            });
+        }
+        row.add_suffix(&delete);
+
+        row
+    }
+
+    fn show_browse_tools_dialog(self: &Rc<Self>, state: Rc<ToolsState>) {
+        let dialog = adw::Dialog::builder()
+            .title("Browse tools")
+            .content_width(760)
+            .content_height(680)
+            .build();
+
+        let header = adw::HeaderBar::new();
+        header.set_show_end_title_buttons(false);
+        let close = gtk::Button::from_icon_name("window-close-symbolic");
+        close.add_css_class("flat");
+        {
+            let dialog = dialog.downgrade();
+            close.connect_clicked(move |_| {
+                if let Some(dialog) = dialog.upgrade() {
+                    dialog.close();
+                }
+            });
+        }
+        header.pack_end(&close);
+
+        let search = gtk::SearchEntry::new();
+        search.set_placeholder_text(Some("Search tools"));
+        search.set_margin_top(12);
+        search.set_margin_start(18);
+        search.set_margin_end(18);
+
+        let group = adw::PreferencesGroup::new();
+        group.set_title("Available tools");
+        let page = adw::PreferencesPage::new();
+        page.add(&group);
+
+        let scrolled = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vexpand(true)
+            .child(&page)
+            .build();
+
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        content.append(&search);
+        content.append(&scrolled);
+
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&header);
+        toolbar.set_content(Some(&content));
+        dialog.set_child(Some(&toolbar));
+        dialog.present(Some(&self.window));
+
+        let loading = adw::ActionRow::new();
+        loading.set_title("Loading tools…");
+        let spinner = gtk::Spinner::new();
+        spinner.set_valign(gtk::Align::Center);
+        spinner.start();
+        loading.add_suffix(&spinner);
+        group.add(&loading);
+
+        let (tx, rx) = async_channel::bounded(1);
+        self.state.runtime.spawn(async move {
+            let _ = tx.send(crate::tools::fetch_index().await).await;
+        });
+
+        let win = self.clone();
+        let dialog_for_retry = dialog.clone();
+        glib::spawn_future_local(async move {
+            let Ok(result) = rx.recv().await else {
+                return;
+            };
+            group.remove(&loading);
+            match result {
+                Ok(index) => {
+                    if index.tools.is_empty() {
+                        let row = adw::ActionRow::new();
+                        row.set_title("No tools available");
+                        group.add(&row);
+                        return;
+                    }
+                    let rows: Rc<RefCell<Vec<(crate::tools::ToolIndexEntry, adw::ActionRow)>>> =
+                        Rc::new(RefCell::new(Vec::new()));
+                    for entry in index.tools {
+                        let row = win.build_registry_tool_row(&entry, &state);
+                        group.add(&row);
+                        rows.borrow_mut().push((entry, row));
+                    }
+                    let rows_for_search = Rc::clone(&rows);
+                    search.connect_search_changed(move |search| {
+                        let query = search.text().to_lowercase();
+                        for (entry, row) in rows_for_search.borrow().iter() {
+                            let matches = query.is_empty()
+                                || entry.id.to_lowercase().contains(&query)
+                                || entry.name.to_lowercase().contains(&query)
+                                || entry.description.to_lowercase().contains(&query)
+                                || entry.category.to_lowercase().contains(&query);
+                            row.set_visible(matches);
+                        }
+                    });
+                }
+                Err(err) => {
+                    let row = adw::ActionRow::new();
+                    row.set_title("Could not load the tool registry");
+                    row.set_subtitle(&format!("{err:#}"));
+                    let retry = gtk::Button::from_icon_name("view-refresh-symbolic");
+                    retry.add_css_class("flat");
+                    retry.set_valign(gtk::Align::Center);
+                    retry.set_tooltip_text(Some("Retry"));
+                    {
+                        let win = win.clone();
+                        let state = state.clone();
+                        let dialog = dialog_for_retry.clone();
+                        retry.connect_clicked(move |_| {
+                            dialog.close();
+                            win.show_browse_tools_dialog(state.clone());
+                        });
+                    }
+                    row.add_suffix(&retry);
+                    group.add(&row);
+                }
+            }
+        });
+    }
+
+    fn build_registry_tool_row(
+        self: &Rc<Self>,
+        entry: &crate::tools::ToolIndexEntry,
+        state: &Rc<ToolsState>,
+    ) -> adw::ActionRow {
+        let row = adw::ActionRow::new();
+        let title = if entry.name.is_empty() {
+            entry.id.clone()
+        } else {
+            entry.name.clone()
+        };
+        row.set_title(&title);
+
+        let mut subtitle = entry.description.clone();
+        if !entry.category.is_empty() {
+            subtitle.push_str(&format!(" · {}", entry.category));
+        }
+        subtitle.push_str(&format!(" · v{}", entry.version));
+        if !entry.requires.commands.is_empty() {
+            subtitle.push_str(&format!(" · needs {}", entry.requires.commands.join(", ")));
+        }
+        row.set_subtitle(&subtitle);
+        row.set_subtitle_lines(2);
+        row.set_activatable(false);
+
+        let installed = crate::tools::list_installed()
+            .into_iter()
+            .find(|tool| tool.manifest.name == entry.id);
+        let (label, sensitive) = match &installed {
+            Some(tool) if tool.manifest.version >= entry.version => {
+                ("Installed".to_string(), false)
+            }
+            Some(_) => ("Update".to_string(), true),
+            None => ("Install".to_string(), true),
+        };
+
+        let button = gtk::Button::with_label(&label);
+        button.add_css_class("flat");
+        button.set_valign(gtk::Align::Center);
+        button.set_sensitive(sensitive);
+        if sensitive {
+            let win = self.clone();
+            let entry = entry.clone();
+            let state = state.clone();
+            button.connect_clicked(move |button| {
+                win.begin_tool_install(entry.clone(), state.clone(), button.clone());
+            });
+        }
+        row.add_suffix(&button);
+
+        row
+    }
+
+    fn begin_tool_install(
+        self: &Rc<Self>,
+        entry: crate::tools::ToolIndexEntry,
+        state: Rc<ToolsState>,
+        button: gtk::Button,
+    ) {
+        let previous_label = button
+            .label()
+            .map(|label| label.to_string())
+            .unwrap_or_else(|| "Install".to_string());
+        button.set_label("Loading…");
+        button.set_sensitive(false);
+
+        let id = entry.id.clone();
+        let (tx, rx) = async_channel::bounded(1);
+        self.state.runtime.spawn(async move {
+            let _ = tx.send(crate::tools::fetch_package(&entry).await).await;
+        });
+
+        let win = self.clone();
+        glib::spawn_future_local(async move {
+            match rx.recv().await {
+                Ok(Ok(package)) => {
+                    win.show_install_tool_dialog(package, state, button, previous_label);
+                }
+                Ok(Err(err)) => {
+                    win.toast(&format!("Could not load {id}: {err:#}"));
+                    button.set_label(&previous_label);
+                    button.set_sensitive(true);
+                }
+                Err(_) => {
+                    button.set_label(&previous_label);
+                    button.set_sensitive(true);
+                }
+            }
+        });
+    }
+
+    fn show_install_tool_dialog(
+        self: &Rc<Self>,
+        package: crate::tools::ToolPackage,
+        state: Rc<ToolsState>,
+        button: gtk::Button,
+        previous_label: String,
+    ) {
+        let status = crate::tools::requirement_status(&package.manifest);
+        let dialog = adw::Dialog::builder()
+            .title(format!("Install {}", package.manifest.name))
+            .content_width(760)
+            .content_height(720)
+            .build();
+
+        let header = adw::HeaderBar::new();
+        header.set_show_end_title_buttons(false);
+        let close = gtk::Button::from_icon_name("window-close-symbolic");
+        close.add_css_class("flat");
+        {
+            let dialog = dialog.downgrade();
+            close.connect_clicked(move |_| {
+                if let Some(dialog) = dialog.upgrade() {
+                    dialog.close();
+                }
+            });
+        }
+        header.pack_end(&close);
+
+        let page = adw::PreferencesPage::new();
+
+        let tool_group = adw::PreferencesGroup::new();
+        tool_group.set_title("Tool");
+        add_info_row(&tool_group, "Name", &package.manifest.name);
+        add_info_row(
+            &tool_group,
+            "Version",
+            &package.manifest.version.to_string(),
+        );
+        add_info_row(&tool_group, "Category", &package.manifest.category);
+        add_info_row(
+            &tool_group,
+            "Runtime",
+            runtime_label(&package.manifest.runtime),
+        );
+        add_info_row(&tool_group, "Description", &package.manifest.description);
+        page.add(&tool_group);
+
+        let requirements = adw::PreferencesGroup::new();
+        requirements.set_title("Requirements");
+        let commands = if package.manifest.requires.commands.is_empty() {
+            "None"
+        } else {
+            &package.manifest.requires.commands.join(", ")
+        };
+        add_info_row(&requirements, "Commands", commands);
+        if !package.manifest.requires.python.is_empty() {
+            add_info_row(
+                &requirements,
+                "Python modules",
+                &package.manifest.requires.python.join(", "),
+            );
+        }
+        if let Some(summary) = status.summary() {
+            add_info_row(&requirements, "Missing", &summary);
+        }
+        page.add(&requirements);
+
+        let sandbox = adw::PreferencesGroup::new();
+        sandbox.set_title("Sandbox");
+        let mut access = Vec::new();
+        if package.manifest.sandbox.network {
+            access.push("Network");
+        }
+        if package.manifest.sandbox.wayland {
+            access.push("Wayland");
+        }
+        if package.manifest.sandbox.dbus {
+            access.push("D-Bus");
+        }
+        if package.manifest.sandbox.runtime_dir {
+            access.push("Desktop runtime directory");
+        }
+        if access.is_empty() {
+            access.push("No extra access");
+        }
+        add_info_row(&sandbox, "Access", &access.join(" · "));
+        if !package.manifest.sandbox.read_paths.is_empty() {
+            add_info_row(
+                &sandbox,
+                "Read paths",
+                &package.manifest.sandbox.read_paths.join(" · "),
+            );
+        }
+        if !package.manifest.sandbox.write_paths.is_empty() {
+            add_info_row(
+                &sandbox,
+                "Write paths",
+                &package.manifest.sandbox.write_paths.join(" · "),
+            );
+        }
+        page.add(&sandbox);
+
+        let script_group = adw::PreferencesGroup::new();
+        script_group.set_title("Script");
+        script_group.set_description(Some(
+            "Review the script before installing. It runs inside bubblewrap with only the access listed above.",
+        ));
+        let script = String::from_utf8_lossy(&package.run_bytes).into_owned();
+        script_group.add(&script_expander("run", &script));
+        page.add(&script_group);
+
+        let cancel = gtk::Button::with_label("Cancel");
+        let install = gtk::Button::with_label(if previous_label == "Update" {
+            "Update"
+        } else {
+            "Install"
+        });
+        install.add_css_class("suggested-action");
+        install.set_sensitive(status.is_ok());
+
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        actions.set_halign(gtk::Align::End);
+        actions.set_margin_top(12);
+        actions.set_margin_bottom(12);
+        actions.set_margin_start(12);
+        actions.set_margin_end(12);
+        actions.append(&cancel);
+        actions.append(&install);
+
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&header);
+        toolbar.set_content(Some(&page));
+        toolbar.add_bottom_bar(&actions);
+        dialog.set_child(Some(&toolbar));
+
+        button.set_label(&previous_label);
+        let installed = Rc::new(Cell::new(false));
+
+        {
+            let dialog = dialog.clone();
+            cancel.connect_clicked(move |_| {
+                dialog.close();
+            });
+        }
+        {
+            let win = self.clone();
+            let package = package.clone();
+            let state = state.clone();
+            let button = button.clone();
+            let dialog = dialog.clone();
+            let installed = Rc::clone(&installed);
+            install.connect_clicked(move |_| match crate::tools::install_package(&package) {
+                Ok(tool) => {
+                    {
+                        let mut settings = win.state.settings.borrow_mut();
+                        settings
+                            .tool_permissions
+                            .entry(tool.manifest.name.clone())
+                            .or_insert_with(|| {
+                                crate::config::ToolPermissions::from_manifest(
+                                    &tool.manifest.default_permission,
+                                    &tool.manifest.default_cloud_permission,
+                                )
+                            });
+                    }
+                    win.save_settings();
+                    state.refresh(&win);
+                    installed.set(true);
+                    button.set_label("Installed");
+                    button.set_sensitive(false);
+                    win.toast(&format!("Installed {}", tool.manifest.name));
+                    dialog.close();
+                }
+                Err(err) => {
+                    win.toast(&format!(
+                        "Could not install {}: {err:#}",
+                        package.manifest.name
+                    ));
+                }
+            });
+        }
+        {
+            let button = button.clone();
+            let previous_label = previous_label.clone();
+            let installed = Rc::clone(&installed);
+            dialog.connect_closed(move |_| {
+                if !installed.get() {
+                    button.set_label(&previous_label);
+                    button.set_sensitive(true);
+                }
+            });
+        }
+
+        dialog.present(Some(&self.window));
+    }
+
+    fn show_tool_info(
+        self: &Rc<Self>,
+        tool: crate::tools::InstalledTool,
+        status: crate::tools::RequirementStatus,
+        state: Rc<ToolsState>,
+    ) {
+        let dialog = adw::Dialog::builder()
+            .title(format!("{} details", tool.manifest.name))
+            .content_width(760)
+            .content_height(720)
+            .build();
+
+        let header = adw::HeaderBar::new();
+        header.set_show_end_title_buttons(false);
+        let close = gtk::Button::from_icon_name("window-close-symbolic");
+        close.add_css_class("flat");
+        {
+            let dialog = dialog.downgrade();
+            close.connect_clicked(move |_| {
+                if let Some(dialog) = dialog.upgrade() {
+                    dialog.close();
+                }
+            });
+        }
+        header.pack_end(&close);
+
+        let page = adw::PreferencesPage::new();
+
+        let details = adw::PreferencesGroup::new();
+        details.set_title("Tool");
+        add_info_row(&details, "Name", &tool.manifest.name);
+        add_info_row(&details, "Version", &tool.manifest.version.to_string());
+        add_info_row(&details, "Category", &tool.manifest.category);
+        add_info_row(&details, "Runtime", runtime_label(&tool.manifest.runtime));
+        add_info_row(&details, "Installed at", &tool.dir.display().to_string());
+        add_info_row(&details, "Description", &tool.manifest.description);
+        page.add(&details);
+
+        let requirements = adw::PreferencesGroup::new();
+        requirements.set_title("Requirements");
+        let commands = if tool.manifest.requires.commands.is_empty() {
+            "None".to_string()
+        } else {
+            tool.manifest.requires.commands.join(", ")
+        };
+        add_info_row(&requirements, "Commands", &commands);
+        if !tool.manifest.requires.python.is_empty() {
+            add_info_row(
+                &requirements,
+                "Python modules",
+                &tool.manifest.requires.python.join(", "),
+            );
+        }
+        if let Some(summary) = status.summary() {
+            add_info_row(&requirements, "Missing", &summary);
+        }
+        page.add(&requirements);
+
+        let sandbox = adw::PreferencesGroup::new();
+        sandbox.set_title("Sandbox");
+        let mut access = Vec::new();
+        if tool.manifest.sandbox.network {
+            access.push("Network");
+        }
+        if tool.manifest.sandbox.wayland {
+            access.push("Wayland");
+        }
+        if tool.manifest.sandbox.dbus {
+            access.push("D-Bus");
+        }
+        if tool.manifest.sandbox.runtime_dir {
+            access.push("Desktop runtime directory");
+        }
+        if access.is_empty() {
+            access.push("No extra access");
+        }
+        add_info_row(&sandbox, "Access", &access.join(" · "));
+        if !tool.manifest.sandbox.read_paths.is_empty() {
+            add_info_row(
+                &sandbox,
+                "Read paths",
+                &tool.manifest.sandbox.read_paths.join(" · "),
+            );
+        }
+        if !tool.manifest.sandbox.write_paths.is_empty() {
+            add_info_row(
+                &sandbox,
+                "Write paths",
+                &tool.manifest.sandbox.write_paths.join(" · "),
+            );
+        }
+        page.add(&sandbox);
+
+        let permissions = adw::PreferencesGroup::new();
+        permissions.set_title("Permissions");
+        add_info_row(
+            &permissions,
+            "Local models",
+            self.tool_permission(&tool.manifest, false).label(),
+        );
+        add_info_row(
+            &permissions,
+            "Cloud models",
+            self.tool_permission(&tool.manifest, true).label(),
+        );
+        page.add(&permissions);
+
+        let script_group = adw::PreferencesGroup::new();
+        script_group.set_title("Script");
+        let script = std::fs::read_to_string(tool.run_path())
+            .unwrap_or_else(|err| format!("Could not read the script: {err}"));
+        script_group.add(&script_expander("run", &script));
+        page.add(&script_group);
+
+        let test = gtk::Button::with_label("Test tool");
+        test.add_css_class("pill");
+        {
+            let win = self.clone();
+            let tool = tool.clone();
+            test.connect_clicked(move |_| win.show_tool_test_dialog(tool.clone()));
+        }
+        let delete = gtk::Button::with_label("Delete");
+        delete.add_css_class("destructive-action");
+        {
+            let win = self.clone();
+            let tool = tool.clone();
+            let dialog = dialog.clone();
+            let state = state.clone();
+            delete.connect_clicked(move |_| {
+                dialog.close();
+                let id = tool.manifest.name.clone();
+                let state = state.clone();
+                let win_for_delete = win.clone();
+                let id_for_delete = id.clone();
+                win.confirm_delete_tool(&id, move || {
+                    win_for_delete.delete_tool(&id_for_delete, state.clone())
+                });
+            });
+        }
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        actions.set_halign(gtk::Align::Center);
+        actions.set_margin_top(12);
+        actions.set_margin_bottom(12);
+        actions.append(&test);
+        actions.append(&delete);
+
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&header);
+        toolbar.set_content(Some(&page));
+        toolbar.add_bottom_bar(&actions);
+        dialog.set_child(Some(&toolbar));
+        dialog.present(Some(&self.window));
+    }
+
+    fn show_tool_test_dialog(self: &Rc<Self>, tool: crate::tools::InstalledTool) {
+        let dialog = adw::Dialog::builder()
+            .title(format!("Test {}", tool.manifest.name))
+            .content_width(720)
+            .content_height(600)
+            .build();
+
+        let header = adw::HeaderBar::new();
+        header.set_show_end_title_buttons(false);
+        let close = gtk::Button::from_icon_name("window-close-symbolic");
+        close.add_css_class("flat");
+        {
+            let dialog = dialog.downgrade();
+            close.connect_clicked(move |_| {
+                if let Some(dialog) = dialog.upgrade() {
+                    dialog.close();
+                }
+            });
+        }
+        header.pack_end(&close);
+
+        let page = adw::PreferencesPage::new();
+
+        let input_group = adw::PreferencesGroup::new();
+        input_group.set_title("Arguments");
+        let args_row = adw::EntryRow::new();
+        args_row.set_title("JSON");
+        args_row.set_text("{}");
+        input_group.add(&args_row);
+
+        let run_row = adw::ActionRow::new();
+        run_row.set_title("Run the tool");
+        run_row.set_subtitle(
+            "It runs in the same bubblewrap sandbox used for chats, with the declared permissions.",
+        );
+        let run = gtk::Button::with_label("Run");
+        run.add_css_class("suggested-action");
+        run.set_valign(gtk::Align::Center);
+        run_row.add_suffix(&run);
+        input_group.add(&run_row);
+        page.add(&input_group);
+
+        let output_group = adw::PreferencesGroup::new();
+        output_group.set_title("Output");
+        let output = gtk::Label::new(Some("No output yet."));
+        output.set_xalign(0.0);
+        output.set_yalign(0.0);
+        output.set_wrap(true);
+        output.set_selectable(true);
+        output.add_css_class("monospace");
+        let scrolled = gtk::ScrolledWindow::builder()
+            .min_content_height(240)
+            .child(&output)
+            .build();
+        output_group.add(&scrolled);
+        page.add(&output_group);
+
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&header);
+        toolbar.set_content(Some(&page));
+        dialog.set_child(Some(&toolbar));
+        dialog.present(Some(&self.window));
+
+        {
+            let win = self.clone();
+            let tool = tool.clone();
+            let args_row = args_row.clone();
+            let output = output.clone();
+            let run = run.clone();
+            let run_for_click = run.clone();
+            run.connect_clicked(move |_| {
+                let text = args_row.text().to_string();
+                let args: serde_json::Value = match serde_json::from_str(&text) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        output.set_text(&format!("Invalid JSON: {err}"));
+                        return;
+                    }
+                };
+                run_for_click.set_sensitive(false);
+                output.set_text("Running…");
+
+                let (tx, rx) = async_channel::bounded(1);
+                let request_tool = tool.clone();
+                win.state.runtime.spawn(async move {
+                    let _ = tx
+                        .send(crate::tools::execute(&request_tool, &args).await)
+                        .await;
+                });
+
+                let output = output.clone();
+                let run = run_for_click.clone();
+                glib::spawn_future_local(async move {
+                    let text = match rx.recv().await {
+                        Ok(Ok(result)) if result.success => result.text,
+                        Ok(Ok(result)) => format!("The tool reported an error:\n{}", result.text),
+                        Ok(Err(err)) => format!("Error: {err:#}"),
+                        Err(_) => "The tool was cancelled.".to_string(),
+                    };
+                    output.set_text(&text);
+                    run.set_sensitive(true);
+                });
+            });
+        }
+    }
+
+    fn delete_tool(self: &Rc<Self>, id: &str, state: Rc<ToolsState>) {
+        match crate::tools::uninstall(id) {
+            Ok(()) => {
+                self.state.settings.borrow_mut().tool_permissions.remove(id);
+                self.save_settings();
+                state.refresh(self);
+                self.toast(&format!("Deleted {id}"));
+            }
+            Err(err) => self.toast(&format!("Could not delete {id}: {err:#}")),
+        }
+    }
+
+    fn confirm_delete_tool(&self, name: &str, on_delete: impl Fn() + 'static) {
+        let alert = adw::AlertDialog::new(
+            Some("Delete tool?"),
+            Some(&format!(
+                "Delete {name}? Its files and permission settings will be removed."
+            )),
+        );
+        alert.add_response("cancel", "Cancel");
+        alert.add_response("delete", "Delete");
+        alert.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+        alert.set_default_response(Some("cancel"));
+        alert.set_close_response("cancel");
+        let on_delete = Rc::new(on_delete);
+        alert.connect_response(None, move |_, response| {
+            if response == "delete" {
+                on_delete();
+            }
+        });
+        alert.present(Some(&self.window));
+    }
+
     fn live_available(&self) -> bool {
         let enabled = {
             let settings = self.state.settings.borrow();
@@ -7920,6 +8907,7 @@ impl ChatWindow {
             });
         }
         let (models_page, language_models) = self.build_models_page(&parakeet_badges);
+        let (tools_page, tools_state) = self.build_tools_page();
 
         let stack = adw::ViewStack::new();
         stack.add_titled_with_icon(
@@ -7934,15 +8922,23 @@ impl ChatWindow {
             "Models",
             "package-x-generic-symbolic",
         );
+        stack.add_titled_with_icon(
+            &tools_page,
+            Some("tools"),
+            "Tools",
+            "applications-utilities-symbolic",
+        );
         stack.set_visible_child_name("general");
         {
             let win = self.clone();
             let provider_state = Rc::clone(&stt_provider_state);
             let language_models = Rc::clone(&language_models);
+            let tools_state = Rc::clone(&tools_state);
             stack.connect_visible_child_name_notify(move |stack| {
                 match stack.visible_child_name().as_deref() {
                     Some("general") => provider_state.refresh(&win),
                     Some("models") => language_models.refresh(&win),
+                    Some("tools") => tools_state.refresh(&win),
                     _ => {}
                 }
             });
@@ -8220,6 +9216,40 @@ fn add_info_row(group: &adw::PreferencesGroup, title: &str, value: &str) {
     row.set_title(title);
     row.set_subtitle(value);
     group.add(&row);
+}
+
+fn runtime_label(runtime: &str) -> &str {
+    match runtime {
+        "python3" => "Python",
+        "binary" => "Binary",
+        other => other,
+    }
+}
+
+fn script_expander(title: &str, text: &str) -> adw::ExpanderRow {
+    let expander = adw::ExpanderRow::new();
+    expander.set_title(title);
+    expander.set_subtitle(&format!("{} lines", text.lines().count()));
+
+    let label = gtk::Label::new(Some(text));
+    label.set_xalign(0.0);
+    label.set_yalign(0.0);
+    label.set_selectable(true);
+    label.set_wrap(false);
+    label.add_css_class("monospace");
+    label.set_margin_top(6);
+    label.set_margin_bottom(6);
+    label.set_margin_start(12);
+    label.set_margin_end(12);
+
+    let scrolled = gtk::ScrolledWindow::builder()
+        .min_content_height(240)
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .child(&label)
+        .build();
+    expander.add_row(&scrolled);
+    expander
 }
 
 fn text_expander(title: &str, text: &str) -> adw::ExpanderRow {

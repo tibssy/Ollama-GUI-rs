@@ -1,6 +1,78 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolPermission {
+    Allow,
+    #[default]
+    Ask,
+    Deny,
+}
+
+impl ToolPermission {
+    pub const ALL: [Self; 3] = [Self::Allow, Self::Ask, Self::Deny];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Allow => "Allow",
+            Self::Ask => "Ask",
+            Self::Deny => "Deny",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "allow" => Some(Self::Allow),
+            "ask" => Some(Self::Ask),
+            "deny" => Some(Self::Deny),
+            _ => None,
+        }
+    }
+
+    pub fn index(self) -> u32 {
+        match self {
+            Self::Allow => 0,
+            Self::Ask => 1,
+            Self::Deny => 2,
+        }
+    }
+
+    pub fn from_index(index: u32) -> Self {
+        match index {
+            0 => Self::Allow,
+            1 => Self::Ask,
+            _ => Self::Deny,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolPermissions {
+    pub local: ToolPermission,
+    pub cloud: ToolPermission,
+}
+
+impl Default for ToolPermissions {
+    fn default() -> Self {
+        Self {
+            local: ToolPermission::Ask,
+            cloud: ToolPermission::Deny,
+        }
+    }
+}
+
+impl ToolPermissions {
+    pub fn from_manifest(local: &str, cloud: &str) -> Self {
+        Self {
+            local: ToolPermission::from_str(local).unwrap_or(ToolPermission::Ask),
+            cloud: ToolPermission::from_str(cloud).unwrap_or(ToolPermission::Deny),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -65,6 +137,8 @@ pub struct Settings {
     pub wake_listen_timeout_secs: u32,
     /// Start a fresh conversation after a wake session ends with a sleep phrase
     pub wake_new_conversation: bool,
+    /// Per-tool permissions for local and cloud models
+    pub tool_permissions: BTreeMap<String, ToolPermissions>,
 }
 
 impl Default for Settings {
@@ -103,6 +177,7 @@ impl Default for Settings {
             wake_threshold: 0.0,
             wake_listen_timeout_secs: 30,
             wake_new_conversation: false,
+            tool_permissions: BTreeMap::new(),
         }
     }
 }
@@ -122,6 +197,10 @@ pub fn data_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".local/share"))
         .join("ollama-gui")
+}
+
+pub fn home_dir() -> PathBuf {
+    home()
 }
 
 fn home() -> PathBuf {
