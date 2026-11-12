@@ -50,10 +50,10 @@ const TOOL_MAX_ROUNDS: usize = 8;
 /// Maximum number of calls executed from one model response.
 const TOOL_MAX_CALLS_PER_ROUND: usize = 8;
 /// Longest string value kept in stored tool-call arguments.
-const TOOL_ARG_PREVIEW_CHARS: usize = 600;
+const TOOL_ARG_PREVIEW_CHARS: usize = 240;
 /// Ask the model to summarize tool output instead of repeating it.
-const TOOL_SUMMARY_NUDGE: &str = "Tool results are already available. Answer concisely \
-and summarize only the relevant details. Do not repeat the full tool output verbatim.";
+const TOOL_SUMMARY_NUDGE: &str = "Tool results are already available. Reply in at most two \
+sentences, summarize only the relevant details, and do not repeat the full tool output.";
 /// Feed memory extraction this fraction of `num_ctx` at a time.
 const MEMORY_TRANSCRIPT_RATIO: f64 = 0.45;
 const MEMORY_TEMPERATURE: f64 = 0.1;
@@ -7386,7 +7386,7 @@ impl ChatWindow {
         let group = adw::PreferencesGroup::new();
         group.set_title("Installed tools");
         group.set_description(Some(
-            "Tools add actions the model can call. Install them from the registry, then choose whether local and cloud models may run them.",
+            "Tools add actions the model can call. Install them from the registry, then choose whether local and cloud models may run them. Tool definitions use context; 4096 tokens or more is recommended.",
         ));
 
         let header_actions = gtk::Box::new(gtk::Orientation::Horizontal, 4);

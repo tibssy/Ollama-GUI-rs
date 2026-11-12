@@ -140,10 +140,41 @@ impl InstalledTool {
             "type": "function",
             "function": {
                 "name": self.manifest.name,
-                "description": self.manifest.description,
-                "parameters": self.manifest.parameters,
+                // Keep enough for the model to choose the tool without
+                // spending hundreds of tokens on registry prose.
+                "description": truncate_chars(&self.manifest.description, 140),
+                "parameters": compact_schema(&self.manifest.parameters),
             }
         })
+    }
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut truncated: String = text.chars().take(max_chars).collect();
+    truncated.push('…');
+    truncated
+}
+
+/// Drop prose descriptions from the JSON schema sent to the model. Parameter
+/// names, types, enums, and required fields carry the meaning; the registry
+/// descriptions stay in the manifest for the Tools tab.
+fn compact_schema(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut compact = serde_json::Map::new();
+            for (key, value) in object {
+                if key == "description" {
+                    continue;
+                }
+                compact.insert(key.clone(), compact_schema(value));
+            }
+            Value::Object(compact)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(compact_schema).collect()),
+        other => other.clone(),
     }
 }
 
@@ -1427,6 +1458,38 @@ print(json.dumps({
                 && window[2] == canonical.as_os_str()
         }));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn compact_model_definitions_drop_prose() {
+        let mut manifest = manifest();
+        manifest.description = "x".repeat(500);
+        manifest.parameters = json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "A long parameter description.",
+                    "enum": ["read", "set"]
+                },
+                "value": {
+                    "type": "string",
+                    "description": "Another long description."
+                }
+            },
+            "required": ["action"]
+        });
+        let definition = tool(manifest).definition();
+        let function = &definition["function"];
+        assert!(function["description"].as_str().unwrap().chars().count() <= 181);
+        assert!(function["parameters"]["properties"]["action"]
+            .get("description")
+            .is_none());
+        assert_eq!(
+            function["parameters"]["properties"]["action"]["enum"],
+            json!(["read", "set"])
+        );
+        assert_eq!(function["parameters"]["required"], json!(["action"]));
     }
 
     #[test]
