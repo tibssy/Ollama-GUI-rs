@@ -65,6 +65,11 @@ pub struct ToolManifest {
     pub max_output_bytes: usize,
     #[serde(default)]
     pub file_params: Vec<String>,
+    /// Keep the host path for file parameters instead of rewriting to
+    /// /sandbox/incoming. Needed when a daemon outside the sandbox must read
+    /// the file, such as KDE Connect's share action.
+    #[serde(default)]
+    pub preserve_file_paths: bool,
     #[serde(default)]
     pub dangerous_actions: Vec<String>,
     #[serde(default = "default_parameters")]
@@ -1026,9 +1031,15 @@ fn stage_file_params(
             })
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| "file".to_string());
-        let destination = PathBuf::from("/sandbox/incoming").join(format!("{index}-{file_name}"));
-        add_bind(command_args, dirs, &source, &destination, false);
-        input[name] = Value::String(destination.to_string_lossy().into_owned());
+        if tool.manifest.preserve_file_paths {
+            add_bind(command_args, dirs, &source, &source, false);
+            input[name] = Value::String(source.to_string_lossy().into_owned());
+        } else {
+            let destination =
+                PathBuf::from("/sandbox/incoming").join(format!("{index}-{file_name}"));
+            add_bind(command_args, dirs, &source, &destination, false);
+            input[name] = Value::String(destination.to_string_lossy().into_owned());
+        }
     }
     Ok(input)
 }
@@ -1173,6 +1184,7 @@ mod tests {
             timeout_secs: 5,
             max_output_bytes: 4096,
             file_params: Vec::new(),
+            preserve_file_paths: false,
             dangerous_actions: Vec::new(),
             parameters: json!({
                 "type": "object",
@@ -1382,6 +1394,39 @@ print(json.dumps({
         assert!(run.success, "{}", run.text);
         assert_eq!(run.text, "hidden");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn preserves_host_file_paths_when_requested() {
+        let path =
+            std::env::temp_dir().join(format!("ollama-gui-preserve-{}.txt", std::process::id()));
+        std::fs::write(&path, "test").expect("write temp file");
+        let canonical = path.canonicalize().expect("canonicalize");
+
+        let mut manifest = manifest();
+        manifest.file_params = vec!["path".to_string()];
+        manifest.preserve_file_paths = true;
+        manifest.parameters = json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"}
+            }
+        });
+        let plan = build_sandbox_plan(
+            &tool(manifest),
+            &json!({"path": canonical.to_string_lossy()}),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.input.get("path").and_then(Value::as_str),
+            Some(canonical.to_string_lossy().as_ref())
+        );
+        assert!(plan.args.windows(3).any(|window| {
+            window[0] == "--ro-bind"
+                && window[1] == canonical.as_os_str()
+                && window[2] == canonical.as_os_str()
+        }));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
