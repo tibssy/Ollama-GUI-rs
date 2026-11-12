@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use libadwaita::prelude::*;
 
 use crate::api::{
     self, ChatMessage, ChatOptions, ChatRequest, ModelShow, ModelSummary, OllamaClient,
-    StreamEvent, StreamStats, ThinkSetting, ThinkingControl,
+    StreamEvent, StreamStats, ThinkSetting, ThinkingControl, ToolCall,
 };
 use crate::autostart;
 use crate::config::Settings;
@@ -45,6 +45,8 @@ const MEMORY_DEBOUNCE_MS: u64 = 3_000;
 const AUTOSTART_WAKE_DELAY_SECS: u32 = 3;
 /// How long Ollama keeps an unused model loaded.
 const CHAT_KEEP_ALIVE: &str = "5m";
+/// Maximum number of tool rounds before the model is asked to answer without tools.
+const TOOL_MAX_ROUNDS: usize = 8;
 /// Feed memory extraction this fraction of `num_ctx` at a time.
 const MEMORY_TRANSCRIPT_RATIO: f64 = 0.45;
 const MEMORY_TEMPERATURE: f64 = 0.1;
@@ -96,6 +98,11 @@ struct ActiveStream {
     conv_id: i64,
     model: String,
     stats: Rc<RefCell<Option<StreamStats>>>,
+    tool_calls: Vec<ToolCall>,
+    tool_box: gtk::Box,
+    cloud: bool,
+    round: usize,
+    memory_context: Option<String>,
 }
 
 struct PendingAttachment {
@@ -137,6 +144,7 @@ struct CompressionResult {
 struct GenerationRequest {
     conversation_id: i64,
     memory_context: Option<String>,
+    tool_round: usize,
 }
 
 struct MemoryJob {
@@ -1714,6 +1722,161 @@ fn pull_status_label(status: &str) -> String {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ToolPermissionChoice {
+    Deny,
+    Once,
+    Chat,
+}
+
+#[derive(Clone)]
+struct ToolCard {
+    status: gtk::Label,
+    spinner: gtk::Spinner,
+    result: gtk::Label,
+}
+
+impl ToolCard {
+    fn new(parent: &gtk::Box, name: &str, args: &serde_json::Value) -> Self {
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        root.add_css_class("tool-card");
+
+        let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let icon = gtk::Image::from_icon_name("applications-utilities-symbolic");
+        icon.set_pixel_size(16);
+        icon.add_css_class("dim-label");
+        icon.set_valign(gtk::Align::Center);
+        header.append(&icon);
+
+        let title = gtk::Label::new(Some(name));
+        title.set_xalign(0.0);
+        title.set_hexpand(true);
+        title.add_css_class("tool-card-name");
+        header.append(&title);
+
+        let status = gtk::Label::new(Some("Requested"));
+        status.set_xalign(1.0);
+        status.add_css_class("dim-label");
+        status.add_css_class("tool-card-status");
+        header.append(&status);
+
+        let spinner = gtk::Spinner::new();
+        spinner.set_size_request(16, 16);
+        spinner.set_valign(gtk::Align::Center);
+        spinner.set_visible(false);
+        header.append(&spinner);
+        root.append(&header);
+
+        if !args.is_null() && args.as_object().is_none_or(|object| !object.is_empty()) {
+            let text = serde_json::to_string_pretty(args).unwrap_or_else(|_| args.to_string());
+            let label = gtk::Label::new(Some(&truncate_tool_text(&text, 800)));
+            label.set_xalign(0.0);
+            label.set_wrap(true);
+            label.set_selectable(true);
+            label.set_max_width_chars(60);
+            label.add_css_class("monospace");
+            label.add_css_class("dim-label");
+            label.add_css_class("tool-card-args");
+            root.append(&label);
+        }
+
+        let result = gtk::Label::new(None);
+        result.set_xalign(0.0);
+        result.set_wrap(true);
+        result.set_selectable(true);
+        result.set_max_width_chars(60);
+        result.set_visible(false);
+        result.add_css_class("monospace");
+        result.add_css_class("tool-card-result");
+        root.append(&result);
+
+        parent.append(&root);
+        Self {
+            status,
+            spinner,
+            result,
+        }
+    }
+
+    fn set_status(&self, text: &str) {
+        self.status.set_text(text);
+    }
+
+    fn set_waiting(&self) {
+        self.set_status("Waiting for permission…");
+        self.spinner.set_visible(true);
+        self.spinner.start();
+    }
+
+    fn set_running(&self) {
+        self.set_status("Running…");
+        self.spinner.set_visible(true);
+        self.spinner.start();
+    }
+
+    fn set_requested(&self) {
+        self.spinner.stop();
+        self.spinner.set_visible(false);
+        self.set_status("Requested");
+    }
+
+    fn finish(&self, status: &str, text: &str, success: bool) {
+        self.spinner.stop();
+        self.spinner.set_visible(false);
+        self.set_status(status);
+        let text = truncate_tool_text(text, 4000);
+        self.result.set_text(&text);
+        self.result.set_visible(!text.is_empty());
+        if success {
+            self.result.remove_css_class("error");
+        } else {
+            self.result.add_css_class("error");
+        }
+    }
+
+    fn set_done(&self, success: bool, text: &str) {
+        self.finish(if success { "Done" } else { "Error" }, text, success);
+    }
+
+    fn set_denied(&self, text: &str) {
+        self.finish("Denied", text, false);
+    }
+
+    fn set_error(&self, text: &str) {
+        self.finish("Error", text, false);
+    }
+}
+
+fn truncate_tool_text(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut truncated: String = text.chars().take(max_chars).collect();
+    truncated.push_str("…[truncated]");
+    truncated
+}
+
+fn add_static_tool_card(
+    parent: &gtk::Box,
+    name: &str,
+    args: &serde_json::Value,
+    status: &str,
+    result: Option<&str>,
+) -> ToolCard {
+    let card = ToolCard::new(parent, name, args);
+    match result {
+        Some(text) => card.finish(status, text, status == "Done"),
+        None => {
+            if status == "Requested" {
+                card.set_requested();
+            } else {
+                card.set_status(status);
+            }
+        }
+    }
+    card
+}
+
 struct ChatWindow {
     window: adw::ApplicationWindow,
     state: Rc<AppState>,
@@ -1764,6 +1927,11 @@ struct ChatWindow {
 
     current_id: RefCell<Option<i64>>,
     active: RefCell<Option<ActiveStream>>,
+    tool_grants: RefCell<HashSet<(i64, String)>>,
+    tool_task: RefCell<Option<glib::JoinHandle<()>>>,
+    tool_abort: RefCell<Option<tokio::task::AbortHandle>>,
+    last_tool_box: RefCell<Option<gtk::Box>>,
+    last_tool_cards: RefCell<HashMap<String, ToolCard>>,
     speech_buttons: RefCell<Vec<gtk::Button>>,
     message_pictures: RefCell<Vec<glib::WeakRef<gtk::Picture>>>,
     last_image_column: Cell<i32>,
@@ -2138,6 +2306,11 @@ impl ChatWindow {
             tray_wake_word: RefCell::new(String::new()),
             current_id: RefCell::new(None),
             active: RefCell::new(None),
+            tool_grants: RefCell::new(HashSet::new()),
+            tool_task: RefCell::new(None),
+            tool_abort: RefCell::new(None),
+            last_tool_box: RefCell::new(None),
+            last_tool_cards: RefCell::new(HashMap::new()),
             speech_buttons: RefCell::new(Vec::new()),
             message_pictures: RefCell::new(Vec::new()),
             last_image_column: Cell::new(0),
@@ -2855,6 +3028,7 @@ impl ChatWindow {
         self.stop_stt();
         *self.pending_generation.borrow_mut() = None;
         *self.current_id.borrow_mut() = Some(id);
+        self.tool_grants.borrow_mut().clear();
 
         let (title, model, messages, images) = {
             let store = self.state.store.borrow();
@@ -2920,6 +3094,7 @@ impl ChatWindow {
         self.stop_stt();
         *self.pending_generation.borrow_mut() = None;
         *self.current_id.borrow_mut() = None;
+        self.tool_grants.borrow_mut().clear();
         self.chat_list.unselect_all();
         self.show_empty();
         self.input.grab_focus();
@@ -2932,6 +3107,8 @@ impl ChatWindow {
             self.messages_box.remove(&child);
         }
         *self.summary_notice.borrow_mut() = None;
+        *self.last_tool_box.borrow_mut() = None;
+        self.last_tool_cards.borrow_mut().clear();
         self.speech_buttons.borrow_mut().clear();
         self.message_pictures.borrow_mut().clear();
     }
@@ -2943,9 +3120,50 @@ impl ChatWindow {
         images: &[StoredImage],
     ) {
         if message.role == "user" {
+            *self.last_tool_box.borrow_mut() = None;
+            self.last_tool_cards.borrow_mut().clear();
             self.add_user_message(conversation_id, Some(message.id), &message.content, images);
+            return;
+        }
+        if message.role == "tool" {
+            self.add_tool_result_widget(message);
+            return;
+        }
+
+        let (_row, bubble, view) = self.add_assistant_bubble();
+        let tool_calls: Vec<ToolCall> = message
+            .tool_calls
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok())
+            .unwrap_or_default();
+        let mut tool_box = None;
+        let mut cards_by_id = HashMap::new();
+        if !tool_calls.is_empty() {
+            let cards = gtk::Box::new(gtk::Orientation::Vertical, 4);
+            cards.set_margin_top(4);
+            bubble.append(&cards);
+            for (index, call) in tool_calls.iter().enumerate() {
+                let card = add_static_tool_card(
+                    &cards,
+                    &call.function.name,
+                    &call.function.arguments,
+                    "Requested",
+                    None,
+                );
+                let key = call
+                    .id
+                    .clone()
+                    .unwrap_or_else(|| format!("{index}:{}", call.function.name));
+                cards_by_id.insert(key, card);
+            }
+            tool_box = Some(cards);
+        }
+        *self.last_tool_box.borrow_mut() = tool_box;
+        *self.last_tool_cards.borrow_mut() = cards_by_id;
+
+        if message.content.trim().is_empty() {
+            view.set_visible(false);
         } else {
-            let (_row, bubble, view) = self.add_assistant_bubble();
             // A GtkTextView populated before its first allocation caches a zero
             // height. Render once it has a width, then request one more resize
             // after that allocation so wrapped markdown gets its real height.
@@ -2979,6 +3197,51 @@ impl ChatWindow {
                 Some(message.id),
             );
         }
+    }
+
+    fn add_tool_result_widget(&self, message: &StoredMessage) {
+        let name = message.tool_name.as_deref().unwrap_or("tool");
+        let denied = message.content.contains("denied permission");
+        let success = !message.content.trim_start().starts_with("Error:");
+        let status = if denied {
+            "Denied"
+        } else if success {
+            "Done"
+        } else {
+            "Error"
+        };
+
+        if let Some(id) = message.tool_call_id.as_deref() {
+            if let Some(card) = self.last_tool_cards.borrow_mut().remove(id) {
+                card.finish(status, &message.content, success);
+                return;
+            }
+        }
+
+        if let Some(tool_box) = self.last_tool_box.borrow().as_ref() {
+            add_static_tool_card(
+                tool_box,
+                name,
+                &serde_json::Value::Null,
+                status,
+                Some(&message.content),
+            );
+            return;
+        }
+
+        let (_row, bubble, view) = self.add_assistant_bubble();
+        view.set_visible(false);
+        let tool_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        tool_box.set_margin_top(4);
+        bubble.append(&tool_box);
+        add_static_tool_card(
+            &tool_box,
+            name,
+            &serde_json::Value::Null,
+            status,
+            Some(&message.content),
+        );
+        *self.last_tool_box.borrow_mut() = Some(tool_box);
     }
 
     fn add_user_message(
@@ -3421,6 +3684,7 @@ impl ChatWindow {
         self.start_generation(GenerationRequest {
             conversation_id,
             memory_context: None,
+            tool_round: 0,
         });
 
         if removed > 1 {
@@ -4740,6 +5004,7 @@ impl ChatWindow {
             self.start_generation(GenerationRequest {
                 conversation_id,
                 memory_context: None,
+                tool_round: 0,
             });
             return;
         }
@@ -4749,6 +5014,7 @@ impl ChatWindow {
             self.start_generation(GenerationRequest {
                 conversation_id,
                 memory_context: None,
+                tool_round: 0,
             });
             return;
         }
@@ -4756,6 +5022,7 @@ impl ChatWindow {
             self.start_generation(GenerationRequest {
                 conversation_id,
                 memory_context: None,
+                tool_round: 0,
             });
             return;
         };
@@ -4768,6 +5035,7 @@ impl ChatWindow {
             self.start_generation(GenerationRequest {
                 conversation_id,
                 memory_context: None,
+                tool_round: 0,
             });
             return;
         }
@@ -4789,6 +5057,7 @@ impl ChatWindow {
             self.start_generation(GenerationRequest {
                 conversation_id,
                 memory_context: None,
+                tool_round: 0,
             });
             return;
         }
@@ -4882,6 +5151,7 @@ impl ChatWindow {
             win.start_generation(GenerationRequest {
                 conversation_id,
                 memory_context,
+                tool_round: 0,
             });
         });
     }
@@ -5069,7 +5339,8 @@ impl ChatWindow {
         }
 
         let conversation_id = request.conversation_id;
-        let memory_context = request.memory_context;
+        let tool_round = request.tool_round;
+        let memory_context = request.memory_context.clone();
         let model = self.selected_model();
         if model.is_empty() {
             self.toast("No chat model selected. Pull one with `ollama pull`, then refresh.");
@@ -5121,6 +5392,8 @@ impl ChatWindow {
         let think = self.think_setting();
         tracing::debug!("chat: thinking setting {think:?}");
 
+        let tools = self.tool_definitions(&model, tool_round);
+        let cloud = self.model_is_cloud_scope(&model);
         let request = ChatRequest {
             model: model.clone(),
             messages,
@@ -5132,9 +5405,13 @@ impl ChatWindow {
             }),
             keep_alive: Some(CHAT_KEEP_ALIVE.to_string()),
             think,
+            tools,
         };
 
         let (row, bubble, assistant_view) = self.add_assistant_bubble();
+        let tool_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        tool_box.set_margin_top(4);
+        bubble.append(&tool_box);
         let thinking = ThinkingUi::new(&bubble);
         let assistant_buffer = assistant_view.buffer();
         let content = Rc::new(RefCell::new(String::new()));
@@ -5153,6 +5430,11 @@ impl ChatWindow {
             conv_id: conversation_id,
             model,
             stats: stats.clone(),
+            tool_calls: Vec::new(),
+            tool_box,
+            cloud,
+            round: tool_round,
+            memory_context,
         });
 
         self.set_streaming_ui(true);
@@ -5190,6 +5472,11 @@ impl ChatWindow {
                             win.scroll_to_bottom();
                         }
                     }
+                    StreamEvent::ToolCalls(calls) => {
+                        if let Some(active) = win.active.borrow_mut().as_mut() {
+                            active.tool_calls = calls;
+                        }
+                    }
                     StreamEvent::Done(stream_stats) => {
                         final_stats = Some(stream_stats);
                     }
@@ -5209,15 +5496,17 @@ impl ChatWindow {
     }
 
     fn finish_stream(self: &Rc<Self>, had_error: bool) {
-        let Some(active) = self.active.borrow_mut().take() else {
+        let Some(mut active) = self.active.borrow_mut().take() else {
             return;
         };
 
         let content = active.content.borrow().clone();
         let stats = active.stats.borrow().clone();
+        let tool_calls = std::mem::take(&mut active.tool_calls);
+        let has_content = !content.trim().is_empty();
         let mut assistant_id = None;
 
-        if !content.trim().is_empty() {
+        if has_content || !tool_calls.is_empty() {
             let conversation_exists = self
                 .state
                 .store
@@ -5227,22 +5516,34 @@ impl ChatWindow {
                 .flatten()
                 .is_some();
             if conversation_exists {
-                match self.state.store.borrow().add_message(
-                    active.conv_id,
-                    "assistant",
-                    &content,
-                    stats.as_ref(),
-                ) {
+                let saved = if tool_calls.is_empty() {
+                    self.state.store.borrow().add_message(
+                        active.conv_id,
+                        "assistant",
+                        &content,
+                        stats.as_ref(),
+                    )
+                } else {
+                    self.state.store.borrow().add_tool_call_message(
+                        active.conv_id,
+                        &content,
+                        &tool_calls,
+                        stats.as_ref(),
+                    )
+                };
+                match saved {
                     Ok(id) => assistant_id = Some(id),
                     Err(err) => {
                         self.toast(&format!("Could not save reply: {err:#}"));
                     }
                 }
             }
-            if active.row.parent().is_some() {
+            if has_content && active.row.parent().is_some() {
                 super::markdown::render(&active.view, &content);
+            } else if !has_content {
+                active.view.set_visible(false);
             }
-        } else if active.row.parent().is_some() {
+        } else if active.row.parent().is_some() && active.tool_box.first_child().is_none() {
             self.messages_box.remove(&active.row);
         }
 
@@ -5252,9 +5553,19 @@ impl ChatWindow {
             content.len()
         );
 
+        if !tool_calls.is_empty() && !had_error {
+            tracing::info!(
+                "tool round {} requested {} call(s)",
+                active.round,
+                tool_calls.len()
+            );
+            self.run_tool_round(active, tool_calls);
+            return;
+        }
+
         if content.trim().is_empty() && had_error {
             self.toast("Generation failed. Check the Ollama server.");
-        } else if content.trim().is_empty() {
+        } else if content.trim().is_empty() && tool_calls.is_empty() {
             self.toast("The model returned an empty response.");
         }
 
@@ -5312,10 +5623,174 @@ impl ChatWindow {
         }
     }
 
+    fn save_tool_result(
+        &self,
+        conversation_id: i64,
+        name: &str,
+        call_id: Option<&str>,
+        text: &str,
+    ) {
+        if let Err(err) =
+            self.state
+                .store
+                .borrow()
+                .add_tool_result_message(conversation_id, name, call_id, text)
+        {
+            self.toast(&format!("Could not save tool result: {err:#}"));
+        }
+    }
+
+    async fn ask_tool_permission(
+        self: &Rc<Self>,
+        tool: &crate::tools::InstalledTool,
+        args: &serde_json::Value,
+        cloud: bool,
+        dangerous: bool,
+    ) -> ToolPermissionChoice {
+        let scope = if cloud { "cloud" } else { "local" };
+        let mut body = tool.manifest.description.clone();
+        if dangerous {
+            body.push_str(
+                "\n\nThis action is marked as dangerous and always asks for confirmation.",
+            );
+        }
+        body.push_str(&format!("\n\nScope: {scope} models."));
+
+        let alert =
+            adw::AlertDialog::new(Some(&format!("Allow {}?", tool.manifest.name)), Some(&body));
+        alert.set_content_width(620);
+        alert.set_content_height(460);
+
+        let args_text = serde_json::to_string_pretty(args).unwrap_or_else(|_| args.to_string());
+        let label = gtk::Label::new(Some(&args_text));
+        label.set_xalign(0.0);
+        label.set_yalign(0.0);
+        label.set_wrap(true);
+        label.set_selectable(true);
+        label.add_css_class("monospace");
+        let scrolled = gtk::ScrolledWindow::builder()
+            .min_content_height(160)
+            .child(&label)
+            .build();
+        alert.set_extra_child(Some(&scrolled));
+
+        alert.add_response("deny", "Deny");
+        alert.add_response("once", "Allow once");
+        alert.add_response("chat", "Allow for this chat");
+        alert.set_response_appearance("deny", adw::ResponseAppearance::Destructive);
+        alert.set_response_appearance("chat", adw::ResponseAppearance::Suggested);
+        alert.set_default_response(Some("deny"));
+        alert.set_close_response("deny");
+
+        let response = alert.choose_future(Some(&self.window)).await;
+        match response.as_str() {
+            "once" => ToolPermissionChoice::Once,
+            "chat" => ToolPermissionChoice::Chat,
+            _ => ToolPermissionChoice::Deny,
+        }
+    }
+
+    fn run_tool_round(self: &Rc<Self>, active: ActiveStream, calls: Vec<ToolCall>) {
+        let win = self.clone();
+        let conv_id = active.conv_id;
+        let cloud = active.cloud;
+        let next_round = active.round + 1;
+        let memory_context = active.memory_context.clone();
+        let tool_box = active.tool_box.clone();
+
+        let handle = glib::spawn_future_local(async move {
+            let installed = crate::tools::list_installed();
+            let by_name: HashMap<String, crate::tools::InstalledTool> = installed
+                .into_iter()
+                .map(|tool| (tool.manifest.name.clone(), tool))
+                .collect();
+
+            for call in calls {
+                let name = call.function.name.clone();
+                let args = call.function.arguments.clone();
+                let card = ToolCard::new(&tool_box, &name, &args);
+
+                let Some(tool) = by_name.get(&name).cloned() else {
+                    let text = format!("Error: unknown tool '{name}'.");
+                    card.set_error(&text);
+                    win.save_tool_result(conv_id, &name, call.id.as_deref(), &text);
+                    continue;
+                };
+
+                let permission = {
+                    let settings = win.state.settings.borrow();
+                    crate::tools::permission_for(&settings, &tool.manifest, cloud)
+                };
+                let dangerous = crate::tools::is_dangerous_action(&tool.manifest, &args);
+                let mut allowed = permission != crate::config::ToolPermission::Deny;
+
+                if allowed && (permission == crate::config::ToolPermission::Ask || dangerous) {
+                    let granted = win.tool_grants.borrow().contains(&(conv_id, name.clone()));
+                    if !granted {
+                        card.set_waiting();
+                        match win
+                            .ask_tool_permission(&tool, &args, cloud, dangerous)
+                            .await
+                        {
+                            ToolPermissionChoice::Deny => allowed = false,
+                            ToolPermissionChoice::Once => {}
+                            ToolPermissionChoice::Chat => {
+                                win.tool_grants.borrow_mut().insert((conv_id, name.clone()));
+                            }
+                        }
+                    }
+                }
+
+                if !allowed {
+                    let text = format!("Error: the user denied permission to use '{name}'.");
+                    card.set_denied(&text);
+                    win.save_tool_result(conv_id, &name, call.id.as_deref(), &text);
+                    continue;
+                }
+
+                card.set_running();
+                let (tx, rx) = async_channel::bounded(1);
+                let request_tool = tool.clone();
+                let request_args = args.clone();
+                let handle = win.state.runtime.spawn(async move {
+                    let _ = tx
+                        .send(crate::tools::execute(&request_tool, &request_args).await)
+                        .await;
+                });
+                *win.tool_abort.borrow_mut() = Some(handle.abort_handle());
+                let result = rx.recv().await;
+                *win.tool_abort.borrow_mut() = None;
+                let (success, text) = match result {
+                    Ok(Ok(run)) => (run.success, run.text),
+                    Ok(Err(err)) => (false, format!("Error: {err:#}")),
+                    Err(_) => (false, "Error: the tool was cancelled.".to_string()),
+                };
+                card.set_done(success, &text);
+                win.save_tool_result(conv_id, &name, call.id.as_deref(), &text);
+            }
+
+            *win.tool_task.borrow_mut() = None;
+            if *win.current_id.borrow() == Some(conv_id) {
+                win.start_generation(GenerationRequest {
+                    conversation_id: conv_id,
+                    memory_context,
+                    tool_round: next_round,
+                });
+            }
+        });
+        *self.tool_task.borrow_mut() = Some(handle);
+    }
+
     fn stop_streaming(&self) {
         if let Some(active) = self.active.borrow().as_ref() {
             self.suppress_autoread.set(true);
             active.abort.abort();
+        }
+        if let Some(task) = self.tool_task.borrow_mut().take() {
+            task.abort();
+        }
+        if let Some(abort) = self.tool_abort.borrow_mut().take() {
+            abort.abort();
         }
         self.stop_speech();
         self.set_streaming_ui(false);
@@ -5328,7 +5803,7 @@ impl ChatWindow {
 
     // ----- Long-term memory -----------------------------------------------
 
-    fn model_pool(&self, model: &str) -> MemoryPool {
+    fn model_is_cloud_scope(&self, model: &str) -> bool {
         let remote_host = self
             .state
             .models
@@ -5337,11 +5812,46 @@ impl ChatWindow {
             .find(|candidate| memory::model_names_match(&candidate.name, model))
             .and_then(|candidate| candidate.remote_host.clone());
         let base_url = self.state.settings.borrow().base_url.clone();
-        if memory::model_is_cloud(model, remote_host.as_deref(), &base_url) {
+        memory::model_is_cloud(model, remote_host.as_deref(), &base_url)
+    }
+
+    fn model_pool(&self, model: &str) -> MemoryPool {
+        if self.model_is_cloud_scope(model) {
             MemoryPool::Cloud
         } else {
             MemoryPool::Local
         }
+    }
+
+    fn model_supports_tools(&self, model: &str) -> bool {
+        self.state
+            .models
+            .borrow()
+            .iter()
+            .find(|candidate| memory::model_names_match(&candidate.name, model))
+            .is_some_and(|candidate| {
+                candidate
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "tools")
+            })
+    }
+
+    /// Definitions for the enabled tools that may run with this model.
+    fn tool_definitions(&self, model: &str, round: usize) -> Vec<serde_json::Value> {
+        if round >= TOOL_MAX_ROUNDS || !self.model_supports_tools(model) {
+            return Vec::new();
+        }
+        let cloud = self.model_is_cloud_scope(model);
+        let settings = self.state.settings.borrow();
+        crate::tools::list_installed()
+            .into_iter()
+            .filter(|tool| {
+                crate::tools::permission_for(&settings, &tool.manifest, cloud)
+                    != crate::config::ToolPermission::Deny
+            })
+            .map(|tool| tool.definition())
+            .collect()
     }
 
     /// The pool to use for a model, if memory is enabled for that pool.
@@ -9764,7 +10274,13 @@ fn estimate_request_tokens(
     total.saturating_add(
         messages
             .iter()
-            .map(|message| estimate_tokens(&message.content).saturating_add(4))
+            .map(|message| {
+                let mut tokens = estimate_tokens(&message.content).saturating_add(4);
+                if let Some(tool_calls) = message.tool_calls.as_deref() {
+                    tokens = tokens.saturating_add(estimate_tokens(tool_calls));
+                }
+                tokens
+            })
             .sum::<u32>(),
     )
 }
@@ -9883,6 +10399,14 @@ fn build_request_messages(
                 .map(|image| base64::engine::general_purpose::STANDARD.encode(&image.data))
                 .collect();
         }
+        if let Some(tool_calls) = message
+            .tool_calls
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok())
+        {
+            chat.tool_calls = tool_calls;
+        }
+        chat.tool_name = message.tool_name.clone();
         chat
     }));
     messages
@@ -9972,6 +10496,7 @@ async fn run_memory_job(client: OllamaClient, job: MemoryJob) -> anyhow::Result<
         }),
         keep_alive: Some(CHAT_KEEP_ALIVE.to_string()),
         think,
+        tools: Vec::new(),
     };
 
     let reply = client.chat_once(&request).await?;
@@ -10029,6 +10554,7 @@ async fn run_compression(
             }),
             keep_alive: Some(CHAT_KEEP_ALIVE.to_string()),
             think: None,
+            tools: Vec::new(),
         };
 
         let reply = client.chat_once(&request).await?;
@@ -10651,6 +11177,9 @@ mod tests {
             id,
             role: role.to_string(),
             content: content.to_string(),
+            tool_calls: None,
+            tool_name: None,
+            tool_call_id: None,
         }
     }
 

@@ -95,6 +95,22 @@ pub struct ChatOptions {
     pub seed: Option<i64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolCall {
+    /// Ollama returns an id for each call and accepts it on the follow-up turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub function: ToolFunctionCall,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolFunctionCall {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub arguments: serde_json::Value,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
@@ -102,6 +118,12 @@ pub struct ChatMessage {
     /// Base64-encoded images for vision-capable Ollama models.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<String>,
+    /// Tool calls made by the assistant. Sent back when continuing a tool loop.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+    /// Set on `role: "tool"` messages so Ollama can match the result to the call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
 }
 
 impl ChatMessage {
@@ -110,6 +132,8 @@ impl ChatMessage {
             role: role.to_string(),
             content: content.into(),
             images: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_name: None,
         }
     }
 }
@@ -132,6 +156,8 @@ pub struct ChatRequest {
     pub keep_alive: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub think: Option<ThinkSetting>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -211,6 +237,7 @@ impl PullProgress {
 pub enum StreamEvent {
     Delta(String),
     Thinking(String),
+    ToolCalls(Vec<ToolCall>),
     Done(StreamStats),
     Error(String),
 }
@@ -237,6 +264,8 @@ struct ChunkMessage {
     content: String,
     #[serde(default)]
     thinking: String,
+    #[serde(default)]
+    tool_calls: Vec<ToolCall>,
 }
 
 #[derive(Clone)]
@@ -703,6 +732,9 @@ async fn handle_line(
         if !message.content.is_empty() {
             let _ = tx.send(StreamEvent::Delta(message.content)).await;
         }
+        if !message.tool_calls.is_empty() {
+            let _ = tx.send(StreamEvent::ToolCalls(message.tool_calls)).await;
+        }
     }
 
     stats.eval_count = chunk.eval_count.or(stats.eval_count);
@@ -839,6 +871,75 @@ mod tests {
     }
 
     #[test]
+    fn serializes_tool_calls_and_definitions() {
+        let call = ToolCall {
+            id: Some("call_1".into()),
+            function: ToolFunctionCall {
+                name: "get_time".into(),
+                arguments: serde_json::json!({}),
+            },
+        };
+        let mut message = ChatMessage::new("assistant", "");
+        message.tool_calls = vec![call];
+        let json = serde_json::to_value(&message).unwrap();
+        assert_eq!(json["tool_calls"][0]["id"], "call_1");
+        assert_eq!(json["tool_calls"][0]["function"]["name"], "get_time");
+        assert!(json.get("tool_name").is_none());
+
+        let tool_message = ChatMessage {
+            role: "tool".into(),
+            content: "sunny".into(),
+            images: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_name: Some("get_weather".into()),
+        };
+        let json = serde_json::to_value(&tool_message).unwrap();
+        assert_eq!(json["tool_name"], "get_weather");
+        assert!(json.get("tool_calls").is_none());
+
+        let request = ChatRequest {
+            model: "llama3".into(),
+            messages: vec![ChatMessage::new("user", "hi")],
+            stream: true,
+            options: None,
+            keep_alive: None,
+            think: None,
+            tools: vec![serde_json::json!({
+                "type": "function",
+                "function": {"name": "get_time", "parameters": {"type": "object"}}
+            })],
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["tools"][0]["function"]["name"], "get_time");
+    }
+
+    #[test]
+    fn parses_stream_tool_calls() {
+        let chunk: ChatChunk = serde_json::from_value(serde_json::json!({
+            "message": {
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "function": {
+                        "index": 0,
+                        "name": "calculator",
+                        "arguments": {"expression": "2 + 2"}
+                    }
+                }]
+            },
+            "done": true
+        }))
+        .unwrap();
+        let message = chunk.message.expect("message");
+        assert_eq!(message.tool_calls.len(), 1);
+        assert_eq!(message.tool_calls[0].function.name, "calculator");
+        assert_eq!(
+            message.tool_calls[0].function.arguments["expression"],
+            "2 + 2"
+        );
+    }
+
+    #[test]
     fn request_serializes_options() {
         let request = ChatRequest {
             model: "llama3".into(),
@@ -851,6 +952,7 @@ mod tests {
             }),
             keep_alive: None,
             think: None,
+            tools: Vec::new(),
         };
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["options"]["temperature"], 0.5);
@@ -920,6 +1022,7 @@ mod tests {
             options: None,
             keep_alive: None,
             think: Some(ThinkSetting::Level("low".into())),
+            tools: Vec::new(),
         };
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["think"], "low");
@@ -1058,6 +1161,7 @@ mod tests {
                 }),
                 keep_alive: Some("30s".into()),
                 think: Some(ThinkSetting::Bool(false)),
+                tools: Vec::new(),
             };
 
             let (tx, rx) = async_channel::unbounded();
@@ -1069,6 +1173,7 @@ mod tests {
                 match event {
                     StreamEvent::Delta(delta) => text.push_str(&delta),
                     StreamEvent::Thinking(_) => {}
+                    StreamEvent::ToolCalls(_) => {}
                     StreamEvent::Done(stats) => {
                         done = true;
                         println!("stats: {stats:?}");
