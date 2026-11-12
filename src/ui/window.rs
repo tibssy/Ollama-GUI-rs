@@ -47,6 +47,8 @@ const AUTOSTART_WAKE_DELAY_SECS: u32 = 3;
 const CHAT_KEEP_ALIVE: &str = "5m";
 /// Maximum number of tool rounds before the model is asked to answer without tools.
 const TOOL_MAX_ROUNDS: usize = 8;
+/// Maximum number of calls executed from one model response.
+const TOOL_MAX_CALLS_PER_ROUND: usize = 8;
 /// Feed memory extraction this fraction of `num_ctx` at a time.
 const MEMORY_TRANSCRIPT_RATIO: f64 = 0.45;
 const MEMORY_TEMPERATURE: f64 = 0.1;
@@ -5559,8 +5561,30 @@ impl ChatWindow {
                 active.round,
                 tool_calls.len()
             );
-            self.run_tool_round(active, tool_calls);
-            return;
+            if active.round >= TOOL_MAX_ROUNDS {
+                for call in &tool_calls {
+                    let text = format!(
+                        "Error: tool call limit reached for '{}'. Answer without using more tools.",
+                        call.function.name
+                    );
+                    let card = ToolCard::new(
+                        &active.tool_box,
+                        &call.function.name,
+                        &call.function.arguments,
+                    );
+                    card.set_error(&text);
+                    self.save_tool_result(
+                        active.conv_id,
+                        &call.function.name,
+                        call.id.as_deref(),
+                        &text,
+                    );
+                }
+                self.toast("Tool call limit reached; answering without more tools.");
+            } else {
+                self.run_tool_round(active, tool_calls);
+                return;
+            }
         }
 
         if content.trim().is_empty() && had_error {
@@ -5705,10 +5729,18 @@ impl ChatWindow {
                 .map(|tool| (tool.manifest.name.clone(), tool))
                 .collect();
 
-            for call in calls {
+            for (index, call) in calls.into_iter().enumerate() {
                 let name = call.function.name.clone();
                 let args = call.function.arguments.clone();
                 let card = ToolCard::new(&tool_box, &name, &args);
+
+                if index >= TOOL_MAX_CALLS_PER_ROUND {
+                    let text =
+                        format!("Error: too many tool calls in one round; '{name}' was not run.");
+                    card.set_error(&text);
+                    win.save_tool_result(conv_id, &name, call.id.as_deref(), &text);
+                    continue;
+                }
 
                 let Some(tool) = by_name.get(&name).cloned() else {
                     let text = format!("Error: unknown tool '{name}'.");
