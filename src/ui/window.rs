@@ -1849,6 +1849,45 @@ impl ToolCard {
     }
 }
 
+fn sanitize_tool_args(
+    manifest: &crate::tools::ToolManifest,
+    args: &serde_json::Value,
+) -> serde_json::Value {
+    let Some(properties) = manifest
+        .parameters
+        .get("properties")
+        .and_then(|value| value.as_object())
+    else {
+        return serde_json::Value::Object(serde_json::Map::new());
+    };
+    let Some(object) = args.as_object() else {
+        return serde_json::Value::Object(serde_json::Map::new());
+    };
+    let mut cleaned = serde_json::Map::new();
+    for (key, value) in object {
+        if properties.contains_key(key) {
+            cleaned.insert(key.clone(), value.clone());
+        }
+    }
+    serde_json::Value::Object(cleaned)
+}
+
+fn canonical_tool_key(name: &str, args: &serde_json::Value) -> String {
+    let mut key = String::from(name);
+    key.push('\0');
+    if let Some(object) = args.as_object() {
+        let mut names: Vec<&String> = object.keys().collect();
+        names.sort();
+        for name in names {
+            key.push_str(name);
+            key.push('=');
+            key.push_str(&serde_json::to_string(&object[name]).unwrap_or_default());
+            key.push('\0');
+        }
+    }
+    key
+}
+
 fn truncate_tool_text(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         return text.to_string();
@@ -1934,6 +1973,7 @@ struct ChatWindow {
     tool_abort: RefCell<Option<tokio::task::AbortHandle>>,
     last_tool_box: RefCell<Option<gtk::Box>>,
     last_tool_cards: RefCell<HashMap<String, ToolCard>>,
+    tool_calls_seen: RefCell<HashSet<String>>,
     speech_buttons: RefCell<Vec<gtk::Button>>,
     message_pictures: RefCell<Vec<glib::WeakRef<gtk::Picture>>>,
     last_image_column: Cell<i32>,
@@ -2313,6 +2353,7 @@ impl ChatWindow {
             tool_abort: RefCell::new(None),
             last_tool_box: RefCell::new(None),
             last_tool_cards: RefCell::new(HashMap::new()),
+            tool_calls_seen: RefCell::new(HashSet::new()),
             speech_buttons: RefCell::new(Vec::new()),
             message_pictures: RefCell::new(Vec::new()),
             last_image_column: Cell::new(0),
@@ -3031,6 +3072,7 @@ impl ChatWindow {
         *self.pending_generation.borrow_mut() = None;
         *self.current_id.borrow_mut() = Some(id);
         self.tool_grants.borrow_mut().clear();
+        self.tool_calls_seen.borrow_mut().clear();
 
         let (title, model, messages, images) = {
             let store = self.state.store.borrow();
@@ -3097,6 +3139,7 @@ impl ChatWindow {
         *self.pending_generation.borrow_mut() = None;
         *self.current_id.borrow_mut() = None;
         self.tool_grants.borrow_mut().clear();
+        self.tool_calls_seen.borrow_mut().clear();
         self.chat_list.unselect_all();
         self.show_empty();
         self.input.grab_focus();
@@ -3111,6 +3154,7 @@ impl ChatWindow {
         *self.summary_notice.borrow_mut() = None;
         *self.last_tool_box.borrow_mut() = None;
         self.last_tool_cards.borrow_mut().clear();
+        self.tool_calls_seen.borrow_mut().clear();
         self.speech_buttons.borrow_mut().clear();
         self.message_pictures.borrow_mut().clear();
     }
@@ -5342,6 +5386,9 @@ impl ChatWindow {
 
         let conversation_id = request.conversation_id;
         let tool_round = request.tool_round;
+        if tool_round == 0 {
+            self.tool_calls_seen.borrow_mut().clear();
+        }
         let memory_context = request.memory_context.clone();
         let model = self.selected_model();
         if model.is_empty() {
@@ -5383,7 +5430,7 @@ impl ChatWindow {
             let settings = self.state.settings.borrow();
             (settings.temperature, settings.num_ctx.max(1))
         };
-        let messages = build_request_messages(
+        let mut messages = build_request_messages(
             &system_prompt,
             memory_context.as_deref(),
             summary.as_ref(),
@@ -5391,6 +5438,13 @@ impl ChatWindow {
             &images,
             num_ctx,
         );
+        if tool_round >= TOOL_MAX_ROUNDS {
+            messages.push(ChatMessage::new(
+                "system",
+                "The tool call limit has been reached. Do not call more tools. \
+                 Answer the user using the tool results already provided.",
+            ));
+        }
         let think = self.think_setting();
         tracing::debug!("chat: thinking setting {think:?}");
 
@@ -5580,6 +5634,16 @@ impl ChatWindow {
                         &text,
                     );
                 }
+                if active.round == TOOL_MAX_ROUNDS {
+                    let conversation_id = active.conv_id;
+                    let memory_context = active.memory_context.clone();
+                    self.start_generation(GenerationRequest {
+                        conversation_id,
+                        memory_context,
+                        tool_round: TOOL_MAX_ROUNDS + 1,
+                    });
+                    return;
+                }
                 self.toast("Tool call limit reached; answering without more tools.");
             } else {
                 self.run_tool_round(active, tool_calls);
@@ -5749,6 +5813,7 @@ impl ChatWindow {
                     continue;
                 };
 
+                let args = sanitize_tool_args(&tool.manifest, &args);
                 let permission = {
                     let settings = win.state.settings.borrow();
                     crate::tools::permission_for(&settings, &tool.manifest, cloud)
@@ -5776,6 +5841,16 @@ impl ChatWindow {
                 if !allowed {
                     let text = format!("Error: the user denied permission to use '{name}'.");
                     card.set_denied(&text);
+                    win.save_tool_result(conv_id, &name, call.id.as_deref(), &text);
+                    continue;
+                }
+
+                let key = canonical_tool_key(&name, &args);
+                if !win.tool_calls_seen.borrow_mut().insert(key) {
+                    let text = format!(
+                        "Error: duplicate call to '{name}' skipped; use the earlier result."
+                    );
+                    card.set_error(&text);
                     win.save_tool_result(conv_id, &name, call.id.as_deref(), &text);
                     continue;
                 }
