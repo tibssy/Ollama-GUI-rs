@@ -8,6 +8,7 @@ mod paradee;
 mod parakeet;
 mod store;
 mod stt;
+mod tools;
 mod tray;
 mod ui;
 mod wake;

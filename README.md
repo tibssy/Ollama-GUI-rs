@@ -52,8 +52,8 @@ The MVP is working:
 
 ### Roadmap
 
-- Model manager: pull with progress, delete, show model details
-- Tool-call and `think` blocks
+- Tool calls in chat (the Tools tab installs and tests tools)
+- `think` blocks
 - Chat search (SQLite FTS5), rename, export/import
 - Flatpak packaging
 
@@ -121,7 +121,7 @@ Cloud endpoint, set the URL and, if needed, an API key under Preferences.
 Preferences is a wider, tabbed dialog. **General** contains the connection,
 application, generation, long-term memory, speech, speech-to-text, wake-word,
 and appearance options. **Models** manages the downloaded local model files.
-A future **Tools** tab can be added without changing the other pages.
+**Tools** installs and configures model tools.
 
 ## Speech
 
@@ -438,6 +438,32 @@ active provider:
 
 - **Speech to Text** — Parakeet Redux, Parakeet Ultra, Whistle
 - **Text to Speech** — Paradee
+
+## Tools
+
+Preferences → Tools manages the tools downloaded from the
+[Ollama GUI Tools](https://github.com/tibssy/Ollama-GUI-Tools) registry.
+
+Use the **browse** button to install a tool. The install dialog shows the
+description, required commands, sandbox access, and the full `run` script
+before anything is written. Downloads are verified against the SHA-256 hashes
+in `index.json`.
+
+Each installed tool has two permission choices:
+
+- **Local models** — `Allow` runs automatically, `Ask` confirms each call,
+  `Deny` hides the tool from the model.
+- **Cloud models** — the same choices, applied when the selected model runs on
+  ollama.com or a remote server. New tools default to `Deny` for cloud models.
+
+The info button shows the manifest, requirements, sandbox access, and script,
+and includes a test runner with a JSON argument box. The trash button removes
+the tool and its permission settings after confirmation.
+
+Tools run inside [bubblewrap](https://github.com/containers/bubblewrap) with a
+deny-by-default profile: no network, no home directory, and no desktop sockets
+unless the manifest declares them. The tool directory is read-only, `$HOME` is
+a scratch directory, and the app enforces timeouts and output limits.
 
 Each row shows whether the model is downloaded, its approximate size, and its
 license. A download icon button is shown when the files are missing; a

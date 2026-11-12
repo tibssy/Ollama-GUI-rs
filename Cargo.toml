@@ -11,7 +11,7 @@ gdk-pixbuf = "0.22"
 libadwaita = { version = "0.9", features = ["v1_10"] }
 sourceview5 = "0.11"
 base64 = "0.23"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "time", "process"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "multipart"] }
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
