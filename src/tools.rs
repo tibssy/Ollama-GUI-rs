@@ -879,6 +879,8 @@ pub fn build_sandbox_plan(tool: &InstalledTool, args: &Value) -> Result<SandboxP
     }
 
     let mut dirs: BTreeSet<PathBuf> = BTreeSet::new();
+    // /tmp is mounted as a tmpfs above; avoid adding a duplicate --dir.
+    dirs.insert(PathBuf::from("/tmp"));
     for path in [
         "/sandbox",
         "/sandbox/home",
@@ -999,8 +1001,18 @@ pub fn build_sandbox_plan(tool: &InstalledTool, args: &Value) -> Result<SandboxP
     for raw in &manifest.sandbox.write_paths {
         let source = expand_path(raw);
         if !source.exists() {
-            tracing::warn!("tool {}: write path {} does not exist", manifest.name, raw);
-            continue;
+            std::fs::create_dir_all(&source)
+                .with_context(|| format!("could not create write path {raw}"))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut permissions = std::fs::metadata(&source)?.permissions();
+                permissions.set_mode(0o700);
+                std::fs::set_permissions(&source, permissions)?;
+            }
+        }
+        if !source.is_dir() {
+            bail!("write path {raw} is not a directory");
         }
         let destination = sandbox_destination(raw);
         add_bind(&mut command_args, &mut dirs, &source, &destination, true);
@@ -1043,6 +1055,11 @@ fn stage_file_params(
         };
         if value.trim().is_empty() {
             continue;
+        }
+        if !(value.starts_with('/') || value.starts_with("~/") || value == "~") {
+            bail!(
+                "File path '{value}' must be absolute or start with ~/; relative paths are not supported."
+            );
         }
         let source = expand_path(value);
         let source = source
@@ -1344,6 +1361,21 @@ mod tests {
 
     #[test]
     #[ignore]
+    fn shares_the_clipboard_image_with_kdeconnect() {
+        let dir = crate::config::data_dir().join("tools/kdeconnect");
+        let Ok(tool) = load_installed(&dir) else {
+            return;
+        };
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let run = runtime
+            .block_on(execute(&tool, &json!({"action": "share_clipboard"})))
+            .expect("execute kdeconnect");
+        println!("kdeconnect share_clipboard: {}", run.text);
+        assert!(run.success, "{}", run.text);
+    }
+
+    #[test]
+    #[ignore]
     fn executes_the_local_calculator_in_the_sandbox() {
         let dir =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../Ollama-GUI-Tools/tools/calculator");
@@ -1456,6 +1488,38 @@ print(json.dumps({
         assert!(run.success, "{}", run.text);
         assert_eq!(run.text, "hidden");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn creates_declared_write_paths() {
+        let dir =
+            std::env::temp_dir().join(format!("ollama-gui-write-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut manifest = manifest();
+        manifest.sandbox.write_paths = vec![dir.to_string_lossy().into_owned()];
+        let plan = build_sandbox_plan(&tool(manifest), &json!({})).expect("sandbox plan");
+        assert!(dir.is_dir());
+        assert!(plan.args.windows(3).any(|window| {
+            window[0] == "--bind" && window[1] == dir.as_os_str() && window[2] == dir.as_os_str()
+        }));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rejects_relative_file_parameters() {
+        let mut manifest = manifest();
+        manifest.file_params = vec!["path".to_string()];
+        manifest.parameters = json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"}
+            }
+        });
+        let error = build_sandbox_plan(&tool(manifest), &json!({"path": "clipboard/image"}))
+            .expect_err("relative path should be rejected");
+        assert!(format!("{error:#}").contains("must be absolute"));
     }
 
     #[test]
