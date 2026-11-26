@@ -5995,8 +5995,13 @@ impl ChatWindow {
         crate::tools::list_installed()
             .into_iter()
             .filter(|tool| {
-                crate::tools::permission_for(&settings, &tool.manifest, cloud)
-                    != crate::config::ToolPermission::Deny
+                let permissions = crate::tools::permissions_for(&settings, &tool.manifest);
+                let permission = if cloud {
+                    permissions.cloud
+                } else {
+                    permissions.local
+                };
+                permissions.enabled && permission != crate::config::ToolPermission::Deny
             })
             .map(|tool| tool.definition())
             .collect()
@@ -7427,32 +7432,15 @@ impl ChatWindow {
         (page, state)
     }
 
-    fn tool_permission(
-        &self,
-        manifest: &crate::tools::ToolManifest,
-        cloud: bool,
-    ) -> crate::config::ToolPermission {
-        let settings = self.state.settings.borrow();
-        crate::tools::permission_for(&settings, manifest, cloud)
-    }
-
     fn tool_row_subtitle(
         &self,
         manifest: &crate::tools::ToolManifest,
         status: &crate::tools::RequirementStatus,
     ) -> String {
-        let settings = self.state.settings.borrow();
-        let permissions = settings
-            .tool_permissions
-            .get(&manifest.name)
-            .cloned()
-            .unwrap_or_else(|| {
-                crate::config::ToolPermissions::from_manifest(
-                    &manifest.default_permission,
-                    &manifest.default_cloud_permission,
-                )
-            });
-        drop(settings);
+        let permissions = {
+            let settings = self.state.settings.borrow();
+            crate::tools::permissions_for(&settings, manifest)
+        };
 
         let runtime = match manifest.runtime.as_str() {
             "python3" => "Python",
@@ -7460,9 +7448,14 @@ impl ChatWindow {
             other => other,
         };
         let mut text = format!(
-            "v{} · {} · Local: {} · Cloud: {}",
+            "v{} · {} · {} · Local: {} · Cloud: {}",
             manifest.version,
             runtime,
+            if permissions.enabled {
+                "Enabled"
+            } else {
+                "Disabled"
+            },
             permissions.local.label(),
             permissions.cloud.label()
         );
@@ -7484,6 +7477,11 @@ impl ChatWindow {
         row.set_subtitle(&self.tool_row_subtitle(&tool.manifest, &status));
         row.set_subtitle_lines(2);
 
+        let permissions = {
+            let settings = self.state.settings.borrow();
+            crate::tools::permissions_for(&settings, &tool.manifest)
+        };
+
         let local = adw::ComboRow::new();
         local.set_title("Local models");
         local.set_subtitle("Allow runs automatically, Ask confirms, Deny hides the tool.");
@@ -7492,7 +7490,8 @@ impl ChatWindow {
             .map(|permission| permission.label())
             .collect();
         local.set_model(Some(&gtk::StringList::new(&permission_labels)));
-        local.set_selected(self.tool_permission(&tool.manifest, false).index());
+        local.set_selected(permissions.local.index());
+        local.set_sensitive(permissions.enabled);
         {
             let win = self.clone();
             let row = row.clone();
@@ -7519,7 +7518,8 @@ impl ChatWindow {
         cloud.set_title("Cloud models");
         cloud.set_subtitle("Applies to models hosted on ollama.com or a remote server.");
         cloud.set_model(Some(&gtk::StringList::new(&permission_labels)));
-        cloud.set_selected(self.tool_permission(&tool.manifest, true).index());
+        cloud.set_selected(permissions.cloud.index());
+        cloud.set_sensitive(permissions.enabled);
         {
             let win = self.clone();
             let row = row.clone();
@@ -7541,6 +7541,36 @@ impl ChatWindow {
             });
         }
         row.add_row(&cloud);
+
+        let enabled = gtk::Switch::new();
+        enabled.set_valign(gtk::Align::Center);
+        enabled.set_active(permissions.enabled);
+        enabled.set_tooltip_text(Some("Enable this tool"));
+        {
+            let win = self.clone();
+            let row = row.clone();
+            let id = tool.manifest.name.clone();
+            let manifest = tool.manifest.clone();
+            let status = status.clone();
+            let local = local.clone();
+            let cloud = cloud.clone();
+            enabled.connect_active_notify(move |switch| {
+                let active = switch.is_active();
+                {
+                    let mut settings = win.state.settings.borrow_mut();
+                    settings
+                        .tool_permissions
+                        .entry(id.clone())
+                        .or_default()
+                        .enabled = active;
+                }
+                win.save_settings();
+                local.set_sensitive(active);
+                cloud.set_sensitive(active);
+                row.set_subtitle(&win.tool_row_subtitle(&manifest, &status));
+            });
+        }
+        row.add_suffix(&enabled);
 
         let info = gtk::Button::from_icon_name("dialog-information-symbolic");
         info.add_css_class("flat");
@@ -8083,16 +8113,21 @@ impl ChatWindow {
 
         let permissions = adw::PreferencesGroup::new();
         permissions.set_title("Permissions");
+        let permission_state = {
+            let settings = self.state.settings.borrow();
+            crate::tools::permissions_for(&settings, &tool.manifest)
+        };
         add_info_row(
             &permissions,
-            "Local models",
-            self.tool_permission(&tool.manifest, false).label(),
+            "Enabled",
+            if permission_state.enabled {
+                "Yes"
+            } else {
+                "No"
+            },
         );
-        add_info_row(
-            &permissions,
-            "Cloud models",
-            self.tool_permission(&tool.manifest, true).label(),
-        );
+        add_info_row(&permissions, "Local models", permission_state.local.label());
+        add_info_row(&permissions, "Cloud models", permission_state.cloud.label());
         page.add(&permissions);
 
         let script_group = adw::PreferencesGroup::new();
