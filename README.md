@@ -448,10 +448,12 @@ description, required commands, sandbox access, and the full `run` script
 before anything is written. Downloads are verified against the SHA-256 hashes
 in `index.json`.
 
-Each installed tool has two permission choices:
+Each installed tool has an **Enabled** switch. Disabled tools are not sent to
+the model and cannot be called, which also keeps their definitions out of the
+context window. Enabled tools have two permission choices:
 
 - **Local models** — `Allow` runs automatically, `Ask` confirms each call,
-  `Deny` hides the tool from the model.
+  `Deny` hides the tool from local models.
 - **Cloud models** — the same choices, applied when the selected model runs on
   ollama.com or a remote server. New tools default to `Deny` for cloud models.
 

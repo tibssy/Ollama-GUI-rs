@@ -523,16 +523,21 @@ pub fn requirement_status(manifest: &ToolManifest) -> RequirementStatus {
     }
 }
 
-pub fn permission_for(settings: &Settings, manifest: &ToolManifest, cloud: bool) -> ToolPermission {
-    let defaults = ToolPermissions::from_manifest(
-        &manifest.default_permission,
-        &manifest.default_cloud_permission,
-    );
-    let permissions = settings
+pub fn permissions_for(settings: &Settings, manifest: &ToolManifest) -> ToolPermissions {
+    settings
         .tool_permissions
         .get(&manifest.name)
         .cloned()
-        .unwrap_or(defaults);
+        .unwrap_or_else(|| {
+            ToolPermissions::from_manifest(
+                &manifest.default_permission,
+                &manifest.default_cloud_permission,
+            )
+        })
+}
+
+pub fn permission_for(settings: &Settings, manifest: &ToolManifest, cloud: bool) -> ToolPermission {
+    let permissions = permissions_for(settings, manifest);
     if cloud {
         permissions.cloud
     } else {
@@ -1274,6 +1279,32 @@ mod tests {
             permission_for(&settings, &manifest, true),
             ToolPermission::Deny
         );
+    }
+
+    #[test]
+    fn enabled_defaults_to_true_for_existing_settings() {
+        let permissions: ToolPermissions =
+            serde_json::from_str(r#"{"local":"ask","cloud":"deny"}"#).unwrap();
+        assert!(permissions.enabled);
+
+        let permissions: ToolPermissions =
+            serde_json::from_str(r#"{"enabled":false,"local":"allow","cloud":"deny"}"#).unwrap();
+        assert!(!permissions.enabled);
+        assert_eq!(permissions.local, ToolPermission::Allow);
+    }
+
+    #[test]
+    fn disabled_permissions_are_reported() {
+        let manifest = manifest();
+        let mut settings = Settings::default();
+        settings.tool_permissions.insert(
+            "demo_tool".to_string(),
+            ToolPermissions {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+        assert!(!permissions_for(&settings, &manifest).enabled);
     }
 
     #[test]

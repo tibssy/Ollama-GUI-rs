@@ -49,16 +49,34 @@ impl ToolPermission {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+fn default_enabled() -> bool {
+    true
+}
+
+fn default_local_permission() -> ToolPermission {
+    ToolPermission::Ask
+}
+
+fn default_cloud_permission() -> ToolPermission {
+    ToolPermission::Deny
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ToolPermissions {
+    /// Whether the tool definition is sent to the model at all.
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_local_permission")]
     pub local: ToolPermission,
+    #[serde(default = "default_cloud_permission")]
     pub cloud: ToolPermission,
 }
 
 impl Default for ToolPermissions {
     fn default() -> Self {
         Self {
+            enabled: true,
             local: ToolPermission::Ask,
             cloud: ToolPermission::Deny,
         }
@@ -68,6 +86,7 @@ impl Default for ToolPermissions {
 impl ToolPermissions {
     pub fn from_manifest(local: &str, cloud: &str) -> Self {
         Self {
+            enabled: true,
             local: ToolPermission::from_str(local).unwrap_or(ToolPermission::Ask),
             cloud: ToolPermission::from_str(cloud).unwrap_or(ToolPermission::Deny),
         }
