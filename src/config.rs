@@ -156,8 +156,70 @@ pub struct Settings {
     pub wake_listen_timeout_secs: u32,
     /// Start a fresh conversation after a wake session ends with a sleep phrase
     pub wake_new_conversation: bool,
+    /// Ignore the wake word during a daily quiet-hours range
+    pub wake_quiet_enabled: bool,
+    /// Local quiet-hours start time in HH:MM
+    pub wake_quiet_start: String,
+    /// Local quiet-hours end time in HH:MM (exclusive)
+    pub wake_quiet_end: String,
     /// Per-tool permissions for local and cloud models
     pub tool_permissions: BTreeMap<String, ToolPermissions>,
+}
+
+/// Parse a 24-hour `HH:MM` value into minutes since local midnight.
+pub fn parse_hhmm(value: &str) -> Option<u32> {
+    let (hours, minutes) = value.trim().split_once(':')?;
+    let hours: u32 = hours.parse().ok()?;
+    let minutes: u32 = minutes.parse().ok()?;
+    if hours > 23 || minutes > 59 {
+        return None;
+    }
+    Some(hours * 60 + minutes)
+}
+
+/// True when `now` is inside `[start, end)`. Ranges that cross midnight wrap.
+pub fn quiet_hours_active(now: u32, start: u32, end: u32) -> bool {
+    if start == end {
+        return false;
+    }
+    if start < end {
+        now >= start && now < end
+    } else {
+        now >= start || now < end
+    }
+}
+
+#[cfg(unix)]
+fn local_minutes() -> Option<u32> {
+    unsafe {
+        let now = libc::time(std::ptr::null_mut());
+        let mut local: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&now, &mut local).is_null() {
+            return None;
+        }
+        Some((local.tm_hour as u32) * 60 + local.tm_min as u32)
+    }
+}
+
+#[cfg(not(unix))]
+fn local_minutes() -> Option<u32> {
+    None
+}
+
+pub fn wake_quiet_active(settings: &Settings) -> bool {
+    if !settings.wake_quiet_enabled {
+        return false;
+    }
+    let Some(start) = parse_hhmm(&settings.wake_quiet_start) else {
+        return false;
+    };
+    let Some(end) = parse_hhmm(&settings.wake_quiet_end) else {
+        return false;
+    };
+    let Some(now) = local_minutes() else {
+        return false;
+    };
+    quiet_hours_active(now, start, end)
 }
 
 impl Default for Settings {
@@ -196,6 +258,9 @@ impl Default for Settings {
             wake_threshold: 0.0,
             wake_listen_timeout_secs: 30,
             wake_new_conversation: false,
+            wake_quiet_enabled: false,
+            wake_quiet_start: "22:00".to_string(),
+            wake_quiet_end: "07:00".to_string(),
             tool_permissions: BTreeMap::new(),
         }
     }
@@ -257,5 +322,56 @@ impl Settings {
             fs::set_permissions(&path, perms)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_24_hour_times() {
+        assert_eq!(parse_hhmm("00:00"), Some(0));
+        assert_eq!(parse_hhmm("7:05"), Some(7 * 60 + 5));
+        assert_eq!(parse_hhmm("23:59"), Some(23 * 60 + 59));
+        assert_eq!(parse_hhmm("24:00"), None);
+        assert_eq!(parse_hhmm("12:60"), None);
+        assert_eq!(parse_hhmm("abc"), None);
+        assert_eq!(parse_hhmm("12"), None);
+    }
+
+    #[test]
+    fn detects_daytime_quiet_ranges() {
+        let start = 9 * 60;
+        let end = 17 * 60;
+        assert!(!quiet_hours_active(8 * 60 + 59, start, end));
+        assert!(quiet_hours_active(9 * 60, start, end));
+        assert!(quiet_hours_active(16 * 60 + 59, start, end));
+        assert!(!quiet_hours_active(17 * 60, start, end));
+    }
+
+    #[test]
+    fn detects_overnight_quiet_ranges() {
+        let start = 22 * 60;
+        let end = 7 * 60;
+        assert!(!quiet_hours_active(21 * 60 + 59, start, end));
+        assert!(quiet_hours_active(22 * 60, start, end));
+        assert!(quiet_hours_active(23 * 60 + 59, start, end));
+        assert!(quiet_hours_active(0, start, end));
+        assert!(quiet_hours_active(6 * 60 + 59, start, end));
+        assert!(!quiet_hours_active(7 * 60, start, end));
+    }
+
+    #[test]
+    fn equal_bounds_disable_quiet_hours() {
+        assert!(!quiet_hours_active(12 * 60, 8 * 60, 8 * 60));
+    }
+
+    #[test]
+    fn quiet_hours_default_to_off() {
+        let settings = Settings::default();
+        assert!(!settings.wake_quiet_enabled);
+        assert_eq!(settings.wake_quiet_start, "22:00");
+        assert_eq!(settings.wake_quiet_end, "07:00");
     }
 }

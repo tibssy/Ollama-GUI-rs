@@ -528,6 +528,11 @@ Behaviour:
   with a closing phrase. Timeouts, errors, and manual stops continue the
   current conversation. Nothing is created until the first user message, so a
   wake that stays silent or only says goodbye does not create an empty chat.
+- **Quiet hours** pauses detection between two local times without turning the
+  feature off. Enter 24-hour `HH:MM` values; ranges that cross midnight (for
+  example 22:00 → 07:00) work. The detector stops when the range starts and
+  resumes at the end if the tray toggle is still armed. The tray tooltip and
+  menu show that the wake word is paused for quiet hours.
 - Three short synthesized cues confirm the transitions: a rising pair when the
   word is detected, a falling pair when the listening window times out, and a
   descending triple when a closing phrase ends the conversation. They are

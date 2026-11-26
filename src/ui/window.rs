@@ -43,6 +43,8 @@ const MEMORY_DEBOUNCE_MS: u64 = 3_000;
 /// Let the graphical session and microphone settle before an autostart launch
 /// arms the wake detector.
 const AUTOSTART_WAKE_DELAY_SECS: u32 = 3;
+/// Re-check wake quiet hours at this interval.
+const WAKE_QUIET_POLL_SECS: u32 = 30;
 /// How long Ollama keeps an unused model loaded.
 const CHAT_KEEP_ALIVE: &str = "5m";
 /// Maximum number of tool rounds before the model is asked to answer without tools.
@@ -1991,6 +1993,7 @@ struct ChatWindow {
     tray_live_available: Cell<bool>,
     tray_wake_visible: Cell<bool>,
     tray_wake_listening: Cell<bool>,
+    tray_wake_quiet: Cell<bool>,
     tray_wake_word: RefCell<String>,
 
     current_id: RefCell<Option<i64>>,
@@ -2038,6 +2041,8 @@ struct ChatWindow {
     wake_generation: Cell<u64>,
     wake_preparing: Cell<bool>,
     wake_listening: Cell<bool>,
+    /// Last observed quiet-hours state, used to react at the boundary.
+    wake_quiet_state: Cell<bool>,
     /// Session-only armed state. Wake detection never starts by itself.
     wake_active: Cell<bool>,
     /// True when the app was launched by its autostart entry.
@@ -2372,6 +2377,7 @@ impl ChatWindow {
             tray_live_available: Cell::new(false),
             tray_wake_visible: Cell::new(false),
             tray_wake_listening: Cell::new(false),
+            tray_wake_quiet: Cell::new(false),
             tray_wake_word: RefCell::new(String::new()),
             current_id: RefCell::new(None),
             active: RefCell::new(None),
@@ -2415,6 +2421,7 @@ impl ChatWindow {
             wake_generation: Cell::new(0),
             wake_preparing: Cell::new(false),
             wake_listening: Cell::new(false),
+            wake_quiet_state: Cell::new(false),
             wake_active: Cell::new(false),
             autostart,
             autostart_wake_pending: Cell::new(false),
@@ -2722,6 +2729,7 @@ impl ChatWindow {
                 }
             });
         }
+        self.start_wake_quiet_timer();
 
         if let Some(rx) = self.wake_rx.borrow_mut().take() {
             let win = self.clone();
@@ -8327,7 +8335,14 @@ impl ChatWindow {
     // ----- Wake word -------------------------------------------------------
 
     fn wake_should_run(&self) -> bool {
-        if !self.state.settings.borrow().wake_enabled || !self.wake_active.get() {
+        let (wake_enabled, quiet) = {
+            let settings = self.state.settings.borrow();
+            (
+                settings.wake_enabled,
+                crate::config::wake_quiet_active(&settings),
+            )
+        };
+        if !wake_enabled || quiet || !self.wake_active.get() {
             return false;
         }
         if self.live_mode.get() || self.live_pending.get() {
@@ -8340,6 +8355,22 @@ impl ChatWindow {
             return false;
         }
         self.live_available()
+    }
+
+    /// Poll quiet hours so the wake detector starts and stops at the boundary.
+    fn start_wake_quiet_timer(self: &Rc<Self>) {
+        let win = self.clone();
+        glib::timeout_add_seconds_local(WAKE_QUIET_POLL_SECS, move || {
+            let quiet = crate::config::wake_quiet_active(&win.state.settings.borrow());
+            if quiet != win.wake_quiet_state.replace(quiet) {
+                tracing::info!(
+                    "wake word: quiet hours {}",
+                    if quiet { "started" } else { "ended" }
+                );
+                win.refresh_wake();
+            }
+            glib::ControlFlow::Continue
+        });
     }
 
     /// Start or stop wake-word detection to match the current app state.
@@ -8479,14 +8510,19 @@ impl ChatWindow {
         let (commands_tx, commands_rx) = async_channel::unbounded();
         let live = self.live_mode.get() || self.live_pending.get();
         let live_available = self.live_available();
-        let (wake_visible, wake_word) = {
+        let (wake_visible, wake_word, wake_quiet) = {
             let settings = self.state.settings.borrow();
-            (settings.wake_enabled, settings.wake_word.clone())
+            (
+                settings.wake_enabled,
+                settings.wake_word.clone(),
+                crate::config::wake_quiet_active(&settings),
+            )
         };
         self.tray_live.set(live);
         self.tray_live_available.set(live_available);
         self.tray_wake_visible.set(wake_visible);
         self.tray_wake_listening.set(self.wake_listening.get());
+        self.tray_wake_quiet.set(wake_quiet);
         *self.tray_wake_word.borrow_mut() = wake_word.clone();
         let watcher_online = Arc::new(AtomicBool::new(true));
         let autostart = self.autostart;
@@ -8496,6 +8532,7 @@ impl ChatWindow {
             live_available,
             wake_visible,
             wake_listening: self.wake_listening.get(),
+            wake_quiet,
             wake_word,
             watcher_online: watcher_online.clone(),
         };
@@ -8600,9 +8637,13 @@ impl ChatWindow {
     fn update_tray_state(&self) {
         let live = self.live_mode.get() || self.live_pending.get();
         let live_available = self.live_available();
-        let (wake_visible, wake_word) = {
+        let (wake_visible, wake_word, wake_quiet) = {
             let settings = self.state.settings.borrow();
-            (settings.wake_enabled, settings.wake_word.clone())
+            (
+                settings.wake_enabled,
+                settings.wake_word.clone(),
+                crate::config::wake_quiet_active(&settings),
+            )
         };
         let wake_listening = self.wake_listening.get();
 
@@ -8610,6 +8651,7 @@ impl ChatWindow {
             && self.tray_live_available.get() == live_available
             && self.tray_wake_visible.get() == wake_visible
             && self.tray_wake_listening.get() == wake_listening
+            && self.tray_wake_quiet.get() == wake_quiet
             && *self.tray_wake_word.borrow() == wake_word
         {
             return;
@@ -8618,6 +8660,7 @@ impl ChatWindow {
         self.tray_live_available.set(live_available);
         self.tray_wake_visible.set(wake_visible);
         self.tray_wake_listening.set(wake_listening);
+        self.tray_wake_quiet.set(wake_quiet);
         *self.tray_wake_word.borrow_mut() = wake_word.clone();
 
         let Some(handle) = self.tray.borrow().clone() else {
@@ -8630,6 +8673,7 @@ impl ChatWindow {
                     tray.live_available = live_available;
                     tray.wake_visible = wake_visible;
                     tray.wake_listening = wake_listening;
+                    tray.wake_quiet = wake_quiet;
                     tray.wake_word = wake_word.clone();
                 })
                 .await;
@@ -9171,7 +9215,7 @@ impl ChatWindow {
         let wake = adw::PreferencesGroup::new();
         wake.set_title("Wake word");
         wake.set_description(Some(
-            "Start live conversation with a phrase. Use the tray menu to start and stop listening.",
+            "Start live conversation with a phrase. Use the tray menu to start and stop listening. Quiet hours pause the wake word without disabling it.",
         ));
 
         let wake_enable_row = adw::SwitchRow::new();
@@ -9229,6 +9273,28 @@ impl ChatWindow {
             .set_subtitle("Start a fresh chat only after the previous one ended with a goodbye");
         wake_new_chat_row.set_active(self.state.settings.borrow().wake_new_conversation);
         wake.add(&wake_new_chat_row);
+
+        let quiet_hours_row = adw::SwitchRow::new();
+        quiet_hours_row.set_title("Quiet hours");
+        quiet_hours_row.set_subtitle("Pause the wake word during this daily time range");
+        quiet_hours_row.set_active(self.state.settings.borrow().wake_quiet_enabled);
+        wake.add(&quiet_hours_row);
+
+        let quiet_start_row = adw::EntryRow::new();
+        quiet_start_row.set_title("Quiet from");
+        quiet_start_row.set_text(&self.state.settings.borrow().wake_quiet_start);
+        quiet_start_row.set_tooltip_text(Some("24-hour time, for example 22:00"));
+        quiet_start_row.set_max_width_chars(5);
+        quiet_start_row.set_sensitive(self.state.settings.borrow().wake_quiet_enabled);
+        wake.add(&quiet_start_row);
+
+        let quiet_end_row = adw::EntryRow::new();
+        quiet_end_row.set_title("Quiet until");
+        quiet_end_row.set_text(&self.state.settings.borrow().wake_quiet_end);
+        quiet_end_row.set_tooltip_text(Some("24-hour time, for example 07:00"));
+        quiet_end_row.set_max_width_chars(5);
+        quiet_end_row.set_sensitive(self.state.settings.borrow().wake_quiet_enabled);
+        wake.add(&quiet_end_row);
 
         let wake_threshold_row = adw::SpinRow::new(
             Some(&gtk::Adjustment::new(
@@ -9334,6 +9400,47 @@ impl ChatWindow {
                 win.save_settings();
                 win.voice_new_chat_requested.set(false);
                 win.last_voice_end_goodbye.set(false);
+            });
+        }
+        {
+            let win = self.clone();
+            let start = quiet_start_row.clone();
+            let end = quiet_end_row.clone();
+            quiet_hours_row.connect_active_notify(move |row| {
+                let active = row.is_active();
+                win.state.settings.borrow_mut().wake_quiet_enabled = active;
+                win.save_settings();
+                start.set_sensitive(active);
+                end.set_sensitive(active);
+                win.refresh_wake();
+            });
+        }
+        {
+            let win = self.clone();
+            quiet_start_row.connect_changed(move |entry| {
+                let text = entry.text().to_string();
+                if crate::config::parse_hhmm(&text).is_some() {
+                    entry.remove_css_class("error");
+                    win.state.settings.borrow_mut().wake_quiet_start = text;
+                    win.save_settings();
+                    win.refresh_wake();
+                } else {
+                    entry.add_css_class("error");
+                }
+            });
+        }
+        {
+            let win = self.clone();
+            quiet_end_row.connect_changed(move |entry| {
+                let text = entry.text().to_string();
+                if crate::config::parse_hhmm(&text).is_some() {
+                    entry.remove_css_class("error");
+                    win.state.settings.borrow_mut().wake_quiet_end = text;
+                    win.save_settings();
+                    win.refresh_wake();
+                } else {
+                    entry.add_css_class("error");
+                }
             });
         }
         {
