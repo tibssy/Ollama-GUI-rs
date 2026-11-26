@@ -21,6 +21,8 @@ pub struct StatusTray {
     pub wake_visible: bool,
     /// True while the microphone is listening for the wake word.
     pub wake_listening: bool,
+    /// True while wake-word detection is paused for quiet hours.
+    pub wake_quiet: bool,
     pub wake_word: String,
     /// Shared with the UI so an autostart launch can fall back to a visible
     /// window when no StatusNotifier host ever appears.
@@ -63,8 +65,12 @@ impl ksni::Tray for StatusTray {
             title: "Ollama GUI".to_string(),
             description: if self.live {
                 "Live voice conversation is active".to_string()
-            } else if self.wake_visible {
+            } else if self.wake_visible && self.wake_quiet {
+                "Wake word paused for quiet hours".to_string()
+            } else if self.wake_listening {
                 format!("Listening for \u{201c}{}\u{201d}", self.wake_word)
+            } else if self.wake_visible {
+                "Wake word is on".to_string()
             } else {
                 "Ready".to_string()
             },
@@ -114,7 +120,11 @@ impl ksni::Tray for StatusTray {
             }
             .into(),
             CheckmarkItem {
-                label: format!("Wake word: {}", self.wake_word),
+                label: if self.wake_quiet {
+                    format!("Wake word: {} (quiet hours)", self.wake_word)
+                } else {
+                    format!("Wake word: {}", self.wake_word)
+                },
                 visible: self.wake_visible,
                 enabled: self.wake_visible && !self.live,
                 checked: self.wake_listening,
